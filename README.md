@@ -4,23 +4,54 @@ LLM inference engine for AMD RDNA GPUs. Written in Rust. Faster than llama.cpp a
 
 ## What it does
 
-Takes a quantized language model and runs it on your AMD GPU. Generates text at **59 tok/s for Qwen3-8B** and **256 tok/s for Qwen3-0.6B** on an RX 5700 XT ($200 GPU from 2019).
+Takes a quantized language model and runs it on your AMD GPU. Generates text at **59.9 tok/s for Qwen3-8B** and **262 tok/s for Qwen3-0.6B** on an RX 5700 XT ($200 GPU from 2019).
 
-No Python runtime. No ROCm link-time dependency. Loads `libamdhip64.so` via `dlopen` at runtime — works across ROCm versions without recompilation.
+Includes **TurboQuant KV cache** (2/3/4-bit, FWHT + norm correction) for 14.2x KV compression with coherent output, and **Qwen3.5 DeltaNet** support (gated linear attention at 190 tok/s).
+
+No Python runtime. No ROCm link-time dependency. Loads `libamdhip64.so` via `dlopen` at runtime.
+
+## v0.1.0 Highlights
+
+- Qwen3.5 DeltaNet inference working (0.8B/2B/4B/9B)
+- TurboQuant KV cache: turbo2 (2-bit, 14.2x), turbo3 (3-bit, 9.8x), turbo4 (4-bit, 7.5x)
+- Register-only FWHT via `__shfl_xor` (zero shared memory, zero barriers)
+- HFQ2 weight quantization kernel (19 VGPRs, 66.8 tok/s for 8B)
+- Layer-adaptive KV: first/last layers at FP32, middle layers at turbo
+- GPU-side max-probability kernel for confidence checking
+- Early-exit forward pass infrastructure
 
 ## Performance
 
-Measured on AMD RX 5700 XT (gfx1010, RDNA1, 8GB GDDR6).
+Measured on AMD RX 5700 XT (gfx1010, RDNA1, 8GB GDDR6, 448 GB/s peak).
 
-| Benchmark | hipfire | llama.cpp | Ratio |
-|-----------|---------|-----------|-------|
-| **Qwen3-8B generation** | **59.3 tok/s** | 44.3 tok/s | **1.34x** |
-| **Qwen3-8B long gen (1000+ tokens)** | **52.7 tok/s** | 42.8 tok/s | **1.23x** |
-| Qwen3-8B prompt processing | 108 tok/s | 189.2 tok/s | 0.57x |
-| **Qwen3-0.6B generation** | **256.3 tok/s** | 193.6 tok/s | **1.32x** |
-| Qwen3-0.6B prompt processing | 1053 tok/s | 1534 tok/s | 0.69x |
+### Generation (decode)
 
-hipfire wins all generation benchmarks. llama.cpp wins prompt processing (prefill) due to rocBLAS GEMM. Full methodology and analysis in [docs/PERF_COMPARISON.md](docs/PERF_COMPARISON.md).
+| Model | hipfire | llama.cpp | Ratio |
+|-------|---------|-----------|-------|
+| **Qwen3-8B** | **59.9 tok/s** | 44.3 tok/s | **1.35x** |
+| **Qwen3-8B long (1000+ tok)** | **52.7 tok/s** | 42.8 tok/s | **1.23x** |
+| **Qwen3-0.6B** | **262 tok/s** | 193.6 tok/s | **1.35x** |
+| **Qwen3.5-0.8B (DeltaNet)** | **190 tok/s** | N/A | -- |
+
+### TurboQuant KV Cache
+
+| KV Config | Qwen3-8B tok/s | KV Compression | Quality |
+|-----------|---------------|----------------|---------|
+| Q8 (default) | 59.9 | 3.88x | good |
+| turbo2 (2-bit) | 55.1 | **14.2x** | good |
+| turbo4 (4-bit) | 54.5 | 7.5x | good |
+| turbo3 (3-bit) | 52.0 | 9.85x | good |
+
+All turbo configs produce coherent output. Norm-corrected quantization eliminates systematic drift.
+
+### Prefill (prompt processing)
+
+| Model | hipfire | llama.cpp | Ratio |
+|-------|---------|-----------|-------|
+| Qwen3-8B | 108 tok/s | 189.2 tok/s | 0.57x |
+| Qwen3-0.6B | 1053 tok/s | 1534 tok/s | 0.69x |
+
+hipfire wins all generation benchmarks. llama.cpp wins prefill via rocBLAS GEMM.
 
 ## Quick Start
 
@@ -29,15 +60,20 @@ hipfire wins all generation benchmarks. llama.cpp wins prompt processing (prefil
 cd hipfire
 cargo build --release
 
-# Quantize a model from HuggingFace
-# Downloads safetensors + tokenizer, quantizes weights to 4-bit, embeds tokenizer
+# Quantize a model from HuggingFace safetensors
 cargo run --release -p hipfire-quantize -- \
-  --input ~/.cache/huggingface/hub/models--Qwen--Qwen3-8B/snapshots/*/ \
+  --input path/to/Qwen3-8B/ \
   --output models/qwen3-8b.hfq \
   --format hfq4
 
 # Run inference
 cargo run --release --example infer_hfq -- models/qwen3-8b.hfq "Hello"
+
+# With TurboQuant KV cache (2-bit, 14.2x compression)
+cargo run --release --example infer_hfq -- models/qwen3-8b.hfq --turbo2 "Hello"
+
+# Qwen3.5 DeltaNet models
+cargo run --release --features deltanet --example infer_qwen35 -- models/qwen35-0.8b.hfq "Hello"
 ```
 
 ### Requirements
@@ -50,27 +86,30 @@ cargo run --release --example infer_hfq -- models/qwen3-8b.hfq "Hello"
 
 ### Weight quantization: HFQ4
 
-Weights are stored in HFQ4 (HipFire Quantized 4-bit) format — a custom format designed for high GPU occupancy on RDNA.
+Weights are stored in HFQ4 (HipFire Quantized 4-bit) format -- designed for maximum GPU occupancy on RDNA.
 
-Each block of 256 weights: `[f32 scale][f32 zero][128 packed nibble bytes]` = 136 bytes. The GEMV kernel that multiplies these against activation vectors uses **18 VGPRs** — half what llama.cpp's Q4_K uses (39 VGPRs). Lower register usage means more concurrent wavefronts, which means better memory latency hiding, which means higher effective bandwidth.
+Each block of 256 weights: `[f32 scale][f32 zero][128 packed nibble bytes]` = 136 bytes. The GEMV kernel uses **18 VGPRs** -- half what llama.cpp's Q4_K uses (39 VGPRs). Lower register pressure = more concurrent wavefronts = better memory latency hiding = higher effective bandwidth (282 GB/s vs ~210 GB/s).
 
-The quantizer (`hipfire-quantize`) reads HuggingFace safetensors directly. It auto-selects G256 (group size 256) for models with dim >= 4096 and G128 for smaller models. The tokenizer from `tokenizer.json` is embedded in the `.hfq` file — no external tokenizer dependency at inference time.
+Also supports HFQ2 (2-bit, 19 VGPRs, 66.8 tok/s -- quality requires incoherence processing).
 
-### KV cache quantization: Q8_0
+### TurboQuant KV cache
 
-During generation, the key-value cache is quantized to Q8_0 format (int8 values with f16 scale, 34 bytes per 32 elements). This reduces KV cache bandwidth by 3.76x compared to FP32, with negligible quality impact. The biggest effect is on long generation: **+39% tok/s** at 1000+ tokens where attention bandwidth dominates.
+Norm-corrected quantization for the KV cache using Fast Walsh-Hadamard Transform:
 
-### Batched prefill
+1. **Normalize** each KV vector to unit L2 norm
+2. **FWHT rotate** via register-only `__shfl_xor` (zero shared memory barriers)
+3. **Lloyd-Max quantize** to optimal centroids (2/3/4-bit)
+4. **Norm correction**: store `original_norm / reconstruction_norm` per head
 
-Prompt tokens are processed in parallel:
-- **Batched GEMM**: all prompt tokens' projections computed with one weight load
-- **Batched RoPE**: all positions rotated in one kernel
-- **Batched causal attention**: all query positions attend to their causal context in one kernel
-- **Batched KV cache write**: all positions quantized and written in one launch
+This guarantees exact L2 norm preservation and decorrelated quantization error. The FWHT butterfly runs entirely in 8 VGPRs.
+
+### Qwen3.5 DeltaNet
+
+Gated Delta Network linear attention with recurrent S-state. The 128x128 state matrix fits exactly in RDNA1's 64KB LDS. Supports Q8 and FP32 state quantization.
 
 ### Runtime kernel compilation
 
-HIP kernels are embedded as C++ string constants in the Rust source. On first use, each kernel is compiled to `.hsaco` via `hipcc --genco` and cached to `/tmp/hipfire_kernels/`. A source hash ensures stale caches are recompiled. First inference run compiles ~15 kernels (takes a few seconds), subsequent runs use cache.
+HIP kernels are embedded as C++ string constants in the Rust source. On first use, each kernel is compiled to `.hsaco` via `hipcc --genco` and cached to `/tmp/hipfire_kernels/`. Source hashing ensures stale caches are recompiled.
 
 ## Architecture
 
@@ -81,22 +120,35 @@ hipfire/
 │   ├── rdna-compute/        # HIP kernel compilation, dispatch, GPU tensor ops
 │   ├── engine/              # Model loading, forward pass, tokenizer
 │   └── hipfire-quantize/    # Quantizer: HuggingFace safetensors -> .hfq
-├── bench/                   # Profiling scripts (run_profile.sh, compile_results.py)
+├── bench/                   # Benchmark data and scripts
+├── scripts/                 # Benchmark automation
 └── docs/
-    ├── PERF_COMPARISON.md   # Detailed benchmark comparison vs llama.cpp
-    └── HFQ_FAMILY.md        # HFQ quantization format family spec (Q2-Q8)
+    ├── BENCHMARKS.md         # Full benchmark tables
+    ├── TURBO3_DESIGN.md      # TurboQuant KV design document
+    ├── RESEARCH_RDNA1.md     # RDNA1 optimization research synthesis
+    ├── FLASH_DECODE_PLAN.md  # Flash Decoding design (planned)
+    ├── MATH_SYNTHESIS.md     # Mathematical optimization analysis
+    └── PERF_COMPARISON.md    # hipfire vs llama.cpp detailed comparison
 ```
 
 ## Supported Models
 
-Any LLaMA-architecture or Qwen3 model from HuggingFace. Tested:
+| Model | Architecture | Weight format | VRAM | Generation tok/s |
+|-------|-------------|-------------|------|-----------------|
+| Qwen3-8B | Transformer + GQA | HFQ4-G256 | ~4.4 GB | 59.9 |
+| Qwen3-0.6B | Transformer + GQA | HFQ4-G128 | ~0.5 GB | 262 |
+| Qwen3.5-0.8B | DeltaNet + Attention | HFQ4 | ~0.3 GB | 190 |
+| TinyLlama-1.1B | Transformer | HFQ4-G256 | ~0.7 GB | 222 |
 
-| Model | Weight format | VRAM | Generation tok/s |
-|-------|-------------|------|-----------------|
-| Qwen3-8B | HFQ4-G256 | ~4.4 GB | 59.3 |
-| Qwen3-0.6B | HFQ4-G128 | ~0.4 GB | 256.3 |
+Quantize any LLaMA/Qwen3/Qwen3.5 model from HuggingFace with `hipfire-quantize --format hfq4`.
 
-Quantize any LLaMA/Qwen3 model from HuggingFace with `hipfire-quantize --format hfq4`.
+## Roadmap
+
+- [ ] Vision model support (Qwen-VL, LLaVA)
+- [ ] E8 lattice 2-bit weight quantization (QuIP#-style)
+- [ ] Flash Decoding for long context (4-5x attention at 2K+)
+- [ ] HTTP server mode (OpenAI-compatible API)
+- [ ] Embedded tokenizer from HFQ metadata (remove GGUF fallback)
 
 ## License
 
