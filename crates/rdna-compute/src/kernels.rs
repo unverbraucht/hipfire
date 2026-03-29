@@ -3479,12 +3479,13 @@ extern "C" __global__ void gated_delta_net_f32(
 
         // OK — the column access is fundamental to this algorithm.
         // Let's just read it with the original pattern but in a tighter loop.
+        // kv = (S @ k)[row] — row dot product, NOT column (S^T @ k was the bug!)
         float kv_val = 0.0f;
         for (int j = 0; j < HD; j += 4) {
-            kv_val += state[h*HD*HD + j*HD + row] * k_lds[j];
-            kv_val += state[h*HD*HD + (j+1)*HD + row] * k_lds[j+1];
-            kv_val += state[h*HD*HD + (j+2)*HD + row] * k_lds[j+2];
-            kv_val += state[h*HD*HD + (j+3)*HD + row] * k_lds[j+3];
+            kv_val += S_row[j]   * k_lds[j];
+            kv_val += S_row[j+1] * k_lds[j+1];
+            kv_val += S_row[j+2] * k_lds[j+2];
+            kv_val += S_row[j+3] * k_lds[j+3];
         }
 
         float delta = (v_t[row] - alpha_val * kv_val) * beta_val;
@@ -3559,18 +3560,13 @@ extern "C" __global__ void gated_delta_net_q8(
         q_lds[row] = q_t[row];
         __syncthreads();
 
-        // Phase 1: kv = S^T @ k (column access into global Q8 state)
-        // Need S[j][row] for j=0..127. Each row j has its own scale.
+        // Phase 1: kv = (S @ k)[row] — row dot product (NOT S^T @ k!)
         float kv_val = 0.0f;
         for (int j = 0; j < HD; j += 4) {
-            float sc0 = s_scales[h*HD + j];
-            float sc1 = s_scales[h*HD + j+1];
-            float sc2 = s_scales[h*HD + j+2];
-            float sc3 = s_scales[h*HD + j+3];
-            kv_val += sc0 * (float)s_q8[h*HD*HD + j*HD + row] * k_lds[j];
-            kv_val += sc1 * (float)s_q8[h*HD*HD + (j+1)*HD + row] * k_lds[j+1];
-            kv_val += sc2 * (float)s_q8[h*HD*HD + (j+2)*HD + row] * k_lds[j+2];
-            kv_val += sc3 * (float)s_q8[h*HD*HD + (j+3)*HD + row] * k_lds[j+3];
+            kv_val += S_local[j]   * k_lds[j];
+            kv_val += S_local[j+1] * k_lds[j+1];
+            kv_val += S_local[j+2] * k_lds[j+2];
+            kv_val += S_local[j+3] * k_lds[j+3];
         }
 
         float delta = (v_t[row] - alpha_val * kv_val) * beta_val;
@@ -3667,13 +3663,13 @@ extern "C" __global__ void gated_delta_net_q4(
         q_lds[row] = q_t[row];
         __syncthreads();
 
-        // Phase 1: kv = S^T @ k (column access into global Q4 state)
+        // Phase 1: kv = (S @ k)[row] — row dot product (NOT S^T @ k!)
         float kv_val = 0.0f;
-        for (int j = 0; j < HD; j++) {
-            float sc_j = s_scales[h*HD + j];
-            unsigned char byte = s_q4[h*HD*half_hd + j*half_hd + row/2];
-            int nibble = (row % 2 == 0) ? (byte & 0xF) : (byte >> 4);
-            kv_val += sc_j * (float)(nibble - 8) * k_lds[j];
+        for (int j = 0; j < HD; j += 4) {
+            kv_val += S_local[j]   * k_lds[j];
+            kv_val += S_local[j+1] * k_lds[j+1];
+            kv_val += S_local[j+2] * k_lds[j+2];
+            kv_val += S_local[j+3] * k_lds[j+3];
         }
 
         float delta = (v_t[row] - alpha_val * kv_val) * beta_val;
