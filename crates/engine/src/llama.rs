@@ -2071,6 +2071,78 @@ pub fn argmax(logits: &[f32]) -> u32 {
 ///
 /// Single pass over raw logits to find top-K by value (no softmax on 151K vocab).
 /// Softmax only computed on the K=20 finalists.
+// ─── Sampling configuration ──────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct SamplingConfig {
+    pub think_temp: f32,
+    pub answer_temp: f32,
+    pub top_p: f32,
+    pub repeat_penalty: f32,
+    pub repeat_window: usize,
+}
+
+impl SamplingConfig {
+    /// Text-only thinking model (Qwen3.5 text inference).
+    pub fn text_thinking() -> Self {
+        Self { think_temp: 0.6, answer_temp: 0.3, top_p: 0.9, repeat_penalty: 1.3, repeat_window: 128 }
+    }
+    /// VL thinking model — looser think temp for spatial grounding, lighter repeat penalty
+    /// to avoid penalizing legitimate spatial references ("the left side", "upper right").
+    pub fn vl_thinking() -> Self {
+        Self { think_temp: 0.6, answer_temp: 0.3, top_p: 0.9, repeat_penalty: 1.3, repeat_window: 64 }
+    }
+    /// Simple greedy-ish sampling (no think/answer split).
+    pub fn simple() -> Self {
+        Self { think_temp: 0.7, answer_temp: 0.7, top_p: 0.9, repeat_penalty: 1.1, repeat_window: 64 }
+    }
+}
+
+/// Apply repeat penalty to logits in-place.
+pub fn apply_repeat_penalty(logits: &mut [f32], history: &[u32], window: usize, penalty: f32) {
+    let start = history.len().saturating_sub(window);
+    for &t in &history[start..] {
+        if (t as usize) < logits.len() {
+            if logits[t as usize] > 0.0 {
+                logits[t as usize] /= penalty;
+            } else {
+                logits[t as usize] *= penalty;
+            }
+        }
+    }
+}
+
+/// N-gram repeat detection: if the last `n` tokens in history match an earlier n-gram,
+/// set the logit of the token that followed that earlier occurrence to -inf.
+/// This breaks phrase-level loops that token-level repeat penalty misses.
+/// Checks n-grams of sizes 3, 4, 5, 6 for robustness.
+pub fn apply_ngram_block(logits: &mut [f32], history: &[u32]) {
+    if history.len() < 4 {
+        return;
+    }
+    for ngram_size in [3, 4, 5, 6] {
+        if history.len() <= ngram_size {
+            continue;
+        }
+        let suffix = &history[history.len() - ngram_size..];
+        // Scan history for earlier occurrences of this n-gram
+        let search_end = history.len() - ngram_size;
+        for i in 0..search_end {
+            if i + ngram_size >= history.len() {
+                break;
+            }
+            if history[i..i + ngram_size] == *suffix {
+                // Found a match — the token that followed this earlier n-gram
+                // is what the model wants to repeat. Block it.
+                let next_tok = history[i + ngram_size];
+                if (next_tok as usize) < logits.len() {
+                    logits[next_tok as usize] = f32::NEG_INFINITY;
+                }
+            }
+        }
+    }
+}
+
 pub fn sample_top_p(logits: &[f32], temperature: f32, top_p: f32) -> u32 {
     if temperature <= 0.0 {
         return argmax(logits);

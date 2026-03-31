@@ -3387,19 +3387,20 @@ extern "C" __global__ void gated_norm_f32(
 }
 "#;
 
-/// Gated Delta Net recurrence — THE CORE OP.
-/// 128 threads (4 warps), one thread per row of S[128×128].
-/// S in global memory (16 heads × 64KB = 1MB, fits in L2).
-/// Key optimization: fuse S update + output in one pass over S row,
-/// and use warp shuffle to broadcast k,q values instead of re-reading.
-/// Grid: [n_heads]. Block: [128].
+/// Gated Delta Net — tiled LDS + warp-shuffle.
+/// S[128×128] tiled into TILE_ROWS=8 row chunks. Each tile = 8×128×4 = 4KB LDS.
+/// 64KB/4KB = 16 blocks/CU → 4 waves/SIMD. Rows are independent → perfect tiling.
+/// 32 threads per block (one warp), each handles 4 columns.
+/// Grid: [n_heads, HD/TILE_ROWS]. Block: [32].
 #[cfg(feature = "deltanet")]
 pub const GATED_DELTA_NET_SRC: &str = r#"
 #include <hip/hip_runtime.h>
 
 #define HD 128
+#define TILE_ROWS 4
 
-extern "C" __global__ void gated_delta_net_f32(
+extern "C" __launch_bounds__(32, 8)
+__global__ void gated_delta_net_f32(
     const float* __restrict__ q,
     const float* __restrict__ k,
     const float* __restrict__ v,
@@ -3412,198 +3413,156 @@ extern "C" __global__ void gated_delta_net_f32(
     int head_dim
 ) {
     const int h = blockIdx.x;
+    const int tile = blockIdx.y;  // which row tile (0..HD/TILE_ROWS-1)
     if (h >= n_heads) return;
-    const int row = threadIdx.x;  // 0..127, one thread per row
-
-    float* S_row = state + h * HD * HD + row * HD;  // this thread's row of S
+    const int tid = threadIdx.x;
+    const int col = tid * 4;
     const int stride = n_heads * HD;
+    const int row_start = tile * TILE_ROWS;
 
-    // Load k,v into LDS for coalesced broadcast
-    __shared__ float k_lds[HD];
-    __shared__ float q_lds[HD];
+    // Tile of S in LDS: TILE_ROWS × 128 floats = 4KB
+    __shared__ float S_tile[TILE_ROWS * HD];
+
+    // Load tile from global → LDS
+    float* S_global = state + h * HD * HD + row_start * HD;
+    for (int i = tid; i < TILE_ROWS * HD; i += 32)
+        S_tile[i] = S_global[i];
 
     for (int t = 0; t < n_tokens; t++) {
         const float* q_t = q + t * stride + h * HD;
         const float* k_t = k + t * stride + h * HD;
         const float* v_t = v + t * stride + h * HD;
-        float alpha_val = expf(gate[t * n_heads + h]);
-        float beta_val = beta[t * n_heads + h];
+        float alpha = expf(gate[t * n_heads + h]);
+        float beta_v = beta[t * n_heads + h];
 
-        // Coalesced load of k and q into LDS
-        k_lds[row] = k_t[row];
-        q_lds[row] = q_t[row];
-        __syncthreads();
+        float k0 = k_t[col], k1 = k_t[col+1], k2 = k_t[col+2], k3 = k_t[col+3];
+        float q0 = q_t[col], q1 = q_t[col+1], q2 = q_t[col+2], q3 = q_t[col+3];
 
-        // Phase 1: kv = sum_j S[j][row] * k[j]  (column access → row access with transposed loop)
-        // S is row-major: S_row[j] = S[row][j]. We need S[j][row] = column access.
-        // Instead, compute using warp-level partial sums:
-        // Each thread computes its contribution: S_row[j] * (term involving j-th column)
-        // But we need S^T @ k = column-wise dot product.
+        for (int r = 0; r < TILE_ROWS; r++) {
+            int row = row_start + r;
+            float* sr = S_tile + r * HD + col;
+            float s0 = sr[0], s1 = sr[1], s2 = sr[2], s3 = sr[3];
 
-        // Direct approach: each thread reads its full row and accumulates dot with a column vector.
-        // For kv[row], we need to read column `row` from all 128 rows.
-        // With LDS for k, we can do: kv = S_row dot k (if S were transposed).
-        // S is NOT transposed, so kv[row] = sum_j S[j*HD + row] * k[j].
-        // But each thread owns row `row` of S: S_row = S[row*HD..row*HD+HD].
-        // We don't own column `row`.
+            float kv = s0*k0 + s1*k1 + s2*k2 + s3*k3;
+            for (int o = 16; o > 0; o >>= 1)
+                kv += __shfl_down(kv, o);
+            kv = __shfl(kv, 0);
 
-        // Alternative: compute S_row @ k first (this IS a row dot product, fast!).
-        // But that gives sum_j S[row][j]*k[j] = (S @ k)[row], not (S^T @ k)[row].
-        // The recurrence needs (S^T @ k)[row].
+            float delta = (v_t[row] - alpha * kv) * beta_v;
 
-        // Correct approach: collaborative reduction.
-        // Each thread t computes S[t][row] * k[t] and we sum across threads.
-        // This gives sum_t S[t][row] * k[t] = (S^T @ k)[row]. ✓
-        // Use warp shuffle to sum within warps, then LDS for cross-warp sum.
+            s0 = alpha * s0 + k0 * delta;
+            s1 = alpha * s1 + k1 * delta;
+            s2 = alpha * s2 + k2 * delta;
+            s3 = alpha * s3 + k3 * delta;
+            sr[0] = s0; sr[1] = s1; sr[2] = s2; sr[3] = s3;
 
-        __shared__ float kv_partial[4];  // one per warp
-        float my_contrib = S_row[row] * k_lds[row];  // WRONG: this is S[row][row]*k[row]
-
-        // Actually: thread `row` owns S_row[0..127] = S[row][0..127].
-        // For kv[row] = sum_j S[j][row] * k[j], we need S[0][row], S[1][row], ..., S[127][row].
-        // Thread j owns S[j][row] = its_S_row[row].
-        // So thread j's contribution to kv[row] is S[j][row] * k[j] = S_row_of_thread_j[row] * k[j].
-        // Each thread j has S[j][row] available as S_row_of_j[row].
-
-        // Approach: each thread reads S_row[row] (the diagonal element? No.)
-        // Thread j: S[j][0..127]. For target kv[i], thread j contributes S[j][i] * k[j].
-        // We need to sum across all threads j for a specific i.
-        // With 128 threads and 128 targets, this is an all-to-all reduction.
-
-        // Better: thread `row` computes kv[row] = sum_j S[j][row] * k[j].
-        // Thread `row` needs S[0][row], S[1][row], ..., S[127][row].
-        // But thread `row` only owns S[row][0..127] (the row, not the column).
-        // Accessing S[j][row] = state[h*HD*HD + j*HD + row] for j=0..127
-        // is a strided read: stride = HD = 128 floats = 512 bytes.
-        // This is the original column access pattern.
-
-        // OK — the column access is fundamental to this algorithm.
-        // Let's just read it with the original pattern but in a tighter loop.
-        // kv = (S @ k)[row] — row dot product, NOT column (S^T @ k was the bug!)
-        float kv_val = 0.0f;
-        for (int j = 0; j < HD; j += 4) {
-            kv_val += S_row[j]   * k_lds[j];
-            kv_val += S_row[j+1] * k_lds[j+1];
-            kv_val += S_row[j+2] * k_lds[j+2];
-            kv_val += S_row[j+3] * k_lds[j+3];
+            float out_v = s0*q0 + s1*q1 + s2*q2 + s3*q3;
+            for (int o = 16; o > 0; o >>= 1)
+                out_v += __shfl_down(out_v, o);
+            if (tid == 0)
+                output[t * stride + h * HD + row] = out_v;
         }
-
-        float delta = (v_t[row] - alpha_val * kv_val) * beta_val;
-
-        // Phase 2+3 fused: update S row and compute output dot in one pass
-        float out_val = 0.0f;
-        for (int j = 0; j < HD; j += 4) {
-            float s0 = alpha_val * S_row[j]   + k_lds[j]   * delta;
-            float s1 = alpha_val * S_row[j+1] + k_lds[j+1] * delta;
-            float s2 = alpha_val * S_row[j+2] + k_lds[j+2] * delta;
-            float s3 = alpha_val * S_row[j+3] + k_lds[j+3] * delta;
-            S_row[j]   = s0;
-            S_row[j+1] = s1;
-            S_row[j+2] = s2;
-            S_row[j+3] = s3;
-            out_val += s0 * q_lds[j] + s1 * q_lds[j+1] + s2 * q_lds[j+2] + s3 * q_lds[j+3];
-        }
-
-        output[t * stride + h * HD + row] = out_val;
-        __syncthreads();
     }
+
+    // Store tile back
+    for (int i = tid; i < TILE_ROWS * HD; i += 32)
+        S_global[i] = S_tile[i];
 }
 "#;
 
-/// GDN recurrence with Q8-quantized S state in VRAM.
-/// State layout: signed char s_q8[n_heads][HD*HD] + float s_scales[n_heads*HD].
-/// Per-ROW absmax scale for better precision (128 scales per head).
-/// Dequant at load, full FP32 recurrence, requant at store.
+/// GDN Q8 — tiled LDS + warp-shuffle. Dequant tile into LDS, recurrence, requant back.
+/// Tile = TILE_ROWS × 128 × 4B = 4KB. Same tiling as FP32 variant.
+/// Grid: [n_heads, HD/TILE_ROWS]. Block: [32].
 #[cfg(feature = "deltanet")]
 pub const GATED_DELTA_NET_Q8_SRC: &str = r#"
 #include <hip/hip_runtime.h>
 
 #define HD 128
+#define TILE_ROWS 4
 
-extern "C" __global__ void gated_delta_net_q8(
+extern "C" __launch_bounds__(32, 8)
+__global__ void gated_delta_net_q8(
     const float* __restrict__ q,
     const float* __restrict__ k,
     const float* __restrict__ v,
     const float* __restrict__ gate,
     const float* __restrict__ beta,
-    signed char* __restrict__ s_q8,     // [n_heads × HD × HD] int8
-    float* __restrict__ s_scales,       // [n_heads × HD] per-row scale
+    signed char* __restrict__ s_q8,
+    float* __restrict__ s_scales,
     float* __restrict__ output,
     int n_tokens,
     int n_heads,
     int head_dim
 ) {
     const int h = blockIdx.x;
+    const int tile = blockIdx.y;
     if (h >= n_heads) return;
-    const int row = threadIdx.x;  // 0..127
-
+    const int tid = threadIdx.x;
+    const int col = tid * 4;
     const int stride = n_heads * HD;
-    signed char* S_q8_row = s_q8 + h * HD * HD + row * HD;
-    float row_scale = s_scales[h * HD + row];
+    const int row_start = tile * TILE_ROWS;
 
-    // Dequantize this thread's S row from Q8 to FP32 in registers
-    float S_local[HD];
-    for (int j = 0; j < HD; j++)
-        S_local[j] = row_scale * (float)S_q8_row[j];
+    __shared__ float S_tile[TILE_ROWS * HD];  // 4KB
 
-    __shared__ float k_lds[HD];
-    __shared__ float q_lds[HD];
+    // Dequant Q8 tile → FP32 in LDS
+    signed char* sq_base = s_q8 + h * HD * HD + row_start * HD;
+    for (int i = tid; i < TILE_ROWS * HD; i += 32) {
+        int r = i / HD;
+        float scale = s_scales[h * HD + row_start + r];
+        S_tile[i] = scale * (float)sq_base[i];
+    }
 
     for (int t = 0; t < n_tokens; t++) {
         const float* q_t = q + t * stride + h * HD;
         const float* k_t = k + t * stride + h * HD;
         const float* v_t = v + t * stride + h * HD;
-        float alpha_val = expf(gate[t * n_heads + h]);
-        float beta_val = beta[t * n_heads + h];
+        float alpha = expf(gate[t * n_heads + h]);
+        float beta_v = beta[t * n_heads + h];
 
-        k_lds[row] = k_t[row];
-        q_lds[row] = q_t[row];
-        __syncthreads();
+        float k0 = k_t[col], k1 = k_t[col+1], k2 = k_t[col+2], k3 = k_t[col+3];
+        float q0 = q_t[col], q1 = q_t[col+1], q2 = q_t[col+2], q3 = q_t[col+3];
 
-        // Phase 1: kv = (S @ k)[row] — row dot product (NOT S^T @ k!)
-        float kv_val = 0.0f;
-        for (int j = 0; j < HD; j += 4) {
-            kv_val += S_local[j]   * k_lds[j];
-            kv_val += S_local[j+1] * k_lds[j+1];
-            kv_val += S_local[j+2] * k_lds[j+2];
-            kv_val += S_local[j+3] * k_lds[j+3];
+        for (int r = 0; r < TILE_ROWS; r++) {
+            int row = row_start + r;
+            float* sr = S_tile + r * HD + col;
+            float s0 = sr[0], s1 = sr[1], s2 = sr[2], s3 = sr[3];
+
+            float kv = s0*k0 + s1*k1 + s2*k2 + s3*k3;
+            for (int o = 16; o > 0; o >>= 1)
+                kv += __shfl_down(kv, o);
+            kv = __shfl(kv, 0);
+
+            float delta = (v_t[row] - alpha * kv) * beta_v;
+
+            s0 = alpha * s0 + k0 * delta;
+            s1 = alpha * s1 + k1 * delta;
+            s2 = alpha * s2 + k2 * delta;
+            s3 = alpha * s3 + k3 * delta;
+            sr[0] = s0; sr[1] = s1; sr[2] = s2; sr[3] = s3;
+
+            float out_v = s0*q0 + s1*q1 + s2*q2 + s3*q3;
+            for (int o = 16; o > 0; o >>= 1)
+                out_v += __shfl_down(out_v, o);
+            if (tid == 0)
+                output[t * stride + h * HD + row] = out_v;
         }
-
-        float delta = (v_t[row] - alpha_val * kv_val) * beta_val;
-
-        // Phase 2+3 fused: update S in registers and compute output
-        float out_val = 0.0f;
-        for (int j = 0; j < HD; j += 4) {
-            float s0 = alpha_val * S_local[j]   + k_lds[j]   * delta;
-            float s1 = alpha_val * S_local[j+1] + k_lds[j+1] * delta;
-            float s2 = alpha_val * S_local[j+2] + k_lds[j+2] * delta;
-            float s3 = alpha_val * S_local[j+3] + k_lds[j+3] * delta;
-            S_local[j]   = s0;
-            S_local[j+1] = s1;
-            S_local[j+2] = s2;
-            S_local[j+3] = s3;
-            out_val += s0 * q_lds[j] + s1 * q_lds[j+1] + s2 * q_lds[j+2] + s3 * q_lds[j+3];
-        }
-        output[t * stride + h * HD + row] = out_val;
-        __syncthreads();
     }
 
-    // Quantize S row back to Q8: per-row absmax (no cross-thread reduce needed)
-    float amax = 0.0f;
-    for (int j = 0; j < HD; j++) {
-        float a = fabsf(S_local[j]);
-        if (a > amax) amax = a;
-    }
+    // Requant FP32 → Q8
+    for (int r = 0; r < TILE_ROWS; r++) {
+        float* sr = S_tile + r * HD + col;
+        float my_max = fmaxf(fmaxf(fabsf(sr[0]), fabsf(sr[1])), fmaxf(fabsf(sr[2]), fabsf(sr[3])));
+        for (int o = 16; o > 0; o >>= 1)
+            my_max = fmaxf(my_max, __shfl_xor(my_max, o));
 
-    float new_scale = (amax > 0.0f) ? (amax / 127.0f) : 1.0f;
-    float inv_scale = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
-
-    for (int j = 0; j < HD; j++) {
-        int val = (int)roundf(S_local[j] * inv_scale);
-        val = val < -128 ? -128 : (val > 127 ? 127 : val);
-        S_q8_row[j] = (signed char)val;
+        float inv_s = (my_max > 0.0f) ? (127.0f / my_max) : 0.0f;
+        signed char* dst = sq_base + r * HD + col;
+        dst[0] = (signed char)fminf(fmaxf(roundf(sr[0] * inv_s), -128.0f), 127.0f);
+        dst[1] = (signed char)fminf(fmaxf(roundf(sr[1] * inv_s), -128.0f), 127.0f);
+        dst[2] = (signed char)fminf(fmaxf(roundf(sr[2] * inv_s), -128.0f), 127.0f);
+        dst[3] = (signed char)fminf(fmaxf(roundf(sr[3] * inv_s), -128.0f), 127.0f);
+        if (tid == 0) s_scales[h * HD + row_start + r] = (my_max > 0.0f) ? (my_max / 127.0f) : 1.0f;
     }
-    s_scales[h * HD + row] = new_scale;
 }
 "#;
 
@@ -5327,4 +5286,251 @@ extern "C" __global__ void attention_turbo2_kv(
     oh[d0] = mv[0]; oh[d0+1] = mv[1]; oh[d0+2] = mv[2]; oh[d0+3] = mv[3];
 }
 "#;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Vision encoder kernels (ViT: GEMM, LayerNorm, GELU, bias-add)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Batched GEMV (= GEMM) for F16 weights, F32 activations.
+/// Y[M,N] = W_f16[M,K] @ X_f32[N,K]^T
+/// Grid=[M,N], Block=[32]. Each warp computes one dot product via shuffle reduce.
+pub const GEMM_F16_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __launch_bounds__(32, 20)
+__global__ void gemm_f16(
+    const _Float16* __restrict__ W,  // [M, K] row-major
+    const float* __restrict__ X,     // [N, K] row-major
+    float* __restrict__ Y,           // [M, N] row-major
+    int M, int K, int N
+) {
+    int m = blockIdx.x;
+    int n = blockIdx.y;
+    int tid = threadIdx.x;
+    if (m >= M || n >= N) return;
+
+    const _Float16* w_row = W + (size_t)m * K;
+    const float* x_row = X + (size_t)n * K;
+
+    float sum = 0.0f;
+    for (int k = tid; k < K; k += 32) {
+        sum += (float)w_row[k] * x_row[k];
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down(sum, offset);
+
+    if (tid == 0)
+        Y[(size_t)m * N + n] = sum;
+}
+"#;
+
+/// Batched GEMM for F32: Y[M,N] = A[M,K] @ B[N,K]^T
+pub const GEMM_F32_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __launch_bounds__(32, 20)
+__global__ void gemm_f32_batched(
+    const float* __restrict__ A,
+    const float* __restrict__ B,
+    float* __restrict__ Y,
+    int M, int K, int N
+) {
+    int m = blockIdx.x;
+    int n = blockIdx.y;
+    int tid = threadIdx.x;
+    if (m >= M || n >= N) return;
+
+    const float* a_row = A + (size_t)m * K;
+    const float* b_row = B + (size_t)n * K;
+
+    float sum = 0.0f;
+    for (int k = tid; k < K; k += 32) {
+        sum += a_row[k] * b_row[k];
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down(sum, offset);
+
+    if (tid == 0)
+        Y[(size_t)m * N + n] = sum;
+}
+"#;
+
+/// LayerNorm with bias: out = gamma * (x - mean) / sqrt(var + eps) + beta
+/// Grid=[batch], Block=[min(256, n)].
+pub const LAYERNORM_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void layernorm_f32(
+    const float* __restrict__ x,
+    const float* __restrict__ gamma,
+    const float* __restrict__ beta,
+    float* __restrict__ out,
+    int n, float eps
+) {
+    extern __shared__ float sdata[];
+    int row = blockIdx.x;
+    const float* xi = x + (size_t)row * n;
+    float* oi = out + (size_t)row * n;
+
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x)
+        sum += xi[i];
+    sdata[threadIdx.x] = sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        __syncthreads();
+    }
+    float mean = sdata[0] / (float)n;
+    __syncthreads();
+
+    float var_sum = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        float d = xi[i] - mean;
+        var_sum += d * d;
+    }
+    sdata[threadIdx.x] = var_sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        __syncthreads();
+    }
+    float inv_std = rsqrtf(sdata[0] / (float)n + eps);
+    __syncthreads();
+
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        oi[i] = gamma[i] * (xi[i] - mean) * inv_std + beta[i];
+    }
+}
+"#;
+
+/// GELU activation (tanh approximation, matches gelu_pytorch_tanh).
+pub const GELU_TANH_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void gelu_tanh_f32(
+    const float* __restrict__ x,
+    float* __restrict__ out,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float v = x[i];
+    float inner = 0.7978845608f * (v + 0.044715f * v * v * v);
+    out[i] = 0.5f * v * (1.0f + tanhf(inner));
+}
+"#;
+
+/// Transpose: out[c, r] = in[r, c]. Converts [rows, cols] → [cols, rows].
+pub const TRANSPOSE_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void transpose_f32(
+    const float* __restrict__ in_data,
+    float* __restrict__ out_data,
+    int rows, int cols
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = rows * cols;
+    if (idx >= total) return;
+    int r = idx / cols;
+    int c = idx % cols;
+    out_data[c * rows + r] = in_data[idx];
+}
+"#;
+
+/// Fused ViT self-attention: Q@K^T → softmax → @V, reading QKV from [N, 3*hidden].
+/// Grid=[n_heads, N]. Each block computes one (head, query_pos) output row.
+pub const VIT_ATTENTION_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void vit_attention_f32(
+    const float* __restrict__ qkv,   // [N, 3*hidden] row-major
+    float* __restrict__ out,          // [N, hidden] row-major
+    int N, int hidden, int num_heads, int head_dim, float scale
+) {
+    extern __shared__ float sdata[];
+    int head = blockIdx.x;
+    int qi = blockIdx.y;
+    int tid = threadIdx.x;
+    int nthreads = blockDim.x;
+    if (head >= num_heads || qi >= N) return;
+
+    int q_off = head * head_dim;
+    int k_off = hidden + head * head_dim;
+    int v_off = 2 * hidden + head * head_dim;
+    int stride = 3 * hidden;
+
+    float* scores = sdata;
+
+    // Phase 1: Q[qi] @ K[j]^T
+    const float* q_ptr = qkv + qi * stride + q_off;
+    float local_max = -1e30f;
+    for (int j = tid; j < N; j += nthreads) {
+        const float* k_ptr = qkv + j * stride + k_off;
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; d++)
+            dot += q_ptr[d] * k_ptr[d];
+        float s = dot * scale;
+        scores[j] = s;
+        local_max = fmaxf(local_max, s);
+    }
+
+    float* ws = sdata + N;
+    ws[tid] = local_max;
+    __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) {
+        if (tid < s) ws[tid] = fmaxf(ws[tid], ws[tid + s]);
+        __syncthreads();
+    }
+    float max_val = ws[0];
+    __syncthreads();
+
+    float local_sum = 0.0f;
+    for (int j = tid; j < N; j += nthreads) {
+        float e = expf(scores[j] - max_val);
+        scores[j] = e;
+        local_sum += e;
+    }
+    ws[tid] = local_sum;
+    __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) {
+        if (tid < s) ws[tid] += ws[tid + s];
+        __syncthreads();
+    }
+    float sum_val = ws[0];
+    __syncthreads();
+
+    for (int j = tid; j < N; j += nthreads)
+        scores[j] /= sum_val;
+    __syncthreads();
+
+    // Phase 2: weighted V sum
+    float* out_row = out + qi * hidden + head * head_dim;
+    for (int d = tid; d < head_dim; d += nthreads) {
+        float val = 0.0f;
+        for (int j = 0; j < N; j++)
+            val += scores[j] * qkv[j * stride + v_off + d];
+        out_row[d] = val;
+    }
+}
+"#;
+
+/// Bias-add: X[batch, n] += bias[n] (broadcast over batch dim)
+pub const BIAS_ADD_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void bias_add_f32(
+    float* __restrict__ x,
+    const float* __restrict__ bias,
+    int n, int total
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    x[i] += bias[i % n];
+}
+"#;
+
 

@@ -725,6 +725,10 @@ fn find_safetensors(dir: &Path) -> Vec<PathBuf> {
 
 /// Determine which tensors to quantize (weight matrices) vs keep as F16 (norms, embeddings)
 fn should_quantize(name: &str) -> bool {
+    // Vision encoder weights stay FP16 (only 456M params, run once per image)
+    if name.starts_with("model.visual.") || name.starts_with("visual.") {
+        return false;
+    }
     if name.contains("norm") || name.contains("bias") {
         return false;
     }
@@ -918,11 +922,18 @@ fn main() {
     let mut max_quant_error = 0.0f32;
     let mut _n_quant_groups = 0u64;
 
+    let include_vision = std::env::args().any(|a| a == "--include-vision");
     let mut skipped_params = 0u64;
     for (name, file_idx) in &all_tensors {
-        // Skip VLM vision encoder and MTP head — not needed for text inference
-        if name.starts_with("model.visual.") || name.starts_with("visual.")
-            || name.starts_with("mtp.") {
+        // Skip MTP head; optionally include vision encoder for VL inference
+        let is_vision = name.starts_with("model.visual.") || name.starts_with("visual.");
+        if is_vision && !include_vision {
+            let (meta, _) = st_files[*file_idx].tensor_data(name).unwrap();
+            let n: usize = meta.shape.iter().product();
+            skipped_params += n as u64;
+            continue;
+        }
+        if name.starts_with("mtp.") {
             let (meta, _) = st_files[*file_idx].tensor_data(name).unwrap();
             let n: usize = meta.shape.iter().product();
             skipped_params += n as u64;
@@ -1041,8 +1052,15 @@ fn main() {
                     (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                 }
             } else if use_hfq4g256 && is_embed {
-                let q = quantize_q8f16(&f32_data);
-                (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                // HFQ4 embeddings: half the size of Q8, same 18-VGPR lookup kernel
+                let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
+                if k_dim % 256 == 0 {
+                    let q = quantize_hfq4g256(&f32_data);
+                    (q, QuantType::HFQ4G256, 256u32, "HFQ4G256")
+                } else {
+                    let q = quantize_hfq4g128(&f32_data);
+                    (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                }
             } else if use_hfq4g256 {
                 // Auto-select G128 vs G256 based on K dimension
                 // G256 preferred: better coalescing, fewer scale/zero overheads
@@ -1181,7 +1199,7 @@ fn main() {
 
     eprintln!("\n=== Quantization Summary ===");
     if skipped_params > 0 {
-        eprintln!("  Skipped params:   {skipped_params} (visual/mtp — not needed for text)");
+        eprintln!("  Skipped params:   {skipped_params} (mtp/visual — use --include-vision for VL)");
     }
     eprintln!("  Total params:     {total_params}");
     eprintln!("  Quantized params: {quantized_params} ({:.1}%)", 100.0 * quantized_params as f64 / total_params as f64);

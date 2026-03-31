@@ -95,42 +95,34 @@ fn main() {
     let im_end_id = tokenizer.encode("<|im_end|>");
     let im_end_token = if im_end_id.len() == 1 { Some(im_end_id[0]) } else { None };
 
-    // Generation settings matching ollama defaults for thinking models
+    let sc = llama::SamplingConfig::text_thinking();
     let max_gen = 2048;
-    let repeat_penalty: f32 = 1.3;
-    let repeat_window: usize = 128;
-    let think_temp: f32 = 0.6;
-    let answer_temp: f32 = 0.3;
-    let top_p: f32 = 0.9;
 
     let t2 = Instant::now();
     let mut token_history: Vec<u32> = prompt_tokens.clone();
     let mut in_thinking = true;
     let mut generated = Vec::new();
 
-    // Start thinking (first token after <think>\n)
     eprint!("<think>");
-    let mut next_token = llama::sample_top_p(&logits, think_temp, top_p);
+    let mut next_token = llama::sample_top_p(&logits, sc.think_temp, sc.top_p);
 
     for _gi in 0..max_gen {
         generated.push(next_token);
         token_history.push(next_token);
 
-        // Check for think→answer transition
         if in_thinking && think_end_token == Some(next_token) {
             in_thinking = false;
             eprint!("</think>\n");
         } else {
             let text = tokenizer.decode(&[next_token]);
             if in_thinking {
-                eprint!("{text}"); // thinking goes to stderr
+                eprint!("{text}");
             } else {
-                print!("{text}"); // answer goes to stdout
+                print!("{text}");
                 std::io::stdout().flush().ok();
             }
         }
 
-        // Stop conditions
         if next_token == config.eos_token { break; }
         if im_end_token == Some(next_token) { break; }
         if !RUNNING.load(Ordering::Relaxed) { break; }
@@ -139,21 +131,10 @@ fn main() {
         logits = qwen35::forward(&mut gpu, &weights, &config, next_token, pos, &mut kv_cache, &mut dn_state)
             .expect("forward failed");
 
-        // Repeat penalty
-        let hist_start = token_history.len().saturating_sub(repeat_window);
-        for &t in &token_history[hist_start..] {
-            if (t as usize) < logits.len() {
-                if logits[t as usize] > 0.0 {
-                    logits[t as usize] /= repeat_penalty;
-                } else {
-                    logits[t as usize] *= repeat_penalty;
-                }
-            }
-        }
+        llama::apply_repeat_penalty(&mut logits, &token_history, sc.repeat_window, sc.repeat_penalty);
 
-        // Temperature depends on mode
-        let temp = if in_thinking { think_temp } else { answer_temp };
-        next_token = llama::sample_top_p(&logits, temp, top_p);
+        let temp = if in_thinking { sc.think_temp } else { sc.answer_temp };
+        next_token = llama::sample_top_p(&logits, temp, sc.top_p);
     }
 
     let gen_ms = t2.elapsed().as_millis();

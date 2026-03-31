@@ -2339,12 +2339,12 @@ impl Gpu {
             &mut op as *mut _ as *mut c_void, &mut nt as *mut _ as *mut c_void,
             &mut nh as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void,
         ];
-        // 128 threads (4 warps), one per S-row. k,q in LDS for broadcast.
-        // Fused S update + output in one pass per row.
-        unsafe { self.hip.launch_kernel(func, [n_heads as u32, 1, 1], [128, 1, 1], 0, self.stream_ref(), &mut params) }
+        // 32 threads, tiled S in LDS (4KB per tile). Grid: [n_heads, 128/8=16].
+        let n_tiles = (128 / 4) as u32;
+        unsafe { self.hip.launch_kernel(func, [n_heads as u32, n_tiles, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
     }
 
-    /// GDN recurrence with Q8-quantized S state.
+    /// GDN recurrence with Q8-quantized S state — tiled LDS + warp-shuffle.
     #[cfg(feature = "deltanet")]
     pub fn gated_delta_net_q8(
         &mut self, q: &GpuTensor, k: &GpuTensor, v: &GpuTensor,
@@ -2373,7 +2373,8 @@ impl Gpu {
             &mut nt as *mut _ as *mut c_void, &mut nh as *mut _ as *mut c_void,
             &mut hd as *mut _ as *mut c_void,
         ];
-        unsafe { self.hip.launch_kernel(func, [n_heads as u32, 1, 1], [128, 1, 1], 0, self.stream_ref(), &mut params) }
+        let n_tiles = (128 / 4) as u32;
+        unsafe { self.hip.launch_kernel(func, [n_heads as u32, n_tiles, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
     }
 
     /// GDN recurrence with Q4-quantized S state.
@@ -2705,5 +2706,170 @@ impl Gpu {
         let block_size = 256u32;
         let shared_mem = (block_size * 4) as u32;
         unsafe { self.hip.launch_kernel(func, [1, 1, 1], [block_size, 1, 1], shared_mem, self.stream_ref(), &mut params) }
+    }
+
+    // ═══ Vision encoder dispatch (GEMM, LayerNorm, GELU, bias-add) ═══
+
+    /// Batched GEMV (GEMM) for F16 weights: Y[M,N] = W_f16[M,K] @ X_f32[N,K]^T
+    pub fn gemm_f16(
+        &mut self, w: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
+        m: usize, k: usize, n: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("gemm_f16", kernels::GEMM_F16_SRC, "gemm_f16")?;
+        let func = &self.functions["gemm_f16"];
+        let mut wp = w.buf.as_ptr();
+        let mut xp = x.buf.as_ptr();
+        let mut yp = y.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut ni = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut wp as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+        ];
+        unsafe { self.hip.launch_kernel(func, [m as u32, n as u32, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// Batched GEMM for F32: Y[M,N] = A[M,K] @ B[N,K]^T
+    pub fn gemm_f32_batched(
+        &mut self, a: &GpuTensor, b: &GpuTensor, y: &GpuTensor,
+        m: usize, k: usize, n: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("gemm_f32_batched", kernels::GEMM_F32_SRC, "gemm_f32_batched")?;
+        let func = &self.functions["gemm_f32_batched"];
+        let mut ap = a.buf.as_ptr();
+        let mut bp = b.buf.as_ptr();
+        let mut yp = y.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut ni = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ap as *mut _ as *mut c_void,
+            &mut bp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+        ];
+        unsafe { self.hip.launch_kernel(func, [m as u32, n as u32, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// LayerNorm with bias (batched): out = gamma * (x - mean) / sqrt(var + eps) + beta
+    pub fn layernorm_batched(
+        &mut self, x: &GpuTensor, gamma: &GpuTensor, beta: &GpuTensor,
+        out: &GpuTensor, batch: usize, n: usize, eps: f32,
+    ) -> HipResult<()> {
+        self.ensure_kernel("layernorm_f32", kernels::LAYERNORM_SRC, "layernorm_f32")?;
+        let func = &self.functions["layernorm_f32"];
+        let mut xp = x.buf.as_ptr();
+        let mut gp = gamma.buf.as_ptr();
+        let mut bp = beta.buf.as_ptr();
+        let mut op = out.buf.as_ptr();
+        let mut ni = n as i32;
+        let mut ep = eps;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut xp as *mut _ as *mut c_void,
+            &mut gp as *mut _ as *mut c_void,
+            &mut bp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+            &mut ep as *mut _ as *mut c_void,
+        ];
+        let block_size = std::cmp::min(256, n) as u32;
+        // Round up to power of 2 for reduction
+        let block_size = block_size.next_power_of_two();
+        let shared_mem = block_size * 4;
+        unsafe { self.hip.launch_kernel(func, [batch as u32, 1, 1], [block_size, 1, 1], shared_mem, self.stream_ref(), &mut params) }
+    }
+
+    /// GELU tanh approximation (in-place capable if x == out)
+    pub fn gelu_tanh_f32(&mut self, x: &GpuTensor, out: &GpuTensor, n: usize) -> HipResult<()> {
+        self.ensure_kernel("gelu_tanh_f32", kernels::GELU_TANH_SRC, "gelu_tanh_f32")?;
+        let func = &self.functions["gelu_tanh_f32"];
+        let mut xp = x.buf.as_ptr();
+        let mut op = out.buf.as_ptr();
+        let mut ni = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut xp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+        ];
+        let blocks = ((n + 255) / 256) as u32;
+        unsafe { self.hip.launch_kernel(func, [blocks, 1, 1], [256, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// Bias-add: x[batch, n] += bias[n] (in-place, broadcast over batch dim)
+    pub fn bias_add_f32(&mut self, x: &GpuTensor, bias: &GpuTensor, batch: usize, n: usize) -> HipResult<()> {
+        self.ensure_kernel("bias_add_f32", kernels::BIAS_ADD_SRC, "bias_add_f32")?;
+        let func = &self.functions["bias_add_f32"];
+        let mut xp = x.buf.as_ptr();
+        let mut bp = bias.buf.as_ptr();
+        let mut ni = n as i32;
+        let total = (batch * n) as i32;
+        let mut ti = total;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut xp as *mut _ as *mut c_void,
+            &mut bp as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+            &mut ti as *mut _ as *mut c_void,
+        ];
+        let blocks = ((total as usize + 255) / 256) as u32;
+        unsafe { self.hip.launch_kernel(func, [blocks, 1, 1], [256, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// Transpose [rows, cols] → [cols, rows]
+    pub fn transpose_f32(
+        &mut self, src: &GpuTensor, dst: &GpuTensor, rows: usize, cols: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("transpose_f32", kernels::TRANSPOSE_SRC, "transpose_f32")?;
+        let func = &self.functions["transpose_f32"];
+        let mut sp = src.buf.as_ptr();
+        let mut dp = dst.buf.as_ptr();
+        let mut ri = rows as i32;
+        let mut ci = cols as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut sp as *mut _ as *mut c_void,
+            &mut dp as *mut _ as *mut c_void,
+            &mut ri as *mut _ as *mut c_void,
+            &mut ci as *mut _ as *mut c_void,
+        ];
+        let total = rows * cols;
+        let blocks = ((total + 255) / 256) as u32;
+        unsafe { self.hip.launch_kernel(func, [blocks, 1, 1], [256, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// Fused ViT self-attention: reads QKV [N, 3*hidden], writes out [N, hidden].
+    pub fn vit_attention_f32(
+        &mut self, qkv: &GpuTensor, out: &GpuTensor,
+        n: usize, hidden: usize, num_heads: usize, head_dim: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("vit_attention_f32", kernels::VIT_ATTENTION_SRC, "vit_attention_f32")?;
+        let func = &self.functions["vit_attention_f32"];
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut qp = qkv.buf.as_ptr();
+        let mut op = out.buf.as_ptr();
+        let mut ni = n as i32;
+        let mut hi = hidden as i32;
+        let mut nh = num_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+            &mut hi as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+        let block_size = std::cmp::min(256, std::cmp::max(n, head_dim)) as u32;
+        let block_size = block_size.next_power_of_two();
+        // Shared memory: scores[N] + workspace[block_size]
+        let shared_mem = ((n + block_size as usize) * 4) as u32;
+        unsafe { self.hip.launch_kernel(func, [num_heads as u32, n as u32, 1], [block_size, 1, 1], shared_mem, self.stream_ref(), &mut params) }
     }
 }

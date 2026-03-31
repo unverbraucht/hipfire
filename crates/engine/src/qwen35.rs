@@ -223,6 +223,35 @@ fn load_norm_weight(hfq: &HfqFile, gpu: &mut Gpu, name: &str, shape: &[usize]) -
     gpu.upload_f32(&f32_data, shape)
 }
 
+/// Load weight tensor from raw bytes + quant_type (no name lookup needed).
+fn load_weight_tensor_raw(gpu: &Gpu, quant_type: u8, data: &[u8], m: usize, k: usize) -> HipResult<WeightTensor> {
+    match quant_type {
+        6 => {
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ4G256, m, k, row_stride: 0 })
+        }
+        7 => {
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ4G128, m, k, row_stride: 0 })
+        }
+        3 => {
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::Q8_0, m, k, row_stride: 0 })
+        }
+        1 => {
+            let f32_data: Vec<f32> = data.chunks_exact(2)
+                .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .collect();
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
+            };
+            let buf = gpu.upload_raw(bytes, &[m, k])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0 })
+        }
+        _ => panic!("unsupported quant_type {} for lm_head", quant_type),
+    }
+}
+
 fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, name: &str, m: usize, k: usize) -> HipResult<WeightTensor> {
     let full_name = format!("model.language_model.{name}");
     let (info, data) = hfq.tensor_data(&full_name)
@@ -315,26 +344,32 @@ pub fn load_weights(hfq: &HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> HipR
     eprintln!("  loading output_norm...");
     let output_norm = load_norm_weight(hfq, gpu, "norm.weight", &[config.dim])?;
 
-    eprintln!("  loading output (tied embeddings)...");
-    // Qwen3.5 uses tied embeddings — output = embed_tokens
-    let embd_data = hfq.tensor_data("model.language_model.embed_tokens.weight").unwrap().1;
-    let output = if embd_info.0.quant_type == 6 || embd_info.0.quant_type == 7 {
-        let buf = gpu.upload_raw(embd_data, &[embd_data.len()])?;
-        let dtype = if embd_info.0.quant_type == 6 { DType::HFQ4G256 } else { DType::HFQ4G128 };
-        WeightTensor { buf, gpu_dtype: dtype, m: config.vocab_size, k: config.dim, row_stride: 0 }
-    } else if embd_info.0.quant_type == 3 {
-        // Q8_0 embedding — also used for output GEMV
-        let buf = gpu.upload_raw(embd_data, &[embd_data.len()])?;
-        WeightTensor { buf, gpu_dtype: DType::Q8_0, m: config.vocab_size, k: config.dim, row_stride: 0 }
+    // Try separate lm_head first (untied embeddings, e.g. 9B), fall back to tied embed_tokens
+    let lm_head_info = hfq.tensor_data("lm_head.weight")
+        .or_else(|| hfq.tensor_data("model.language_model.lm_head.weight"));
+    let output = if let Some((lm_info, lm_data)) = lm_head_info {
+        eprintln!("  loading output (separate lm_head, qt={})...", lm_info.quant_type);
+        load_weight_tensor_raw(gpu, lm_info.quant_type, lm_data, config.vocab_size, config.dim)?
     } else {
-        let f32_data: Vec<f32> = embd_data.chunks_exact(2)
-            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-            .collect();
-        let bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
-        };
-        let buf = gpu.upload_raw(bytes, &[config.vocab_size, config.dim])?;
-        WeightTensor { buf, gpu_dtype: DType::F32, m: config.vocab_size, k: config.dim, row_stride: 0 }
+        eprintln!("  loading output (tied embeddings)...");
+        let embd_data = hfq.tensor_data("model.language_model.embed_tokens.weight").unwrap().1;
+        if embd_info.0.quant_type == 6 || embd_info.0.quant_type == 7 {
+            let buf = gpu.upload_raw(embd_data, &[embd_data.len()])?;
+            let dtype = if embd_info.0.quant_type == 6 { DType::HFQ4G256 } else { DType::HFQ4G128 };
+            WeightTensor { buf, gpu_dtype: dtype, m: config.vocab_size, k: config.dim, row_stride: 0 }
+        } else if embd_info.0.quant_type == 3 {
+            let buf = gpu.upload_raw(embd_data, &[embd_data.len()])?;
+            WeightTensor { buf, gpu_dtype: DType::Q8_0, m: config.vocab_size, k: config.dim, row_stride: 0 }
+        } else {
+            let f32_data: Vec<f32> = embd_data.chunks_exact(2)
+                .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .collect();
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
+            };
+            let buf = gpu.upload_raw(bytes, &[config.vocab_size, config.dim])?;
+            WeightTensor { buf, gpu_dtype: DType::F32, m: config.vocab_size, k: config.dim, row_stride: 0 }
+        }
     };
 
     let mut layers = Vec::with_capacity(config.n_layers);
@@ -417,6 +452,38 @@ pub fn forward(
         EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &x, token, dim)?,
         _ => panic!("unsupported embedding format"),
     }
+
+    forward_from_x(gpu, weights, config, x, pos, kv_cache, dn_state)
+}
+
+/// Shared forward pass — returns logits as CPU Vec<f32>.
+fn forward_from_x(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    x: GpuTensor,
+    pos: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+) -> HipResult<Vec<f32>> {
+    let logits_gpu = forward_from_x_gpu(gpu, weights, config, x, pos, kv_cache, dn_state)?;
+    let logits_data = gpu.download_f32(&logits_gpu)?;
+    gpu.free_tensor(logits_gpu)?;
+    Ok(logits_data)
+}
+
+/// Shared forward pass — returns logits as GPU tensor (no download).
+/// Caller must free the returned tensor.
+fn forward_from_x_gpu(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    x: GpuTensor,
+    pos: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+) -> HipResult<GpuTensor> {
+    let dim = config.dim;
 
     let tmp = gpu.alloc_tensor(&[dim], DType::F32)?;
     let pos_buf = gpu.hip.malloc(4)?;
@@ -662,12 +729,336 @@ pub fn forward(
     let logits = gpu.alloc_tensor(&[config.vocab_size], DType::F32)?;
     weight_gemv(gpu, &weights.output, &tmp, &logits)?;
 
-    let logits_data = gpu.download_f32(&logits)?;
-
     gpu.free_tensor(x)?;
     gpu.free_tensor(tmp)?;
-    gpu.free_tensor(logits)?;
     gpu.hip.free(pos_buf)?;
 
-    Ok(logits_data)
+    Ok(logits)
+}
+
+/// Pre-allocated scratch buffers for zero-alloc qwen35 forward + GPU sampling.
+pub struct Qwen35Scratch {
+    // Persistent state
+    pub x: GpuTensor,           // [dim]
+    pub tmp: GpuTensor,         // [dim]
+    pub pos_buf: hip_bridge::DeviceBuffer, // 4 bytes
+
+    // DeltaNet temporaries (reused across layers)
+    pub dn_qkv: GpuTensor,     // [qkv_dim]
+    pub dn_z: GpuTensor,        // [v_dim]
+    pub dn_alpha: GpuTensor,    // [n_v_heads]
+    pub dn_beta: GpuTensor,     // [n_v_heads]
+    pub dn_conv_out: GpuTensor, // [qkv_dim]
+    pub dn_q: GpuTensor,        // [v_dim] (after repeat-interleave)
+    pub dn_k: GpuTensor,        // [v_dim]
+    pub dn_v: GpuTensor,        // [v_dim]
+    pub dn_q_raw: GpuTensor,    // [k_dim] (before repeat)
+    pub dn_k_raw: GpuTensor,    // [k_dim]
+    pub dn_attn_out: GpuTensor, // [v_dim]
+    pub dn_normed: GpuTensor,   // [v_dim]
+
+    // FullAttn temporaries (reused across layers)
+    pub fa_q_full: GpuTensor,   // [n_heads * head_dim * 2]
+    pub fa_q: GpuTensor,        // [n_heads * head_dim]
+    pub fa_gate: GpuTensor,     // [n_heads * head_dim]
+    pub fa_k: GpuTensor,        // [n_kv_heads * head_dim]
+    pub fa_v: GpuTensor,        // [n_kv_heads * head_dim]
+    pub fa_attn_out: GpuTensor, // [n_heads * head_dim]
+
+    // Shared (used by both layer types)
+    pub o: GpuTensor,           // [dim]
+    pub gate_ffn: GpuTensor,    // [hidden_dim]
+    pub up: GpuTensor,          // [hidden_dim]
+    pub ffn_hidden: GpuTensor,  // [hidden_dim]
+    pub ffn_out: GpuTensor,     // [dim]
+
+    // Sampling
+    pub logits: GpuTensor,      // [vocab_size]
+    pub sample_buf: GpuTensor,  // [2] — token_id + rng
+    pub repeat_buf: GpuTensor,  // [repeat_window]
+}
+
+impl Qwen35Scratch {
+    pub fn new(gpu: &mut Gpu, config: &Qwen35Config, repeat_window: usize) -> HipResult<Self> {
+        let dim = config.dim;
+        let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
+        let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
+        let qkv_dim = k_dim * 2 + v_dim;
+        let q_dim = config.n_heads * config.head_dim;
+        let kv_dim = config.n_kv_heads * config.head_dim;
+
+        Ok(Self {
+            x: gpu.alloc_tensor(&[dim], DType::F32)?,
+            tmp: gpu.alloc_tensor(&[dim], DType::F32)?,
+            pos_buf: gpu.hip.malloc(4)?,
+
+            dn_qkv: gpu.alloc_tensor(&[qkv_dim], DType::F32)?,
+            dn_z: gpu.alloc_tensor(&[v_dim], DType::F32)?,
+            dn_alpha: gpu.alloc_tensor(&[config.linear_num_value_heads], DType::F32)?,
+            dn_beta: gpu.alloc_tensor(&[config.linear_num_value_heads], DType::F32)?,
+            dn_conv_out: gpu.alloc_tensor(&[qkv_dim], DType::F32)?,
+            dn_q: gpu.alloc_tensor(&[v_dim], DType::F32)?,
+            dn_k: gpu.alloc_tensor(&[v_dim], DType::F32)?,
+            dn_v: gpu.alloc_tensor(&[v_dim], DType::F32)?,
+            dn_q_raw: gpu.alloc_tensor(&[k_dim], DType::F32)?,
+            dn_k_raw: gpu.alloc_tensor(&[k_dim], DType::F32)?,
+            dn_attn_out: gpu.alloc_tensor(&[v_dim], DType::F32)?,
+            dn_normed: gpu.alloc_tensor(&[v_dim], DType::F32)?,
+
+            fa_q_full: gpu.alloc_tensor(&[q_dim * 2], DType::F32)?,
+            fa_q: gpu.alloc_tensor(&[q_dim], DType::F32)?,
+            fa_gate: gpu.alloc_tensor(&[q_dim], DType::F32)?,
+            fa_k: gpu.alloc_tensor(&[kv_dim], DType::F32)?,
+            fa_v: gpu.alloc_tensor(&[kv_dim], DType::F32)?,
+            fa_attn_out: gpu.alloc_tensor(&[q_dim], DType::F32)?,
+
+            o: gpu.alloc_tensor(&[dim], DType::F32)?,
+            gate_ffn: gpu.alloc_tensor(&[config.hidden_dim], DType::F32)?,
+            up: gpu.alloc_tensor(&[config.hidden_dim], DType::F32)?,
+            ffn_hidden: gpu.alloc_tensor(&[config.hidden_dim], DType::F32)?,
+            ffn_out: gpu.alloc_tensor(&[dim], DType::F32)?,
+
+            logits: gpu.alloc_tensor(&[config.vocab_size], DType::F32)?,
+            sample_buf: gpu.alloc_tensor(&[2], DType::F32)?,
+            repeat_buf: gpu.alloc_tensor(&[repeat_window], DType::F32)?,
+        })
+    }
+}
+
+/// Zero-alloc forward pass using pre-allocated scratch buffers.
+/// Logits stay on GPU in scratch.logits. Returns nothing — caller uses scratch.logits.
+pub fn forward_scratch(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    token: u32,
+    pos: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+    scratch: &Qwen35Scratch,
+) -> HipResult<()> {
+    let dim = config.dim;
+    let pos_i32 = pos as i32;
+    gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
+
+    // Embedding lookup into scratch.x
+    match weights.embd_format {
+        EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256(&weights.token_embd, &scratch.x, token, dim)?,
+        EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(&weights.token_embd, &scratch.x, token, dim)?,
+        EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.token_embd, &scratch.x, token, dim)?,
+        EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &scratch.x, token, dim)?,
+        _ => panic!("unsupported embedding format"),
+    }
+
+    forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch)
+}
+
+/// Zero-alloc forward from pre-computed embedding in scratch.x.
+pub fn forward_scratch_embed(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    embedding_data: &[f32],
+    pos: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+    scratch: &Qwen35Scratch,
+) -> HipResult<()> {
+    let pos_i32 = pos as i32;
+    gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
+    // Upload embedding directly into scratch.x
+    let bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(embedding_data.as_ptr() as *const u8, embedding_data.len() * 4)
+    };
+    gpu.hip.memcpy_htod(&scratch.x.buf, bytes)?;
+    forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch)
+}
+
+/// Layer loop using scratch buffers. Zero alloc/free per token.
+fn forward_scratch_layers(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    pos: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+    s: &Qwen35Scratch,
+) -> HipResult<()> {
+    let dim = config.dim;
+    let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
+    let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
+    let qkv_dim = k_dim * 2 + v_dim;
+    let n_v_heads = config.linear_num_value_heads;
+    let hd = config.linear_key_head_dim;
+
+    let mut delta_layer_idx = 0usize;
+
+    for layer_idx in 0..config.n_layers {
+        match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
+            (LayerWeights::DeltaNet(layer), LayerType::LinearAttention) => {
+                gpu.rmsnorm_f32(&s.x, &layer.attn_norm, &s.tmp, config.norm_eps)?;
+                weight_gemv(gpu, &layer.wqkv, &s.tmp, &s.dn_qkv)?;
+                weight_gemv(gpu, &layer.wz, &s.tmp, &s.dn_z)?;
+                weight_gemv(gpu, &layer.w_beta, &s.tmp, &s.dn_beta)?;
+                gpu.sigmoid_f32(&s.dn_beta)?;
+                weight_gemv(gpu, &layer.w_alpha, &s.tmp, &s.dn_alpha)?;
+                gpu.alpha_gate_f32(&s.dn_alpha, &layer.dt_bias, &layer.a_log, n_v_heads)?;
+
+                gpu.conv1d_silu_f32(&s.dn_conv_out, &s.dn_qkv, &layer.conv_weight,
+                    &dn_state.conv_states[delta_layer_idx], qkv_dim)?;
+
+                // Split conv output into Q, K, V
+                gpu.hip.memcpy_dtod_at(&s.dn_q_raw.buf, 0, &s.dn_conv_out.buf, 0, k_dim * 4)?;
+                gpu.hip.memcpy_dtod_at(&s.dn_k_raw.buf, 0, &s.dn_conv_out.buf, k_dim * 4, k_dim * 4)?;
+                gpu.hip.memcpy_dtod_at(&s.dn_v.buf, 0, &s.dn_conv_out.buf, k_dim * 2 * 4, v_dim * 4)?;
+
+                gpu.l2_norm_f32(&s.dn_q_raw, config.linear_num_key_heads, hd, config.norm_eps)?;
+                gpu.l2_norm_f32(&s.dn_k_raw, config.linear_num_key_heads, hd, config.norm_eps)?;
+                gpu.scale_f32(&s.dn_q_raw, 1.0 / (hd as f32).sqrt())?;
+
+                // Repeat-interleave Q/K if needed
+                if config.linear_num_key_heads < n_v_heads {
+                    let ratio = n_v_heads / config.linear_num_key_heads;
+                    for kh in 0..config.linear_num_key_heads {
+                        for r in 0..ratio {
+                            let dst = (kh * ratio + r) * hd * 4;
+                            let src = kh * hd * 4;
+                            gpu.hip.memcpy_dtod_at(&s.dn_q.buf, dst, &s.dn_q_raw.buf, src, hd * 4)?;
+                            gpu.hip.memcpy_dtod_at(&s.dn_k.buf, dst, &s.dn_k_raw.buf, src, hd * 4)?;
+                        }
+                    }
+                } else {
+                    gpu.hip.memcpy_dtod(&s.dn_q.buf, &s.dn_q_raw.buf, k_dim * 4)?;
+                    gpu.hip.memcpy_dtod(&s.dn_k.buf, &s.dn_k_raw.buf, k_dim * 4)?;
+                }
+
+                match dn_state.quant {
+                    StateQuant::FP32 => gpu.gated_delta_net_f32(
+                        &s.dn_q, &s.dn_k, &s.dn_v, &s.dn_alpha, &s.dn_beta,
+                        &dn_state.s_matrices[delta_layer_idx], &s.dn_attn_out,
+                        1, n_v_heads, config.linear_value_head_dim,
+                    )?,
+                    StateQuant::Q8 => gpu.gated_delta_net_q8(
+                        &s.dn_q, &s.dn_k, &s.dn_v, &s.dn_alpha, &s.dn_beta,
+                        &dn_state.s_matrices[delta_layer_idx],
+                        &dn_state.s_scales[delta_layer_idx], &s.dn_attn_out,
+                        1, n_v_heads, config.linear_value_head_dim,
+                    )?,
+                    StateQuant::Q4 => gpu.gated_delta_net_q4(
+                        &s.dn_q, &s.dn_k, &s.dn_v, &s.dn_alpha, &s.dn_beta,
+                        &dn_state.s_matrices[delta_layer_idx],
+                        &dn_state.s_scales[delta_layer_idx], &s.dn_attn_out,
+                        1, n_v_heads, config.linear_value_head_dim,
+                    )?,
+                }
+
+                gpu.gated_norm_f32(&s.dn_attn_out, &s.dn_z, &layer.norm_weight, &s.dn_normed,
+                    n_v_heads, config.linear_value_head_dim, config.norm_eps)?;
+                weight_gemv(gpu, &layer.wo, &s.dn_normed, &s.o)?;
+                gpu.add_inplace_f32(&s.x, &s.o)?;
+
+                // FFN
+                gpu.rmsnorm_f32(&s.x, &layer.ffn_norm, &s.tmp, config.norm_eps)?;
+                weight_gemv(gpu, &layer.w_gate, &s.tmp, &s.gate_ffn)?;
+                weight_gemv(gpu, &layer.w_up, &s.tmp, &s.up)?;
+                gpu.silu_mul_f32(&s.gate_ffn, &s.up, &s.ffn_hidden)?;
+                weight_gemv(gpu, &layer.w_down, &s.ffn_hidden, &s.ffn_out)?;
+                gpu.add_inplace_f32(&s.x, &s.ffn_out)?;
+
+                delta_layer_idx += 1;
+            }
+
+            (LayerWeights::FullAttn(layer), LayerType::FullAttention) => {
+                gpu.rmsnorm_f32(&s.x, &layer.attn_norm, &s.tmp, config.norm_eps)?;
+                weight_gemv(gpu, &layer.wq, &s.tmp, &s.fa_q_full)?;
+
+                // Split interleaved Q+gate
+                for h in 0..config.n_heads {
+                    let src_q = h * config.head_dim * 2 * 4;
+                    let src_g = (h * config.head_dim * 2 + config.head_dim) * 4;
+                    let dst = h * config.head_dim * 4;
+                    gpu.hip.memcpy_dtod_at(&s.fa_q.buf, dst, &s.fa_q_full.buf, src_q, config.head_dim * 4)?;
+                    gpu.hip.memcpy_dtod_at(&s.fa_gate.buf, dst, &s.fa_q_full.buf, src_g, config.head_dim * 4)?;
+                }
+
+                gpu.rmsnorm_batched(&s.fa_q, &layer.q_norm, &s.fa_q, config.n_heads, config.head_dim, config.norm_eps)?;
+
+                let kv_dim = config.n_kv_heads * config.head_dim;
+                weight_gemv(gpu, &layer.wk, &s.tmp, &s.fa_k)?;
+                weight_gemv(gpu, &layer.wv, &s.tmp, &s.fa_v)?;
+                gpu.rmsnorm_batched(&s.fa_k, &layer.k_norm, &s.fa_k, config.n_kv_heads, config.head_dim, config.norm_eps)?;
+
+                let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
+                gpu.rope_partial_interleaved_f32(&s.fa_q, &s.fa_k, pos as i32,
+                    config.n_heads, config.n_kv_heads, config.head_dim, n_rot, config.rope_theta)?;
+
+                gpu.kv_cache_write(&kv_cache.k_gpu[layer_idx], &s.fa_k, &s.pos_buf, kv_dim)?;
+                gpu.kv_cache_write(&kv_cache.v_gpu[layer_idx], &s.fa_v, &s.pos_buf, kv_dim)?;
+                gpu.attention_f32(
+                    &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                    &s.fa_attn_out, &s.pos_buf, pos + 1,
+                    config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+                )?;
+
+                gpu.sigmoid_f32(&s.fa_gate)?;
+                gpu.mul_f32(&s.fa_attn_out, &s.fa_gate, &s.fa_attn_out)?;
+                weight_gemv(gpu, &layer.wo, &s.fa_attn_out, &s.o)?;
+                gpu.add_inplace_f32(&s.x, &s.o)?;
+
+                // FFN
+                gpu.rmsnorm_f32(&s.x, &layer.ffn_norm, &s.tmp, config.norm_eps)?;
+                weight_gemv(gpu, &layer.w_gate, &s.tmp, &s.gate_ffn)?;
+                weight_gemv(gpu, &layer.w_up, &s.tmp, &s.up)?;
+                gpu.silu_mul_f32(&s.gate_ffn, &s.up, &s.ffn_hidden)?;
+                weight_gemv(gpu, &layer.w_down, &s.ffn_hidden, &s.ffn_out)?;
+                gpu.add_inplace_f32(&s.x, &s.ffn_out)?;
+            }
+
+            _ => panic!("layer type mismatch at layer {layer_idx}"),
+        }
+    }
+
+    // Final norm + logits into scratch.logits
+    gpu.rmsnorm_f32(&s.x, &weights.output_norm, &s.tmp, config.norm_eps)?;
+    weight_gemv(gpu, &weights.output, &s.tmp, &s.logits)?;
+
+    Ok(())
+}
+
+/// Forward pass returning logits ON GPU (no download). Caller must free the tensor.
+/// Use with gpu.sample_top_p() after applying CPU-side n-gram blocking via download/modify/upload.
+pub fn forward_gpu(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    token: u32,
+    pos: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+) -> HipResult<GpuTensor> {
+    let dim = config.dim;
+    let x = gpu.alloc_tensor(&[dim], DType::F32)?;
+    match weights.embd_format {
+        EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256(&weights.token_embd, &x, token, dim)?,
+        EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(&weights.token_embd, &x, token, dim)?,
+        EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.token_embd, &x, token, dim)?,
+        EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &x, token, dim)?,
+        _ => panic!("unsupported embedding format"),
+    }
+    forward_from_x_gpu(gpu, weights, config, x, pos, kv_cache, dn_state)
+}
+
+/// Run one step with a pre-computed embedding vector (for VL visual token injection).
+/// embedding_data: [dim] F32 values on CPU — uploaded to GPU as the initial hidden state.
+pub fn forward_with_embedding(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    embedding_data: &[f32],
+    pos: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+) -> HipResult<Vec<f32>> {
+    let x = gpu.upload_f32(embedding_data, &[config.dim])?;
+    forward_from_x(gpu, weights, config, x, pos, kv_cache, dn_state)
 }
