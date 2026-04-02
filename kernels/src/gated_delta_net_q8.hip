@@ -1,0 +1,89 @@
+#include <hip/hip_runtime.h>
+
+#define HD 128
+#define TILE_ROWS 4
+
+extern "C" __launch_bounds__(32, 8)
+__global__ void gated_delta_net_q8(
+    const float* __restrict__ q,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    const float* __restrict__ gate,
+    const float* __restrict__ beta,
+    signed char* __restrict__ s_q8,
+    float* __restrict__ s_scales,
+    float* __restrict__ output,
+    int n_tokens,
+    int n_heads,
+    int head_dim
+) {
+    const int h = blockIdx.x;
+    const int tile = blockIdx.y;
+    if (h >= n_heads) return;
+    const int tid = threadIdx.x;
+    const int col = tid * 4;
+    const int stride = n_heads * HD;
+    const int row_start = tile * TILE_ROWS;
+
+    __shared__ float S_tile[TILE_ROWS * HD];  // 4KB
+
+    // Dequant Q8 tile → FP32 in LDS
+    signed char* sq_base = s_q8 + h * HD * HD + row_start * HD;
+    for (int i = tid; i < TILE_ROWS * HD; i += 32) {
+        int r = i / HD;
+        float scale = s_scales[h * HD + row_start + r];
+        S_tile[i] = scale * (float)sq_base[i];
+    }
+
+    for (int t = 0; t < n_tokens; t++) {
+        const float* q_t = q + t * stride + h * HD;
+        const float* k_t = k + t * stride + h * HD;
+        const float* v_t = v + t * stride + h * HD;
+        float alpha = expf(gate[t * n_heads + h]);
+        float beta_v = beta[t * n_heads + h];
+
+        float k0 = k_t[col], k1 = k_t[col+1], k2 = k_t[col+2], k3 = k_t[col+3];
+        float q0 = q_t[col], q1 = q_t[col+1], q2 = q_t[col+2], q3 = q_t[col+3];
+
+        for (int r = 0; r < TILE_ROWS; r++) {
+            int row = row_start + r;
+            float* sr = S_tile + r * HD + col;
+            float s0 = sr[0], s1 = sr[1], s2 = sr[2], s3 = sr[3];
+
+            float kv = s0*k0 + s1*k1 + s2*k2 + s3*k3;
+            for (int o = 16; o > 0; o >>= 1)
+                kv += __shfl_down(kv, o);
+            kv = __shfl(kv, 0);
+
+            float delta = (v_t[row] - alpha * kv) * beta_v;
+
+            s0 = alpha * s0 + k0 * delta;
+            s1 = alpha * s1 + k1 * delta;
+            s2 = alpha * s2 + k2 * delta;
+            s3 = alpha * s3 + k3 * delta;
+            sr[0] = s0; sr[1] = s1; sr[2] = s2; sr[3] = s3;
+
+            float out_v = s0*q0 + s1*q1 + s2*q2 + s3*q3;
+            for (int o = 16; o > 0; o >>= 1)
+                out_v += __shfl_down(out_v, o);
+            if (tid == 0)
+                output[t * stride + h * HD + row] = out_v;
+        }
+    }
+
+    // Requant FP32 → Q8
+    for (int r = 0; r < TILE_ROWS; r++) {
+        float* sr = S_tile + r * HD + col;
+        float my_max = fmaxf(fmaxf(fabsf(sr[0]), fabsf(sr[1])), fmaxf(fabsf(sr[2]), fabsf(sr[3])));
+        for (int o = 16; o > 0; o >>= 1)
+            my_max = fmaxf(my_max, __shfl_xor(my_max, o));
+
+        float inv_s = (my_max > 0.0f) ? (127.0f / my_max) : 0.0f;
+        signed char* dst = sq_base + r * HD + col;
+        dst[0] = (signed char)fminf(fmaxf(roundf(sr[0] * inv_s), -128.0f), 127.0f);
+        dst[1] = (signed char)fminf(fmaxf(roundf(sr[1] * inv_s), -128.0f), 127.0f);
+        dst[2] = (signed char)fminf(fmaxf(roundf(sr[2] * inv_s), -128.0f), 127.0f);
+        dst[3] = (signed char)fminf(fmaxf(roundf(sr[3] * inv_s), -128.0f), 127.0f);
+        if (tid == 0) s_scales[h * HD + row_start + r] = (my_max > 0.0f) ? (my_max / 127.0f) : 1.0f;
+    }
+}

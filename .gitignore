@@ -4,24 +4,22 @@
 *~
 .DS_Store
 
-# Dev process files (Claude Code orchestration)
-CLAUDE.md
-NEXT-STEPS.md
-harness.sh
-results.tsv
-/findings/
-/experiments/
+# Dev assets (test models, bench results, test images)
+/dev/
+/dist/
 
-# Model files
+# Model files (large binaries)
+/models/
 *.gguf
-*.hfq
 *.safetensors
 
-# Benchmark result data
-bench/results/*.json
-bench/results/*.txt
-bench/results/*.md
+# Pre-compiled kernels are tracked (small .hsaco blobs)
+# but source .hip files are also tracked
 
 # Tool configs
 .serena/
-models/
+.remember/
+
+# Claude Code orchestration
+CLAUDE.md
+harness.sh
