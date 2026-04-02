@@ -32,6 +32,7 @@ fn main() {
 
     // Parse flags
     let no_think = args.iter().any(|a| a == "--no-think");
+    let debug_cmp = args.iter().any(|a| a == "--debug-compare");
     let image_path = args.iter().position(|a| a == "--image")
         .and_then(|i| args.get(i + 1).cloned());
     let vl_mode = image_path.is_some();
@@ -115,6 +116,39 @@ fn main() {
     let mut kv_cache = llama::KvCache::new_gpu(&mut gpu, text_config.n_layers, text_config.n_kv_heads, text_config.head_dim, kv_seq).unwrap();
     let mut dn_state = DeltaNetState::new(&mut gpu, &text_config).unwrap();
 
+    if debug_cmp {
+        let mut kv2 = llama::KvCache::new_gpu(&mut gpu, text_config.n_layers, text_config.n_kv_heads, text_config.head_dim, kv_seq).unwrap();
+        let mut dn2 = DeltaNetState::new(&mut gpu, &text_config).unwrap();
+        let scratch = qwen35::Qwen35Scratch::new(&mut gpu, &text_config, 128).unwrap();
+        let test_token = tokenizer.encode("Hello")[0];
+        // Run a sequence of tokens through both paths and compare at each step
+        let test_seq = tokenizer.encode("What is the capital of France?");
+        eprintln!("=== Debug: comparing {} tokens through both paths ===", test_seq.len());
+        for (i, &tok) in test_seq.iter().enumerate() {
+            let logits_a = qwen35::forward(&mut gpu, &weights, &text_config, tok, i, &mut kv_cache, &mut dn_state).unwrap();
+            qwen35::forward_scratch(&mut gpu, &weights, &text_config, tok, i, &mut kv2, &mut dn2, &scratch).unwrap();
+            let logits_b = gpu.download_f32(&scratch.logits).unwrap();
+
+            let mut max_diff = 0.0f32;
+            let mut max_idx = 0;
+            for j in 0..logits_a.len().min(logits_b.len()) {
+                let d = (logits_a[j] - logits_b[j]).abs();
+                if d > max_diff { max_diff = d; max_idx = j; }
+            }
+            let mut sa: Vec<(usize, f32)> = logits_a.iter().enumerate().map(|(i,&v)| (i,v)).collect();
+            sa.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            let mut sb: Vec<(usize, f32)> = logits_b.iter().enumerate().map(|(i,&v)| (i,v)).collect();
+            sb.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            let top_match = sa[0].0 == sb[0].0;
+            eprintln!("  pos={i:2} tok={tok:6} max_diff={max_diff:.6} top1_match={top_match} A_top={} B_top={}", sa[0].0, sb[0].0);
+            if max_diff > 1.0 {
+                eprintln!("  DIVERGED at pos {i}!");
+                break;
+            }
+        }
+        std::process::exit(0);
+    }
+
     // Build ChatML prompt
     let im_start = tokenizer.encode("<|im_start|>");
     let im_end = tokenizer.encode("<|im_end|>");
@@ -150,21 +184,22 @@ fn main() {
         if vl_mode { format!(" ({} visual + {} text)", n_visual_tokens, prompt_tokens.len() - n_visual_tokens) } else { String::new() });
 
     let sc = llama::SamplingConfig::text_thinking();
+    let scratch = qwen35::Qwen35Scratch::new(&mut gpu, &text_config, sc.repeat_window)
+        .expect("failed to create scratch");
 
-    // Prefill
+    // Prefill (zero-alloc scratch path)
     let t_pf = Instant::now();
-    let mut logits = vec![0.0f32; text_config.vocab_size];
     let mut visual_idx = 0usize;
     for (pos, &token) in prompt_tokens.iter().enumerate() {
         if vl_mode && token == IMAGE_PAD_ID && visual_idx < n_visual_tokens {
             let vt = visual_tokens.as_ref().unwrap();
             let emb = &vt[visual_idx * text_config.dim..(visual_idx + 1) * text_config.dim];
-            logits = qwen35::forward_with_embedding(&mut gpu, &weights, &text_config, emb, pos, &mut kv_cache, &mut dn_state)
-                .expect("forward_with_embedding failed");
+            qwen35::forward_scratch_embed(&mut gpu, &weights, &text_config, emb, pos, &mut kv_cache, &mut dn_state, &scratch)
+                .expect("forward_scratch_embed failed");
             visual_idx += 1;
         } else {
-            logits = qwen35::forward(&mut gpu, &weights, &text_config, token, pos, &mut kv_cache, &mut dn_state)
-                .expect("forward failed");
+            qwen35::forward_scratch(&mut gpu, &weights, &text_config, token, pos, &mut kv_cache, &mut dn_state, &scratch)
+                .expect("forward_scratch failed");
         }
     }
     let prefill_len = prompt_tokens.len();
@@ -180,6 +215,7 @@ fn main() {
     let max_think = 512;
 
     // First token
+    let mut logits = gpu.download_f32(&scratch.logits).unwrap();
     let temp = if in_thinking { sc.think_temp } else { sc.answer_temp };
     let mut next_token = llama::sample_top_p(&logits, temp, sc.top_p);
 
@@ -215,8 +251,9 @@ fn main() {
         let pos = prefill_len + generated.len() - 1;
         let temp = if in_thinking { sc.think_temp } else { sc.answer_temp };
 
-        logits = qwen35::forward(&mut gpu, &weights, &text_config, next_token, pos,
-            &mut kv_cache, &mut dn_state).expect("forward failed");
+        qwen35::forward_scratch(&mut gpu, &weights, &text_config, next_token, pos,
+            &mut kv_cache, &mut dn_state, &scratch).expect("forward_scratch failed");
+        logits = gpu.download_f32(&scratch.logits).unwrap();
         if !in_thinking {
             llama::apply_ngram_block(&mut logits, &token_history);
         }
@@ -227,4 +264,44 @@ fn main() {
     let gen_ms = t_gen.elapsed().as_millis();
     let tok_s = if gen_ms > 0 { generated.len() as f64 / (gen_ms as f64 / 1000.0) } else { 0.0 };
     eprintln!("\n\n=== Done: {} tokens in {}ms ({:.1} tok/s) ===", generated.len(), gen_ms, tok_s);
+}
+
+// Debug: compare forward() vs forward_scratch() logits on first token
+#[allow(dead_code)]
+fn debug_compare(
+    gpu: &mut rdna_compute::Gpu,
+    weights: &engine::qwen35::Qwen35Weights,
+    config: &engine::qwen35::Qwen35Config,
+    token: u32,
+    kv_cache1: &mut engine::llama::KvCache,
+    dn_state1: &mut engine::qwen35::DeltaNetState,
+    kv_cache2: &mut engine::llama::KvCache,
+    dn_state2: &mut engine::qwen35::DeltaNetState,
+    scratch: &engine::qwen35::Qwen35Scratch,
+) {
+    // Path A: forward() 
+    let logits_a = engine::qwen35::forward(gpu, weights, config, token, 0, kv_cache1, dn_state1).unwrap();
+    
+    // Path B: forward_scratch()
+    engine::qwen35::forward_scratch(gpu, weights, config, token, 0, kv_cache2, dn_state2, scratch).unwrap();
+    let logits_b = gpu.download_f32(&scratch.logits).unwrap();
+    
+    // Compare
+    let mut max_diff = 0.0f32;
+    let mut max_idx = 0;
+    let mut n_diff = 0;
+    for i in 0..logits_a.len().min(logits_b.len()) {
+        let diff = (logits_a[i] - logits_b[i]).abs();
+        if diff > 0.001 { n_diff += 1; }
+        if diff > max_diff { max_diff = diff; max_idx = i; }
+    }
+    eprintln!("COMPARE: max_diff={max_diff:.6} at idx={max_idx}, n_diff(>0.001)={n_diff}/{}", logits_a.len());
+    eprintln!("  A[{max_idx}]={:.6}  B[{max_idx}]={:.6}", logits_a[max_idx], logits_b[max_idx]);
+    // Check top-5
+    let mut sorted_a: Vec<(usize, f32)> = logits_a.iter().enumerate().map(|(i,&v)| (i,v)).collect();
+    sorted_a.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    let mut sorted_b: Vec<(usize, f32)> = logits_b.iter().enumerate().map(|(i,&v)| (i,v)).collect();
+    sorted_b.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    eprintln!("  Top-5 A: {:?}", &sorted_a[..5].iter().map(|(i,v)| format!("{}:{:.3}", i, v)).collect::<Vec<_>>());
+    eprintln!("  Top-5 B: {:?}", &sorted_b[..5].iter().map(|(i,v)| format!("{}:{:.3}", i, v)).collect::<Vec<_>>());
 }
