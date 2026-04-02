@@ -39,14 +39,13 @@ case "$OS" in
     mingw*|msys*|cygwin*)
         echo "Windows detected (via $OS)."
         echo ""
-        echo "hipfire Windows support is in progress. Current options:"
-        echo "  1. Use WSL2 with AMD GPU passthrough (recommended)"
-        echo "  2. Native Windows build (coming soon)"
-        echo ""
-        echo "For WSL2 setup:"
-        echo "  wsl --install"
-        echo "  # Then inside WSL:"
-        echo "  curl -L https://raw.githubusercontent.com/$GITHUB_REPO/$GITHUB_BRANCH/scripts/install.sh | bash"
+        echo "hipfire has native Windows support. Install options:"
+        echo "  1. PowerShell (recommended):"
+        echo "     irm https://raw.githubusercontent.com/$GITHUB_REPO/$GITHUB_BRANCH/scripts/install.ps1 | iex"
+        echo "  2. WSL2 (alternative):"
+        echo "     wsl --install"
+        echo "     # Then inside WSL:"
+        echo "     curl -L https://raw.githubusercontent.com/$GITHUB_REPO/$GITHUB_BRANCH/scripts/install.sh | bash"
         exit 1
         ;;
     *)
