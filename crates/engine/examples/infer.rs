@@ -113,7 +113,7 @@ fn main() {
     let weights = qwen35::load_weights(&hfq, &text_config, &mut gpu).expect("failed to load text weights");
 
     let kv_seq = 4096usize;
-    let mut kv_cache = llama::KvCache::new_gpu(&mut gpu, text_config.n_layers, text_config.n_kv_heads, text_config.head_dim, kv_seq).unwrap();
+    let mut kv_cache = llama::KvCache::new_gpu_q8(&mut gpu, text_config.n_layers, text_config.n_kv_heads, text_config.head_dim, kv_seq).unwrap();
     let mut dn_state = DeltaNetState::new(&mut gpu, &text_config).unwrap();
 
     if debug_cmp {

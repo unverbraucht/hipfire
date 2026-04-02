@@ -675,14 +675,23 @@ fn forward_from_x_gpu(
                 gpu.rope_partial_interleaved_f32(&q, &k, pos as i32,
                     config.n_heads, config.n_kv_heads, config.head_dim, n_rot, config.rope_theta)?;
 
-                // KV cache write + attention
-                gpu.kv_cache_write(&kv_cache.k_gpu[layer_idx], &k, &pos_buf, kv_dim)?;
-                gpu.kv_cache_write(&kv_cache.v_gpu[layer_idx], &v, &pos_buf, kv_dim)?;
+                // KV cache write + attention (Q8 if available, FP32 fallback)
                 let attn_out = gpu.alloc_tensor(&[q_dim], DType::F32)?;
-                gpu.attention_f32(
-                    &q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                    &attn_out, &pos_buf, pos + 1, config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
-                )?;
+                if kv_cache.quant_q8 {
+                    gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &k, &pos_buf, config.n_kv_heads, config.head_dim)?;
+                    gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &v, &pos_buf, config.n_kv_heads, config.head_dim)?;
+                    gpu.attention_q8_0_kv(
+                        &q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                        &attn_out, &pos_buf, pos + 1, config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+                    )?;
+                } else {
+                    gpu.kv_cache_write(&kv_cache.k_gpu[layer_idx], &k, &pos_buf, kv_dim)?;
+                    gpu.kv_cache_write(&kv_cache.v_gpu[layer_idx], &v, &pos_buf, kv_dim)?;
+                    gpu.attention_f32(
+                        &q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                        &attn_out, &pos_buf, pos + 1, config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+                    )?;
+                }
 
                 // Sigmoid gate
                 gpu.sigmoid_f32(&gate_vec)?;
@@ -992,13 +1001,23 @@ fn forward_scratch_layers(
                 gpu.rope_partial_interleaved_f32(&s.fa_q, &s.fa_k, pos as i32,
                     config.n_heads, config.n_kv_heads, config.head_dim, n_rot, config.rope_theta)?;
 
-                gpu.kv_cache_write(&kv_cache.k_gpu[layer_idx], &s.fa_k, &s.pos_buf, kv_dim)?;
-                gpu.kv_cache_write(&kv_cache.v_gpu[layer_idx], &s.fa_v, &s.pos_buf, kv_dim)?;
-                gpu.attention_f32(
-                    &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                    &s.fa_attn_out, &s.pos_buf, pos + 1,
-                    config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
-                )?;
+                if kv_cache.quant_q8 {
+                    gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &s.fa_k, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
+                    gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &s.fa_v, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
+                    gpu.attention_q8_0_kv(
+                        &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                        &s.fa_attn_out, &s.pos_buf, pos + 1,
+                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+                    )?;
+                } else {
+                    gpu.kv_cache_write(&kv_cache.k_gpu[layer_idx], &s.fa_k, &s.pos_buf, kv_dim)?;
+                    gpu.kv_cache_write(&kv_cache.v_gpu[layer_idx], &s.fa_v, &s.pos_buf, kv_dim)?;
+                    gpu.attention_f32(
+                        &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                        &s.fa_attn_out, &s.pos_buf, pos + 1,
+                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+                    )?;
+                }
 
                 gpu.sigmoid_f32(&s.fa_gate)?;
                 gpu.mul_f32(&s.fa_attn_out, &s.fa_gate, &s.fa_attn_out)?;
