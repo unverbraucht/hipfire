@@ -52,7 +52,7 @@ hipfire run models/qwen3.5-4b.q4.hfq "What is the capital of France?"
 ```bash
 hipfire serve [port]           # OpenAI-compatible HTTP server
 hipfire run <model> [prompt]   # Interactive generation
-hipfire run <model> --image img.png [prompt]  # Vision-language
+hipfire run <model> --image img.png [prompt]  # Vision-language (coming soon in CLI)
 hipfire list                   # Show local models
 ```
 

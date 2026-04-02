@@ -104,6 +104,19 @@ async function serve(port: number) {
   await e.send({ type: "ping" }); await e.recv();
   let current: string | null = null;
 
+  // Single-flight: only one generation at a time (GPU is single-threaded)
+  let busy = false;
+  const queue: Array<{ resolve: () => void }> = [];
+  async function acquireLock() {
+    if (!busy) { busy = true; return; }
+    await new Promise<void>(resolve => queue.push({ resolve }));
+  }
+  function releaseLock() {
+    const next = queue.shift();
+    if (next) next.resolve();
+    else busy = false;
+  }
+
   console.error(`[hipfire] http://localhost:${port}/v1/chat/completions`);
 
   Bun.serve({
@@ -114,10 +127,12 @@ async function serve(port: number) {
       if (url.pathname === "/v1/models") return Response.json({ data: list().map(m => ({ id: m.name })) });
 
       if (url.pathname === "/v1/chat/completions" && req.method === "POST") {
+        await acquireLock();
+        try {
         const body = await req.json();
         const prompt = (body.messages || []).map((m: any) => m.content).join("\n");
         const path = findModel(body.model || "default");
-        if (!path) return Response.json({ error: "model not found" }, { status: 404 });
+        if (!path) { releaseLock(); return Response.json({ error: "model not found" }, { status: 404 }); }
 
         if (current !== path) {
           if (current) { await e.send({ type: "unload" }); await e.recv(); }
@@ -152,7 +167,9 @@ async function serve(port: number) {
           temperature: (body.temperature ?? 0.3) * TEMP_CORRECTION,
           max_tokens: body.max_tokens ?? 512,
         })) { if (msg.type === "token") content += msg.text; }
+        releaseLock();
         return Response.json({ choices: [{ message: { role: "assistant", content } }] });
+        } finally { releaseLock(); }
       }
       return Response.json({ error: "not found" }, { status: 404 });
     }
@@ -188,7 +205,18 @@ function list() {
 const [cmd, ...rest] = process.argv.slice(2);
 switch (cmd) {
   case "serve": await serve(parseInt(rest[0]) || DEFAULT_PORT); break;
-  case "run": await run(rest[0] || "", rest.slice(1).join(" ") || "Hello"); break;
+  case "run": {
+    const model = rest[0];
+    if (!model) { console.error("Usage: hipfire run <model> [--image img.png] [prompt]"); process.exit(1); }
+    const imgIdx = rest.indexOf("--image");
+    const image = imgIdx >= 0 ? rest[imgIdx + 1] : undefined;
+    const filtered = rest.slice(1).filter((_, i) => i !== imgIdx - 1 && i !== imgIdx);
+    const prompt = filtered.join(" ") || "Hello";
+    // TODO: pass image to daemon when VL mode is wired into daemon protocol
+    if (image) console.error(`[VL mode: ${image}] (image support in daemon coming soon)`);
+    await run(model, prompt);
+    break;
+  }
   case "list": for (const m of list()) console.log(`${m.name.padEnd(40)} ${m.size}`); break;
   case "rm": { const p = findModel(rest[0] || ""); if (p) { require("fs").unlinkSync(p); console.log(`Removed ${p}`); } break; }
   default:

@@ -91,16 +91,29 @@ mkdir -p "$BIN_DIR" "$KERNELS_DIR" "$MODELS_DIR"
 
 # ─── Download binary ─────────────────────────────────────
 echo ""
-echo "Downloading hipfire binary..."
-# For alpha: copy from local build if available
-if [ -f "target/release/examples/daemon" ]; then
-    cp target/release/examples/daemon "$BIN_DIR/daemon"
-    cp target/release/examples/infer "$BIN_DIR/infer" 2>/dev/null || true
-    cp target/release/examples/infer_hfq "$BIN_DIR/infer_hfq" 2>/dev/null || true
-    echo "  Copied from local build ✓"
+echo "Installing hipfire..."
+# For alpha: copy from local checkout if available
+REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+if [ -f "$REPO_DIR/target/release/examples/daemon" ]; then
+    cp "$REPO_DIR/target/release/examples/daemon" "$BIN_DIR/daemon"
+    cp "$REPO_DIR/target/release/examples/infer" "$BIN_DIR/infer" 2>/dev/null || true
+    cp "$REPO_DIR/target/release/examples/infer_hfq" "$BIN_DIR/infer_hfq" 2>/dev/null || true
+    # Copy CLI + wrapper
+    mkdir -p "$HIPFIRE_DIR/cli"
+    cp "$REPO_DIR/cli/index.ts" "$HIPFIRE_DIR/cli/index.ts"
+    cp "$REPO_DIR/cli/package.json" "$HIPFIRE_DIR/cli/package.json"
+    cat > "$BIN_DIR/hipfire" << 'WRAPPER'
+#!/bin/bash
+exec bun run "$HOME/.hipfire/cli/index.ts" "$@"
+WRAPPER
+    chmod +x "$BIN_DIR/hipfire"
+    echo "  Binaries + CLI copied ✓"
+    echo "  hipfire command: $BIN_DIR/hipfire"
 else
-    echo "  TODO: download from GitHub releases"
-    echo "  For now: cargo build --release --features deltanet --example daemon --example infer --example infer_hfq -p engine"
+    echo "  ERROR: No local build found."
+    echo "  Build first: cd $REPO_DIR && cargo build --release --features deltanet --example daemon --example infer --example infer_hfq -p engine"
+    echo "  Then re-run this installer."
+    exit 1
 fi
 
 # ─── Download kernels ────────────────────────────────────
