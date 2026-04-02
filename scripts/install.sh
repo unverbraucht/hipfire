@@ -110,10 +110,27 @@ WRAPPER
     echo "  Binaries + CLI copied ✓"
     echo "  hipfire command: $BIN_DIR/hipfire"
 else
-    echo "  ERROR: No local build found."
-    echo "  Build first: cd $REPO_DIR && cargo build --release --features deltanet --example daemon --example infer --example infer_hfq -p engine"
-    echo "  Then re-run this installer."
-    exit 1
+    echo "  No pre-built binaries found. Building from source..."
+    if ! command -v cargo &>/dev/null; then
+        echo "  Installing Rust..."
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y 2>/dev/null
+        source "$HOME/.cargo/env"
+    fi
+    cd "$REPO_DIR"
+    echo "  cargo build --release (this takes a few minutes)..."
+    cargo build --release --features deltanet --example daemon --example infer --example infer_hfq -p engine 2>&1 | tail -3
+    cp target/release/examples/daemon "$BIN_DIR/daemon"
+    cp target/release/examples/infer "$BIN_DIR/infer" 2>/dev/null || true
+    cp target/release/examples/infer_hfq "$BIN_DIR/infer_hfq" 2>/dev/null || true
+    mkdir -p "$HIPFIRE_DIR/cli"
+    cp cli/index.ts "$HIPFIRE_DIR/cli/index.ts"
+    cp cli/package.json "$HIPFIRE_DIR/cli/package.json"
+    cat > "$BIN_DIR/hipfire" << 'WRAPPER'
+#!/bin/bash
+exec bun run "$HOME/.hipfire/cli/index.ts" "$@"
+WRAPPER
+    chmod +x "$BIN_DIR/hipfire"
+    echo "  Built and installed ✓"
 fi
 
 # ─── Download kernels ────────────────────────────────────
