@@ -74,7 +74,7 @@ Compress the KV cache with FWHT + quantization for longer context in less VRAM:
 
 | Family | Sizes | Arch | Quants |
 |--------|-------|------|--------|
-| Qwen3.5 | 0.8B, 2B, 4B, 9B | DeltaNet hybrid | HFQ4, HFQ6 |
+| Qwen3.5 | 0.8B, 2B, 4B, 9B, 27B | DeltaNet hybrid | HFQ4, HFQ6 |
 | Qwen3.5-VL | 0.8B, 4B, 9B | DeltaNet + ViT | HFQ4 + F16 vision |
 | Qwen3 | 0.6B, 8B | LLaMA attention | HFQ4 |
 

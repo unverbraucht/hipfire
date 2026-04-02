@@ -68,6 +68,19 @@ From earlier benchmarks (2026-03-27):
 | turbo3 (3-bit) | 50.8 | 44.5 | 9.85x |
 | turbo4 (4-bit) | 53.6 | 51.0 | 7.5x |
 
+## Qwen3.5-27B — Awaiting Tester Benchmarks
+
+27B does not fit on 8GB cards. Needs 16GB+ VRAM.
+
+| GPU | VRAM | HFQ4 (14.3GB) | HFQ6 (21.1GB) |
+|-----|------|----------------|----------------|
+| RX 5700 XT | 8GB | Does not fit | Does not fit |
+| RX 6800 XT | 16GB | Fits — benchmark wanted | Does not fit |
+| RX 7900 XTX | 24GB | Fits — benchmark wanted | Fits — benchmark wanted |
+| RX 9070 | 16GB | Fits — benchmark wanted | Does not fit |
+
+To submit benchmarks, see [CONTRIBUTING.md](../CONTRIBUTING.md).
+
 ## Comparison vs llama.cpp + ROCm
 
 | Setup | Model | tok/s |

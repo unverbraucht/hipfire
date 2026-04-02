@@ -91,15 +91,32 @@ run_bench() {
 
 # ─── Phase 1: All models, default KV (Q8) ─────────────────
 
+# ─── VRAM detection ──────────────────────────────────────
+VRAM_MB=0
+if command -v rocm-smi &>/dev/null; then
+    VRAM_MB=$(rocm-smi --showmeminfo vram 2>/dev/null | grep "Total" | grep -oP '\d+' | head -1 || echo "0")
+    VRAM_MB=$((VRAM_MB / 1048576))  # bytes → MB
+fi
+if [ "$VRAM_MB" -eq 0 ] 2>/dev/null; then
+    # Fallback: parse from kernel log or sysfs
+    VRAM_MB=$(cat /sys/class/drm/card*/device/mem_info_vram_total 2>/dev/null | head -1 || echo "0")
+    VRAM_MB=$((VRAM_MB / 1048576))  # bytes → MB
+fi
+echo "Detected VRAM: ${VRAM_MB}MB" >&2
+
+# Model list with minimum VRAM requirement in MB
+# Format: filename:label:min_vram_mb
 QWEN35_MODELS=(
-    "qwen3.5-0.8b.q4.hfq:0.8B-Q4"
-    "qwen3.5-0.8b.hfq6.hfq:0.8B-HFQ6"
-    "qwen3.5-2b.q4.hfq:2B-Q4"
-    "qwen3.5-2b.hfq6.hfq:2B-HFQ6"
-    "qwen3.5-4b.q4.hfq:4B-Q4"
-    "qwen3.5-4b.hfq6.hfq:4B-HFQ6"
-    "qwen3.5-9b.q4.hfq:9B-Q4"
-    "qwen3.5-9b.hfq6.hfq:9B-HFQ6"
+    "qwen3.5-0.8b.q4.hfq:0.8B-Q4:1024"
+    "qwen3.5-0.8b.hfq6.hfq:0.8B-HFQ6:1024"
+    "qwen3.5-2b.q4.hfq:2B-Q4:2048"
+    "qwen3.5-2b.hfq6.hfq:2B-HFQ6:2560"
+    "qwen3.5-4b.q4.hfq:4B-Q4:3584"
+    "qwen3.5-4b.hfq6.hfq:4B-HFQ6:4608"
+    "qwen3.5-9b.q4.hfq:9B-Q4:6144"
+    "qwen3.5-9b.hfq6.hfq:9B-HFQ6:8192"
+    "qwen3.5-27b.q4.hfq:27B-Q4:15360"
+    "qwen3.5-27b.hfq6.hfq:27B-HFQ6:22528"
 )
 
 echo "## Phase 1: Speed + Coherence (Q8 KV, --no-think)" | tee -a "$RESULTS"
@@ -110,11 +127,15 @@ echo "|-------|-------|--------|-----------|" | tee -a "$RESULTS"
 echo "" > "$OUT_DIR/megabench-raw.log"
 
 for entry in "${QWEN35_MODELS[@]}"; do
-    file="${entry%%:*}"
-    label="${entry##*:}"
+    IFS=':' read -r file label min_vram <<< "$entry"
     model="$MODELS_DIR/$file"
     if [ ! -f "$model" ]; then
         echo "| $label | MISSING | - | - |" | tee -a "$RESULTS"
+        continue
+    fi
+    if [ "$VRAM_MB" -gt 0 ] && [ "$min_vram" -gt "$VRAM_MB" ]; then
+        echo "| $label | SKIP (${min_vram}MB > ${VRAM_MB}MB VRAM) | - | - |" | tee -a "$RESULTS"
+        echo ">>> Skipping $label (needs ${min_vram}MB, have ${VRAM_MB}MB)" >&2
         continue
     fi
     echo ">>> Running $label ..." >&2
