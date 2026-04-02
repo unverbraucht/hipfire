@@ -80,6 +80,8 @@ pub struct HipRuntime {
     fn_graph_exec_destroy: unsafe extern "C" fn(HipGraphExec) -> u32,
     fn_graph_destroy: unsafe extern "C" fn(HipGraph) -> u32,
     fn_device_synchronize: unsafe extern "C" fn() -> u32,
+    fn_get_device_properties: unsafe extern "C" fn(*mut u8, c_int) -> u32,
+    fn_mem_get_info: unsafe extern "C" fn(*mut usize, *mut usize) -> u32,
 }
 
 // HipRuntime is Send+Sync — the underlying HIP runtime is thread-safe for API calls.
@@ -138,6 +140,8 @@ impl HipRuntime {
                 fn_graph_exec_destroy: load_fn!(lib, "hipGraphExecDestroy", unsafe extern "C" fn(HipGraphExec) -> u32),
                 fn_graph_destroy: load_fn!(lib, "hipGraphDestroy", unsafe extern "C" fn(HipGraph) -> u32),
                 fn_device_synchronize: load_fn!(lib, "hipDeviceSynchronize", unsafe extern "C" fn() -> u32),
+                fn_get_device_properties: load_fn!(lib, "hipGetDeviceProperties", unsafe extern "C" fn(*mut u8, c_int) -> u32),
+                fn_mem_get_info: load_fn!(lib, "hipMemGetInfo", unsafe extern "C" fn(*mut usize, *mut usize) -> u32),
                 _lib: lib,
             })
         }
@@ -519,6 +523,43 @@ impl HipRuntime {
     pub fn device_synchronize(&self) -> HipResult<()> {
         let code = unsafe { (self.fn_device_synchronize)() };
         self.check(code, "hipDeviceSynchronize")
+    }
+
+    /// Get GPU architecture string (e.g., "gfx1010", "gfx1030", "gfx1100").
+    /// Allocates a large buffer for hipDeviceProp_t, reads gcnArchName from offset 0.
+    pub fn get_arch(&self, device_id: i32) -> HipResult<String> {
+        let mut buf = vec![0u8; 1024]; // hipDeviceProp_t varies by ROCm version, 1024 is safe
+        let code = unsafe { (self.fn_get_device_properties)(buf.as_mut_ptr(), device_id as c_int) };
+        self.check(code, "hipGetDeviceProperties")?;
+        // gcnArchName is a null-terminated C string at the start of the struct
+        // Actually it's at a fixed offset. On ROCm 5/6, gcnArchName is at offset 500+.
+        // Safer: search for "gfx" in the buffer.
+        let s = String::from_utf8_lossy(&buf);
+        if let Some(pos) = s.find("gfx") {
+            let arch_str = &s[pos..];
+            let end = arch_str.find(|c: char| c == '\0' || c == ':' || c == ' ').unwrap_or(arch_str.len());
+            Ok(arch_str[..end].to_string())
+        } else {
+            // Fallback: read as null-terminated string from known offsets
+            // gcnArchName is typically at offset 0 in older ROCm or at a named field
+            let cstr = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr() as *const c_char) };
+            let name = cstr.to_string_lossy().to_string();
+            if name.starts_with("gfx") {
+                let end = name.find(':').unwrap_or(name.len());
+                Ok(name[..end].to_string())
+            } else {
+                Ok("unknown".to_string())
+            }
+        }
+    }
+
+    /// Get VRAM info: (free_bytes, total_bytes).
+    pub fn get_vram_info(&self) -> HipResult<(usize, usize)> {
+        let mut free: usize = 0;
+        let mut total: usize = 0;
+        let code = unsafe { (self.fn_mem_get_info)(&mut free, &mut total) };
+        self.check(code, "hipMemGetInfo")?;
+        Ok((free, total))
     }
 }
 

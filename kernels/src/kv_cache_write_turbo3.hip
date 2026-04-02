@@ -1,3 +1,6 @@
+#include <hip/hip_runtime.h>
+#include "turbo_common.h"
+
 // Fused KV write: both K and V in one kernel, 32 threads per head for parallel FWHT.
 // Grid: n_kv_heads blocks, 32 threads each.
 extern "C" __global__ void kv_cache_write_turbo3(

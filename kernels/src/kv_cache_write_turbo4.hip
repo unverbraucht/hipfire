@@ -1,3 +1,6 @@
+#include <hip/hip_runtime.h>
+#include "turbo_common.h"
+
 // Fused K+V write for turbo_hfq4. 32 threads, parallel FWHT + 4-bit quantize.
 extern "C" __global__ void kv_cache_write_turbo4(
     unsigned char* __restrict__ k_dst,

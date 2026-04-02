@@ -1,4 +1,5 @@
 //! Compile HIP kernels to code objects (.hsaco) via hipcc.
+//! Supports pre-compiled .hsaco blobs for deployment without ROCm SDK.
 
 use hip_bridge::HipResult;
 use std::collections::HashMap;
@@ -8,10 +9,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Compiles HIP kernel sources to code objects, with caching.
+/// Tries pre-compiled blobs first (kernels/compiled/{arch}/), falls back to hipcc.
 pub struct KernelCompiler {
     cache_dir: PathBuf,
     arch: String,
     compiled: HashMap<String, PathBuf>,
+    precompiled_dir: Option<PathBuf>,
 }
 
 impl KernelCompiler {
@@ -20,25 +23,50 @@ impl KernelCompiler {
         std::fs::create_dir_all(&cache_dir).map_err(|e| {
             hip_bridge::HipError::new(0, &format!("failed to create cache dir: {e}"))
         })?;
+
+        // Probe for pre-compiled kernels: try exe-relative, then CWD-relative
+        let precompiled_dir = std::env::current_exe().ok()
+            .and_then(|exe| exe.parent().map(|p| p.to_path_buf()))
+            .map(|dir| dir.join("kernels").join("compiled").join(arch))
+            .filter(|p| p.is_dir())
+            .or_else(|| {
+                let cwd_path = PathBuf::from("kernels/compiled").join(arch);
+                if cwd_path.is_dir() { Some(cwd_path) } else { None }
+            });
+
+        if let Some(ref dir) = precompiled_dir {
+            eprintln!("  pre-compiled kernels: {}", dir.display());
+        }
+
         Ok(Self {
             cache_dir,
             arch: arch.to_string(),
             compiled: HashMap::new(),
+            precompiled_dir,
         })
     }
 
     /// Compile a HIP kernel source string. Returns path to .hsaco file.
-    /// Caches by kernel name + source hash — recompiles if source changes.
+    /// Tries pre-compiled blob first, falls back to runtime hipcc compilation.
     pub fn compile(&mut self, name: &str, source: &str) -> HipResult<&Path> {
         if self.compiled.contains_key(name) {
             return Ok(&self.compiled[name]);
         }
 
+        // Try pre-compiled .hsaco first
+        if let Some(ref dir) = self.precompiled_dir {
+            let precompiled = dir.join(format!("{name}.hsaco"));
+            if precompiled.exists() {
+                self.compiled.insert(name.to_string(), precompiled);
+                return Ok(&self.compiled[name]);
+            }
+        }
+
+        // Fall back to runtime compilation via hipcc
         let src_path = self.cache_dir.join(format!("{name}.hip"));
         let obj_path = self.cache_dir.join(format!("{name}.hsaco"));
         let hash_path = self.cache_dir.join(format!("{name}.hash"));
 
-        // Check if cached .hsaco matches current source
         let mut hasher = DefaultHasher::new();
         source.hash(&mut hasher);
         self.arch.hash(&mut hasher);
@@ -52,7 +80,6 @@ impl KernelCompiler {
                 hip_bridge::HipError::new(0, &format!("failed to write kernel source: {e}"))
             })?;
 
-            // Remove stale .hsaco before compiling
             let _ = std::fs::remove_file(&obj_path);
 
             let output = Command::new("hipcc")
@@ -77,7 +104,6 @@ impl KernelCompiler {
                 ));
             }
 
-            // Write hash only after successful compilation
             let _ = std::fs::write(&hash_path, &src_hash);
         }
 

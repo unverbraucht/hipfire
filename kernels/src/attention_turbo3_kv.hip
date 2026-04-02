@@ -1,3 +1,6 @@
+#include <hip/hip_runtime.h>
+#include "turbo_common.h"
+
 extern "C" __global__ void attention_turbo3_kv(
     const float* __restrict__ q,
     const unsigned char* __restrict__ k_cache,

@@ -55,6 +55,7 @@ impl DType {
 /// High-level GPU context. Owns the HIP runtime, compiler, and loaded kernels.
 pub struct Gpu {
     pub hip: HipRuntime,
+    pub arch: String,
     compiler: KernelCompiler,
     modules: HashMap<String, hip_bridge::Module>,
     functions: HashMap<String, hip_bridge::Function>,
@@ -77,10 +78,15 @@ impl Gpu {
         }
         hip.set_device(0)?;
 
-        let compiler = KernelCompiler::new("gfx1010")?;
+        let arch = hip.get_arch(0).unwrap_or_else(|_| "gfx1010".to_string());
+        let (vram_free, vram_total) = hip.get_vram_info().unwrap_or((0, 0));
+        eprintln!("GPU: {} ({:.1} GB VRAM)", arch, vram_total as f64 / 1e9);
+
+        let compiler = KernelCompiler::new(&arch)?;
 
         Ok(Self {
             hip,
+            arch,
             compiler,
             modules: HashMap::new(),
             functions: HashMap::new(),

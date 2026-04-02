@@ -1,3 +1,6 @@
+#include <hip/hip_runtime.h>
+#include "turbo_common.h"
+
 // Optimized turbo4 attention: dim-parallel, warp-shuffle K dots, parallel FWHT.
 extern "C" __global__ void attention_turbo4_kv(
     const float* __restrict__ q,

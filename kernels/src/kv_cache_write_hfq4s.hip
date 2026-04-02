@@ -1,3 +1,6 @@
+#include <hip/hip_runtime.h>
+#include "turbo_common.h"
+
 extern "C" __global__ void kv_cache_write_hfq4s(
     unsigned char* __restrict__ dst,
     const float* __restrict__ src,
