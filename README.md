@@ -31,13 +31,15 @@ hipfire run models/qwen3.5-4b.q4.hfq "What is the capital of France?"
 | Qwen3.5-4B | HFQ6 | **53** | |
 | Qwen3.5-9B | HFQ4 | **45** | Best quality, fits 8GB |
 | Qwen3.5-9B | HFQ6 | **37** | Near-FP16 quality |
+| Qwen3.5-27B | HFQ4 | TBD | 14.3GB, needs 16GB+ VRAM |
 | Qwen3-8B | HFQ4 | **59.9** | Standard attention |
 | ollama Qwen3.5-9B | — | 4.93 | llama.cpp + ROCm (same GPU) |
 
 Recommended picks:
 - **Speed**: 0.8B HFQ4 (222 tok/s) — fast drafting, coding assistants
 - **Balance**: 4B HFQ4 (63 tok/s) — best quality-per-token for 8GB
-- **Quality**: 9B HFQ4 (45 tok/s) — strongest reasoning, still real-time
+- **Quality (8GB)**: 9B HFQ4 (45 tok/s) — strongest reasoning on 8GB cards
+- **Quality (16GB+)**: 27B HFQ4 — best quality, needs 6800 XT / 7900 XTX / 9070. Benchmarks wanted!
 
 Full benchmarks: [docs/BENCHMARKS.md](docs/BENCHMARKS.md)
 
@@ -104,6 +106,18 @@ Bun CLI (hipfire serve/run)
             ├→ TurboQuant KV (turbo4/turbo2, 128+256-dim FWHT)
             └→ Vision encoder (GEMM, LayerNorm, ViT attention)
 ```
+
+## Contributing
+
+hipfire is in alpha — benchmarks, bug reports, and PRs are welcome.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for:
+- How to run and submit benchmarks
+- Quantizing new models
+- Setting up a dev environment
+- What we need help with
+
+**Benchmarks wanted**: if you have a 6800 XT, 7900 XTX, or 9070, we need your numbers!
 
 ## License
 
