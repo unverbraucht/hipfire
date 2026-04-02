@@ -367,6 +367,12 @@ impl Gpu {
         Ok(())
     }
 
+    /// Drain the GPU memory pool — actually calls hipFree on all pooled buffers.
+    /// Call after model unload to return VRAM to the system.
+    pub fn drain_pool(&mut self) {
+        self.pool.drain(&self.hip);
+    }
+
     // ── Kernel operations ───────────────────────────────────────
 
     /// y = A * x (matrix-vector multiply, A is [M, K], x is [K], y is [M])

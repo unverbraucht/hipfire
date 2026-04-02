@@ -202,6 +202,13 @@ impl DeltaNetState {
         }
         Ok(Self { s_matrices, s_scales, conv_states, quant })
     }
+
+    /// Free all GPU tensors. Call before drop to return VRAM.
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        for t in self.s_matrices { let _ = gpu.free_tensor(t); }
+        for t in self.s_scales { let _ = gpu.free_tensor(t); }
+        for t in self.conv_states { let _ = gpu.free_tensor(t); }
+    }
 }
 
 // ─── Weight loading ─────────────────────────────────────────────────────
@@ -267,6 +274,10 @@ fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, name: &str, m: usize, k: usize) 
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor { buf, gpu_dtype: DType::HFQ4G128, m, k, row_stride: 0 })
         }
+        3 => { // Q8_0
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::Q8_0, m, k, row_stride: 0 })
+        }
         1 => { // F16 → F32
             let f32_data: Vec<f32> = data.chunks_exact(2)
                 .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
@@ -291,6 +302,7 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
     let f32_data: Vec<f32> = match info.quant_type {
         1 => data.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect(),
         2 => data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
+        3 => crate::llama::dequantize_q8_0(data, n),
         6 | 7 => {
             // HFQ4-G256 or G128 — CPU dequant
             let group_size: usize = if info.quant_type == 6 { 256 } else { 128 };
@@ -831,6 +843,21 @@ impl Qwen35Scratch {
             sample_buf: gpu.alloc_tensor(&[2], DType::F32)?,
             repeat_buf: gpu.alloc_tensor(&[repeat_window], DType::F32)?,
         })
+    }
+
+    /// Free all GPU tensors. Call before drop to return VRAM.
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let _ = gpu.free_tensor(self.x);
+        let _ = gpu.free_tensor(self.tmp);
+        let _ = gpu.hip.free(self.pos_buf);
+        for t in [self.dn_qkv, self.dn_z, self.dn_alpha, self.dn_beta, self.dn_conv_out,
+                   self.dn_q, self.dn_k, self.dn_v, self.dn_q_raw, self.dn_k_raw,
+                   self.dn_attn_out, self.dn_normed,
+                   self.fa_q_full, self.fa_q, self.fa_gate, self.fa_k, self.fa_v, self.fa_attn_out,
+                   self.o, self.gate_ffn, self.up, self.ffn_hidden, self.ffn_out,
+                   self.logits, self.sample_buf, self.repeat_buf] {
+            let _ = gpu.free_tensor(t);
+        }
     }
 }
 

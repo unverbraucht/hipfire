@@ -181,25 +181,21 @@ fn main() {
     // gpu.free_tensor() is explicitly called. This means every KvCache,
     // DeltaNetState, Scratch, and VisionWeights that goes out of scope leaks.
     // These tests document the current state and will FAIL until Drop is implemented.
-    test!("VRAM: detect leak from KV cache (KNOWN BUG)", 10000, {
+    test!("VRAM: KV cache free_gpu + drain returns memory", 10000, {
         let (free_before, _) = gpu.hip.get_vram_info().map_err(|e| format!("{e}"))?;
-        {
-            let kv = llama::KvCache::new_gpu_q8(
-                &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, 512
-            ).map_err(|e| format!("{e}"))?;
-            let (free_during, _) = gpu.hip.get_vram_info().map_err(|e| format!("{e}"))?;
-            let alloc_mb = (free_before - free_during) as f64 / 1e6;
-            // KV goes out of scope here
-            drop(kv);
-        }
+        let kv = llama::KvCache::new_gpu_q8(
+            &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, 512
+        ).map_err(|e| format!("{e}"))?;
+        let (free_during, _) = gpu.hip.get_vram_info().map_err(|e| format!("{e}"))?;
+        let alloc_mb = (free_before - free_during) as f64 / 1e6;
+        assert!(alloc_mb > 1.0, "KV cache should use >1MB, got {alloc_mb:.1}MB");
+        // Explicit free + drain
+        kv.free_gpu(&mut gpu);
+        gpu.drain_pool();
         let (free_after, _) = gpu.hip.get_vram_info().map_err(|e| format!("{e}"))?;
         let leak_mb = (free_before as i64 - free_after as i64) as f64 / 1e6;
-        if leak_mb.abs() > 1.0 {
-            // This is the KNOWN BUG — report it but don't fail the suite
-            Ok(format!("LEAK DETECTED: {leak_mb:.1}MB (DeviceBuffer has no Drop impl)"))
-        } else {
-            Ok(format!("no leak ({leak_mb:.2}MB)"))
-        }
+        assert!(leak_mb.abs() < 2.0, "VRAM leak: {leak_mb:.1}MB after free_gpu+drain");
+        Ok(format!("alloc={alloc_mb:.1}MB, leak={leak_mb:.2}MB"))
     });
 
     eprintln!("\n--- Summary ---");

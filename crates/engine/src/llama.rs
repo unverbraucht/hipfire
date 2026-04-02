@@ -2081,6 +2081,17 @@ impl KvCache {
         }).collect()
     }
 
+    /// Free all GPU tensors in this cache. Call before drop to return VRAM.
+    /// After calling, follow with gpu.drain_pool() to actually release memory.
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        for t in self.k_gpu { let _ = gpu.free_tensor(t); }
+        for t in self.v_gpu { let _ = gpu.free_tensor(t); }
+        for t in self.k_scales { let _ = gpu.free_tensor(t); }
+        for t in self.v_scales { let _ = gpu.free_tensor(t); }
+        if let Some(t) = self.turbo_signs1 { let _ = gpu.free_tensor(t); }
+        if let Some(t) = self.turbo_signs2 { let _ = gpu.free_tensor(t); }
+    }
+
     /// Store K, V at position `pos` in layer cache (CPU → GPU copy into cache slot).
     pub fn store_kv_pub(&mut self, gpu: &Gpu, layer: usize, pos: usize, k: &[f32], v: &[f32]) -> HipResult<()> {
         self.store_kv(gpu, layer, pos, k, v)
