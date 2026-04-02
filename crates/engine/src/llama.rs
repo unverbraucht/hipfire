@@ -2085,12 +2085,11 @@ pub struct SamplingConfig {
 impl SamplingConfig {
     /// Text-only thinking model (Qwen3.5 text inference).
     pub fn text_thinking() -> Self {
-        Self { think_temp: 0.6, answer_temp: 0.3, top_p: 0.9, repeat_penalty: 1.3, repeat_window: 128 }
+        Self { think_temp: 0.3, answer_temp: 0.3, top_p: 0.8, repeat_penalty: 1.3, repeat_window: 128 }
     }
-    /// VL thinking model — looser think temp for spatial grounding, lighter repeat penalty
-    /// to avoid penalizing legitimate spatial references ("the left side", "upper right").
+    /// VL thinking model.
     pub fn vl_thinking() -> Self {
-        Self { think_temp: 0.6, answer_temp: 0.3, top_p: 0.9, repeat_penalty: 1.3, repeat_window: 64 }
+        Self { think_temp: 0.3, answer_temp: 0.3, top_p: 0.8, repeat_penalty: 1.3, repeat_window: 128 }
     }
     /// Simple greedy-ish sampling (no think/answer split).
     pub fn simple() -> Self {
