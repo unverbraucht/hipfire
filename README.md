@@ -6,7 +6,7 @@ LLM inference engine for AMD RDNA GPUs. Written from scratch in Rust + HIP. **8.
 
 ```bash
 # Install (Linux, requires AMD GPU)
-curl -L https://raw.githubusercontent.com/autorocm/hipfire/alpha-builds/scripts/install.sh | sh
+curl -L https://raw.githubusercontent.com/Kaden-Schutt/hipfire/alpha-builds/scripts/install.sh | bash
 
 # Or build from source
 cargo build --release --features deltanet --example daemon --example infer --example infer_hfq -p engine
