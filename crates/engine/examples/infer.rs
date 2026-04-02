@@ -72,13 +72,13 @@ fn main() {
         #[cfg(feature = "deltanet")]
         run_qwen35(&hfq, model_path, &prompt_text, image_path, vl_mode, no_think, temp_override, max_gen);
     } else {
-        run_llama(&hfq, &prompt_text, temp_override, max_gen);
+        run_llama(&hfq, &prompt_text, no_think, temp_override, max_gen);
     }
 }
 
 // ─── Qwen3 / LLaMA path (standard attention, forward_scratch, GPU sampling) ───
 
-fn run_llama(hfq: &HfqFile, prompt_text: &str, temp_override: Option<f32>, max_gen: usize) {
+fn run_llama(hfq: &HfqFile, prompt_text: &str, no_think: bool, temp_override: Option<f32>, max_gen: usize) {
     let config = hfq::config_from_hfq(hfq).expect("failed to read model config");
     eprintln!("Arch: Qwen3/LLaMA (standard attention)");
     eprintln!("Config: dim={}, layers={}, heads={}, kv_heads={}, vocab={}",
@@ -89,10 +89,16 @@ fn run_llama(hfq: &HfqFile, prompt_text: &str, temp_override: Option<f32>, max_g
 
     let temp = temp_override.unwrap_or(0.3);
     let top_p: f32 = 0.8;
+    let repeat_penalty: f32 = 1.3;
+    let repeat_window: usize = 128;
 
     // ChatML prompt
     let mut prompt_tokens = tokenizer.encode(prompt_text);
-    if tokenizer.encode("<|im_start|>").len() == 1 {
+    let has_chatml = tokenizer.encode("<|im_start|>").len() == 1;
+    let im_end_token = if has_chatml { Some(tokenizer.encode("<|im_end|>")[0]) } else { None };
+    let think_end_token = { let t = tokenizer.encode("</think>"); if t.len() == 1 { Some(t[0]) } else { None } };
+
+    if has_chatml {
         let im_start = tokenizer.encode("<|im_start|>");
         let im_end = tokenizer.encode("<|im_end|>");
         let nl = tokenizer.encode("\n");
@@ -117,53 +123,77 @@ fn run_llama(hfq: &HfqFile, prompt_text: &str, temp_override: Option<f32>, max_g
     let kv_seq = config.max_seq_len.min(4096);
     let mut kv_cache = KvCache::new_gpu_q8(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap();
     let scratch = ForwardScratch::new(&mut gpu, &config).unwrap();
-    let mut rng_state = 42u32;
 
     // Batched prefill
     let t_pf = Instant::now();
-    let prefill_logits = llama::prefill_forward(&mut gpu, &weights, &config, &prompt_tokens, &mut kv_cache);
-    let mut next_token = if let Ok(logits) = prefill_logits {
-        let ms = t_pf.elapsed().as_millis();
-        eprintln!("Prefill: {}ms ({:.0} tok/s) [batched]", ms, prompt_tokens.len() as f64 / (ms as f64 / 1000.0));
-        llama::argmax(&logits)
-    } else {
+    let prefill_ok = llama::prefill_forward(&mut gpu, &weights, &config, &prompt_tokens, &mut kv_cache).is_ok();
+    if !prefill_ok {
         // Sequential fallback
         for (pos, &token) in prompt_tokens.iter().enumerate() {
-            let (_, rng) = llama::forward_scratch(&mut gpu, &weights, &config, token, pos, &mut kv_cache,
-                &scratch, temp.max(0.01), top_p, rng_state, 0, 1.0).expect("forward failed");
-            rng_state = rng;
+            llama::forward_scratch(&mut gpu, &weights, &config, token, pos, &mut kv_cache,
+                &scratch, temp.max(0.01), top_p, 42, 0, 1.0).expect("forward failed");
         }
-        let ms = t_pf.elapsed().as_millis();
-        eprintln!("Prefill: {}ms ({:.0} tok/s) [sequential]", ms, prompt_tokens.len() as f64 / (ms as f64 / 1000.0));
-        let mut out = [0u8; 8];
-        gpu.hip.memcpy_dtoh(&mut out, &scratch.sample_buf.buf).unwrap();
-        u32::from_ne_bytes([out[0], out[1], out[2], out[3]])
-    };
+    }
+    let ms = t_pf.elapsed().as_millis();
+    eprintln!("Prefill: {}ms ({:.0} tok/s)", ms, prompt_tokens.len() as f64 / (ms as f64 / 1000.0));
 
-    // Generate (GPU sampling — zero logits download)
+    // Thinking mode: append <think>\n tokens
+    let prefill_len;
+    let mut in_thinking;
+    if !no_think && has_chatml {
+        let think_tokens = tokenizer.encode("<think>\n");
+        for (i, &t) in think_tokens.iter().enumerate() {
+            llama::forward_scratch(&mut gpu, &weights, &config, t, prompt_tokens.len() + i, &mut kv_cache,
+                &scratch, temp.max(0.01), top_p, 42, 0, 1.0).expect("forward failed");
+        }
+        prefill_len = prompt_tokens.len() + think_tokens.len();
+        in_thinking = true;
+        eprint!("<think>");
+    } else {
+        prefill_len = prompt_tokens.len();
+        in_thinking = false;
+    }
+
+    // First token: download logits, apply n-gram block, sample on CPU
+    let mut logits = gpu.download_f32(&scratch.logits).unwrap();
+    llama::apply_ngram_block(&mut logits, &prompt_tokens);
+    llama::apply_repeat_penalty(&mut logits, &prompt_tokens, repeat_window, repeat_penalty);
+    let mut next_token = llama::sample_top_p(&logits, temp, top_p);
+
     let t_gen = Instant::now();
     let mut token_history: Vec<u32> = prompt_tokens.clone();
     let mut generated = Vec::new();
+    let mut think_count = 0usize;
+    let max_think = 512;
 
     for _ in 0..max_gen {
         generated.push(next_token);
-        let text = tokenizer.decode(&[next_token]);
-        print!("{text}");
-        std::io::stdout().flush().ok();
-
-        if next_token == config.eos_token || !RUNNING.load(Ordering::Relaxed) { break; }
-
         token_history.push(next_token);
-        let hist_start = token_history.len().saturating_sub(64);
-        let hist_slice = &token_history[hist_start..];
-        let hist_bytes: Vec<u8> = hist_slice.iter().flat_map(|t| t.to_ne_bytes()).collect();
-        gpu.hip.memcpy_htod(&scratch.repeat_buf.buf, &hist_bytes).unwrap();
+        if in_thinking { think_count += 1; }
 
-        let pos = prompt_tokens.len() + generated.len() - 1;
-        let (tok, rng) = llama::forward_scratch(&mut gpu, &weights, &config, next_token, pos, &mut kv_cache,
-            &scratch, temp.max(0.01), top_p, rng_state, hist_slice.len(), 1.1).expect("forward failed");
-        next_token = tok;
-        rng_state = rng;
+        if in_thinking && (think_end_token == Some(next_token) || think_count >= max_think) {
+            in_thinking = false;
+            eprint!("</think>\n");
+        } else {
+            let text = tokenizer.decode(&[next_token]);
+            if in_thinking { eprint!("{text}"); }
+            else { print!("{text}"); std::io::stdout().flush().ok(); }
+        }
+
+        if next_token == config.eos_token { break; }
+        if im_end_token == Some(next_token) { break; }
+        if !RUNNING.load(Ordering::Relaxed) { break; }
+
+        let pos = prefill_len + generated.len() - 1;
+
+        // Forward pass (GPU), then download logits for CPU sampling with n-gram block
+        llama::forward_scratch(&mut gpu, &weights, &config, next_token, pos, &mut kv_cache,
+            &scratch, temp.max(0.01), top_p, 42, 0, 1.0).expect("forward failed");
+
+        logits = gpu.download_f32(&scratch.logits).unwrap();
+        llama::apply_ngram_block(&mut logits, &token_history);
+        llama::apply_repeat_penalty(&mut logits, &token_history, repeat_window, repeat_penalty);
+        next_token = llama::sample_top_p(&logits, temp, top_p);
     }
 
     let ms = t_gen.elapsed().as_millis();
