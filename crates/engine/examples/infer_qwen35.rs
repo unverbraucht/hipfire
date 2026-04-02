@@ -1,8 +1,8 @@
-//! Qwen3.5 inference engine — DeltaNet, thinking mode, VL support.
+//! Unified Qwen3.5 inference — text-only or vision-language.
 //! Usage:
-//!   infer_qwen35 <model.hfq> [prompt...]                          # text-only
-//!   infer_qwen35 <model.hfq> --image <image.png> [prompt...]      # VL mode
-//!   infer_qwen35 <model.hfq> --no-think [prompt...]               # skip thinking
+//!   infer <model.hfq> [prompt...]                          # text-only
+//!   infer <model.hfq> --image <image.png> [prompt...]      # VL mode
+//!   infer <model.hfq> --no-think [prompt...]               # skip thinking
 
 use engine::hfq::HfqFile;
 use engine::llama;
