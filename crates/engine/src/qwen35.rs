@@ -46,13 +46,6 @@ pub struct Qwen35Config {
 pub fn config_from_hfq(hfq: &HfqFile) -> Option<Qwen35Config> {
     let meta: serde_json::Value = serde_json::from_str(&hfq.metadata_json).ok()?;
     let config = meta.get("config")?;
-
-    // Only match Qwen3.5 models (DeltaNet), not Qwen3/LLaMA
-    let model_type = config.get("model_type").and_then(|v| v.as_str()).unwrap_or("");
-    if model_type != "qwen3_5" && model_type != "qwen3_5_text" {
-        return None;
-    }
-
     let tc = config.get("text_config").unwrap_or(config);
 
     let dim = tc.get("hidden_size")?.as_u64()? as usize;
@@ -500,9 +493,6 @@ fn forward_from_x_gpu(
     let mut delta_layer_idx = 0usize;
     let debug_layers = std::env::var("DEBUG_LAYERS").is_ok();
 
-    // Graduated KV: check if we need to compress at this position
-    kv_cache.maybe_graduate(gpu, pos)?;
-
     if debug_layers && pos == 0 {
         let hid = gpu.download_f32(&x)?;
         let norm: f32 = hid.iter().map(|v| v * v).sum::<f32>().sqrt();
@@ -902,9 +892,6 @@ fn forward_scratch_layers(
     let hd = config.linear_key_head_dim;
 
     let mut delta_layer_idx = 0usize;
-
-    // Graduated KV: check if we need to compress at this position
-    kv_cache.maybe_graduate(gpu, pos)?;
 
     for layer_idx in 0..config.n_layers {
         match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {

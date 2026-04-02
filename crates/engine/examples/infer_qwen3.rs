@@ -1,6 +1,6 @@
-//! Qwen3 inference engine — standard attention, GPU sampling, batched prefill.
-//! Usage: infer_qwen3 <model.hfq> [--maxgen N] [--temp T] [prompt text...]
-//! Flags: --q8kv, --fp32kv, --turbo2, --turbo3, --turbo4, --temp T, --maxgen N
+//! Run inference on a .hfq (hipfire-quantized) model.
+//! Usage: cargo run --release --example infer_hfq <model.hfq> [flags] [prompt text...]
+//! Flags: --q8kv, --fp32kv, --turbo2, --turbo3, --turbo4, --temp T
 
 use engine::hfq::{self, HfqFile};
 use engine::llama::{self, KvCache, ForwardScratch};

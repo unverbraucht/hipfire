@@ -50,7 +50,7 @@ run_infer() {
     local flags="$*"
     local OUT
 
-    rm -rf /tmp/hipfire_kernels/
+    # Don't clear kernel cache per-run — only clear once per commit (at checkout)
     OUT=$(timeout "$TIMEOUT_INFER" ./target/release/examples/infer_hfq "$model" --temp 0 $flags "$prompt" 2>&1) || true
 
     local TOKS=$(echo "$OUT" | grep "=== Done:" | grep -oP '[\d.]+(?= tok/s)')
@@ -106,6 +106,7 @@ quantize() {
 }
 
 # ── 6. Run tests ─────────────────────────────────────────────────────────────
+# First run warms the kernel cache; second run is the real measurement.
 
 log ""
 log "──── Qwen3-0.6B ────"
@@ -113,6 +114,7 @@ log "──── Qwen3-0.6B ────"
 # Q8 (default format)
 log "-- q8 (default) --"
 if quantize "$MODEL_06B" /tmp/bisect-06b-q8.hfq "default"; then
+    run_infer /tmp/bisect-06b-q8.hfq "q8 WARMUP     " "$PROMPT_SHORT" >/dev/null 2>&1 || true
     run_infer /tmp/bisect-06b-q8.hfq "q8 defkv short" "$PROMPT_SHORT"
     run_infer /tmp/bisect-06b-q8.hfq "q8 defkv long " "$PROMPT_LONG"
     run_infer /tmp/bisect-06b-q8.hfq "q8 fp32kv short" "$PROMPT_SHORT" --fp32kv
@@ -121,6 +123,7 @@ fi
 # HFQ4 (auto G128/G256)
 log "-- hfq4 (auto) --"
 if quantize "$MODEL_06B" /tmp/bisect-06b-hfq4.hfq "hfq4"; then
+    run_infer /tmp/bisect-06b-hfq4.hfq "hfq4 WARMUP     " "$PROMPT_SHORT" >/dev/null 2>&1 || true
     run_infer /tmp/bisect-06b-hfq4.hfq "hfq4 defkv short" "$PROMPT_SHORT"
     run_infer /tmp/bisect-06b-hfq4.hfq "hfq4 defkv long " "$PROMPT_LONG"
     run_infer /tmp/bisect-06b-hfq4.hfq "hfq4 fp32kv short" "$PROMPT_SHORT" --fp32kv
@@ -144,6 +147,7 @@ log "──── Qwen3-8B (HFQ4 only) ────"
 
 log "-- hfq4 (auto) --"
 if quantize "$MODEL_8B" /tmp/bisect-8b-hfq4.hfq "hfq4"; then
+    run_infer /tmp/bisect-8b-hfq4.hfq "8B hfq4 WARMUP     " "$PROMPT_SHORT" >/dev/null 2>&1 || true
     run_infer /tmp/bisect-8b-hfq4.hfq "8B hfq4 defkv short" "$PROMPT_SHORT"
     run_infer /tmp/bisect-8b-hfq4.hfq "8B hfq4 defkv long " "$PROMPT_LONG"
 fi
