@@ -1,13 +1,14 @@
 #!/usr/bin/env bun
 // hipfire CLI — ollama-style UX for AMD GPU inference
 // Usage:
-//   hipfire serve                    → start daemon + HTTP server
-//   hipfire run <model> [prompt]     → interactive inference
-//   hipfire list                     → show local models
+//   hipfire pull qwen3.5:9b          → download model
+//   hipfire run qwen3.5:9b [prompt]  → generate (auto-pulls if needed)
+//   hipfire serve                     → start daemon + HTTP server
+//   hipfire list                      → show local + available models
 
 import { spawn } from "bun";
-import { existsSync, readdirSync, statSync } from "fs";
-import { join, resolve } from "path";
+import { existsSync, readdirSync, statSync, unlinkSync, mkdirSync } from "fs";
+import { join, resolve, basename } from "path";
 import { homedir } from "os";
 
 const HIPFIRE_DIR = join(homedir(), ".hipfire");
@@ -15,7 +16,61 @@ const MODELS_DIR = join(HIPFIRE_DIR, "models");
 const DEFAULT_PORT = 11435;
 const TEMP_CORRECTION = 0.82;
 
-Bun.spawnSync(["mkdir", "-p", MODELS_DIR]);
+mkdirSync(MODELS_DIR, { recursive: true });
+
+// ─── Model Registry ─────────────────────────────────────
+// Maps "name:tag" → { repo, file, size_gb, min_vram_gb }
+// Default tag (no quant suffix) = HFQ4
+
+const HF_BASE = "https://huggingface.co";
+const REPO_MAIN = "schuttdev/hipfire-models";
+const REPO_27B = "schuttdev/Qwen3.5-27B-hipfire";
+
+interface ModelEntry {
+  repo: string;
+  file: string;
+  size_gb: number;
+  min_vram_gb: number;
+  desc: string;
+}
+
+const REGISTRY: Record<string, ModelEntry> = {
+  // Qwen3.5 HFQ4 (default)
+  "qwen3.5:0.8b":  { repo: REPO_MAIN, file: "qwen3.5-0.8b.q4.hfq",  size_gb: 0.5,  min_vram_gb: 1,  desc: "222 tok/s, tiny & fast" },
+  "qwen3.5:2b":    { repo: REPO_MAIN, file: "qwen3.5-2b.q4.hfq",    size_gb: 1.2,  min_vram_gb: 2,  desc: "141 tok/s" },
+  "qwen3.5:4b":    { repo: REPO_MAIN, file: "qwen3.5-4b.q4.hfq",    size_gb: 2.1,  min_vram_gb: 4,  desc: "63 tok/s, best balance" },
+  "qwen3.5:9b":    { repo: REPO_MAIN, file: "qwen3.5-9b.q4.hfq",    size_gb: 4.5,  min_vram_gb: 6,  desc: "45 tok/s, best quality 8GB" },
+  "qwen3.5:27b":   { repo: REPO_27B,  file: "qwen3.5-27b.q4.hfq",   size_gb: 14.3, min_vram_gb: 16, desc: "best quality, needs 16GB+" },
+
+  // Qwen3.5 HFQ6
+  "qwen3.5:0.8b-hfq6": { repo: REPO_MAIN, file: "qwen3.5-0.8b.hfq6.hfq", size_gb: 0.6,  min_vram_gb: 1,  desc: "210 tok/s, higher quality" },
+  "qwen3.5:2b-hfq6":   { repo: REPO_MAIN, file: "qwen3.5-2b.hfq6.hfq",   size_gb: 1.6,  min_vram_gb: 3,  desc: "127 tok/s" },
+  "qwen3.5:4b-hfq6":   { repo: REPO_MAIN, file: "qwen3.5-4b.hfq6.hfq",   size_gb: 3.3,  min_vram_gb: 5,  desc: "53 tok/s" },
+  "qwen3.5:9b-hfq6":   { repo: REPO_MAIN, file: "qwen3.5-9b.hfq6.hfq",   size_gb: 6.8,  min_vram_gb: 8,  desc: "37 tok/s, near-FP16" },
+  "qwen3.5:27b-hfq6":  { repo: REPO_27B,  file: "qwen3.5-27b.hfq6.hfq",  size_gb: 21.4, min_vram_gb: 24, desc: "needs 24GB (7900 XTX)" },
+};
+
+// Aliases
+const ALIASES: Record<string, string> = {
+  "qwen3.5": "qwen3.5:4b",     // default size
+  "qwen3.5:latest": "qwen3.5:9b",
+  "qwen3.5:small": "qwen3.5:0.8b",
+  "qwen3.5:large": "qwen3.5:27b",
+};
+
+function resolveModelTag(input: string): string {
+  // Direct registry match
+  if (REGISTRY[input]) return input;
+  // Alias
+  if (ALIASES[input]) return ALIASES[input];
+  // Try adding "qwen3.5:" prefix
+  if (REGISTRY[`qwen3.5:${input}`]) return `qwen3.5:${input}`;
+  return input;
+}
+
+function downloadUrl(entry: ModelEntry): string {
+  return `${HF_BASE}/${entry.repo}/resolve/main/${entry.file}`;
+}
 
 // ─── Daemon IPC ─────────────────────────────────────────
 
@@ -74,11 +129,83 @@ class Engine {
   }
 }
 
+// ─── Pull (Download) ────────────────────────────────────
+
+async function pull(tag: string): Promise<string> {
+  const resolved = resolveModelTag(tag);
+  const entry = REGISTRY[resolved];
+  if (!entry) {
+    console.error(`Unknown model: ${tag}`);
+    console.error(`Available: ${Object.keys(REGISTRY).join(", ")}`);
+    process.exit(1);
+  }
+
+  const dest = join(MODELS_DIR, entry.file);
+  if (existsSync(dest)) {
+    const sz = (statSync(dest).size / 1e9).toFixed(1);
+    console.error(`Already downloaded: ${entry.file} (${sz}GB)`);
+    return dest;
+  }
+
+  const url = downloadUrl(entry);
+  console.error(`Pulling ${resolved} (${entry.size_gb}GB)...`);
+  console.error(`  ${url}`);
+
+  const res = await fetch(url);
+  if (!res.ok) {
+    console.error(`Download failed: ${res.status} ${res.statusText}`);
+    console.error(`URL: ${url}`);
+    process.exit(1);
+  }
+
+  const total = parseInt(res.headers.get("content-length") || "0");
+  const tmpDest = dest + ".tmp";
+  const writer = Bun.file(tmpDest).writer();
+  let downloaded = 0;
+  let lastPrint = 0;
+
+  for await (const chunk of res.body as AsyncIterable<Uint8Array>) {
+    writer.write(chunk);
+    downloaded += chunk.length;
+    const now = Date.now();
+    if (now - lastPrint > 500 || downloaded === total) {
+      const pct = total > 0 ? ((downloaded / total) * 100).toFixed(1) : "?";
+      const mb = (downloaded / 1e6).toFixed(0);
+      const totalMb = total > 0 ? (total / 1e6).toFixed(0) : "?";
+      process.stderr.write(`\r  ${mb}/${totalMb} MB (${pct}%)`);
+      lastPrint = now;
+    }
+  }
+  await writer.end();
+  console.error("");
+
+  // Rename tmp → final (atomic-ish)
+  const { renameSync } = await import("fs");
+  renameSync(tmpDest, dest);
+
+  const sz = (statSync(dest).size / 1e9).toFixed(1);
+  console.error(`  Saved: ${dest} (${sz}GB)`);
+  return dest;
+}
+
 // ─── Commands ───────────────────────────────────────────
 
 async function run(model: string, prompt: string, image?: string, temp = 0.3, maxTokens = 512) {
-  const path = findModel(model);
-  if (!path) { console.error(`Model not found: ${model}\nRun: hipfire pull ${model}`); process.exit(1); }
+  let path = findModel(model);
+
+  // Auto-pull if model tag is recognized but not downloaded
+  if (!path) {
+    const resolved = resolveModelTag(model);
+    if (REGISTRY[resolved]) {
+      console.error(`Model not found locally. Pulling ${resolved}...`);
+      path = await pull(model);
+    } else {
+      console.error(`Model not found: ${model}`);
+      console.error(`Run: hipfire pull <model>  (e.g. hipfire pull qwen3.5:9b)`);
+      console.error(`See: hipfire list --remote`);
+      process.exit(1);
+    }
+  }
 
   if (image && !existsSync(image)) { console.error(`Image not found: ${image}`); process.exit(1); }
 
@@ -118,7 +245,6 @@ async function serve(port: number) {
   await e.send({ type: "ping" }); await e.recv();
   let current: string | null = null;
 
-  // Single-flight: only one generation at a time (GPU is single-threaded)
   let busy = false;
   const queue: Array<{ resolve: () => void }> = [];
   async function acquireLock() {
@@ -138,7 +264,7 @@ async function serve(port: number) {
     async fetch(req) {
       const url = new URL(req.url);
       if (url.pathname === "/health") return Response.json({ status: "ok", model: current });
-      if (url.pathname === "/v1/models") return Response.json({ data: list().map(m => ({ id: m.name })) });
+      if (url.pathname === "/v1/models") return Response.json({ data: listLocal().map(m => ({ id: m.name })) });
 
       if (url.pathname === "/v1/chat/completions" && req.method === "POST") {
         await acquireLock();
@@ -193,21 +319,38 @@ async function serve(port: number) {
 // ─── Helpers ────────────────────────────────────────────
 
 function findModel(name: string): string | null {
+  // Direct file path
   if (existsSync(name)) return resolve(name);
+
+  // Resolve tag → filename
+  const resolved = resolveModelTag(name);
+  const entry = REGISTRY[resolved];
+  if (entry) {
+    const p = join(MODELS_DIR, entry.file);
+    if (existsSync(p)) return p;
+  }
+
+  // Fuzzy search local dirs
   const dirs = [resolve(__dirname, "../models"), MODELS_DIR];
   for (const dir of dirs) {
-    try { for (const f of readdirSync(dir)) { if (f.includes(name) && f.endsWith(".hfq")) return join(dir, f); } } catch {}
+    try { for (const f of readdirSync(dir)) {
+      if (f.endsWith(".hfq") && (f.includes(name) || f.includes(name.replace(":", "-")))) return join(dir, f);
+    }} catch {}
   }
   return null;
 }
 
-function list() {
-  const models: { name: string; size: string }[] = [];
-  for (const dir of [resolve(__dirname, "../models"), MODELS_DIR]) {
+function listLocal() {
+  const models: { name: string; tag: string; size: string }[] = [];
+  const seen = new Set<string>();
+  for (const dir of [MODELS_DIR, resolve(__dirname, "../models")]) {
     try { for (const f of readdirSync(dir)) {
-      if (f.endsWith(".hfq")) {
-        const sz = (statSync(join(dir, f)).size / 1e6).toFixed(0);
-        models.push({ name: f, size: `${sz}MB` });
+      if (f.endsWith(".hfq") && !seen.has(f)) {
+        seen.add(f);
+        const sz = (statSync(join(dir, f)).size / 1e9).toFixed(1);
+        // Find matching registry tag
+        const tag = Object.entries(REGISTRY).find(([_, e]) => e.file === f)?.[0] || "";
+        models.push({ name: f, tag, size: `${sz}GB` });
       }
     }} catch {}
   }
@@ -221,7 +364,7 @@ switch (cmd) {
   case "serve": await serve(parseInt(rest[0]) || DEFAULT_PORT); break;
   case "run": {
     const model = rest[0];
-    if (!model) { console.error("Usage: hipfire run <model> [--image img.png] [prompt]"); process.exit(1); }
+    if (!model) { console.error("Usage: hipfire run <model> [--image img.png] [prompt]\n\nExamples:\n  hipfire run qwen3.5:9b \"Hello\"\n  hipfire run qwen3.5:4b --image photo.png \"Describe this\""); process.exit(1); }
     const imgIdx = rest.indexOf("--image");
     const image = imgIdx >= 0 ? rest[imgIdx + 1] : undefined;
     const filtered = rest.slice(1).filter((_, i) => i !== imgIdx - 1 && i !== imgIdx);
@@ -229,14 +372,65 @@ switch (cmd) {
     await run(model, prompt, image);
     break;
   }
-  case "list": for (const m of list()) console.log(`${m.name.padEnd(40)} ${m.size}`); break;
-  case "rm": { const p = findModel(rest[0] || ""); if (p) { require("fs").unlinkSync(p); console.log(`Removed ${p}`); } break; }
+  case "pull": {
+    const tag = rest[0];
+    if (!tag) { console.error("Usage: hipfire pull <model>\n\nExamples:\n  hipfire pull qwen3.5:9b\n  hipfire pull qwen3.5:4b-hfq6\n  hipfire pull qwen3.5:27b\n\nAvailable:\n" + Object.entries(REGISTRY).map(([t, e]) => `  ${t.padEnd(22)} ${e.size_gb.toString().padStart(5)}GB  ${e.desc}`).join("\n")); process.exit(1); }
+    await pull(tag);
+    break;
+  }
+  case "list": {
+    const showRemote = rest.includes("--remote") || rest.includes("-r");
+    const local = listLocal();
+    if (local.length > 0) {
+      console.log("Local models:\n");
+      for (const m of local) {
+        const tag = m.tag ? ` (${m.tag})` : "";
+        console.log(`  ${m.name.padEnd(35)} ${m.size.padStart(6)}${tag}`);
+      }
+    } else {
+      console.log("No local models. Pull one:\n  hipfire pull qwen3.5:9b\n");
+    }
+    if (showRemote || local.length === 0) {
+      console.log("\nAvailable models:\n");
+      const localFiles = new Set(local.map(m => m.name));
+      for (const [tag, entry] of Object.entries(REGISTRY)) {
+        const status = localFiles.has(entry.file) ? " [downloaded]" : "";
+        console.log(`  ${tag.padEnd(22)} ${entry.size_gb.toString().padStart(5)}GB  ${entry.desc}${status}`);
+      }
+      console.log("\nPull: hipfire pull <model>  (e.g. hipfire pull qwen3.5:9b)");
+    }
+    break;
+  }
+  case "rm": {
+    const tag = rest[0] || "";
+    const resolved = resolveModelTag(tag);
+    const entry = REGISTRY[resolved];
+    const path = entry ? join(MODELS_DIR, entry.file) : findModel(tag);
+    if (path && existsSync(path)) {
+      unlinkSync(path);
+      console.log(`Removed ${path}`);
+    } else {
+      console.error(`Model not found: ${tag}`);
+    }
+    break;
+  }
   default:
     console.log(`hipfire — LLM inference for AMD GPUs
 
+  pull <model>          Download model from HuggingFace
+  run <model> [prompt]  Generate text (auto-pulls if needed)
   serve [port]          Start OpenAI-compatible server (default: ${DEFAULT_PORT})
-  run <model> [prompt]  Generate text
-  list                  Show local models
+  list [-r]             Show local models (-r: show available too)
   rm <model>            Delete model
-  pull <model>          Download model (coming soon)`);
+
+Models:
+  hipfire pull qwen3.5:9b            # 4.5GB, best quality for 8GB cards
+  hipfire pull qwen3.5:4b            # 2.1GB, best speed/quality balance
+  hipfire pull qwen3.5:27b           # 14.3GB, needs 16GB+ VRAM
+  hipfire pull qwen3.5:9b-hfq6      # 6.8GB, higher quality (6-bit)
+
+Quick start:
+  hipfire pull qwen3.5:4b
+  hipfire run qwen3.5:4b "What is the capital of France?"
+  hipfire serve`);
 }

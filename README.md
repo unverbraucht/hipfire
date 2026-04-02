@@ -11,13 +11,12 @@ curl -L https://raw.githubusercontent.com/Kaden-Schutt/hipfire/alpha-builds/scri
 # Windows (PowerShell, requires AMD GPU)
 irm https://raw.githubusercontent.com/Kaden-Schutt/hipfire/alpha-builds/scripts/install.ps1 | iex
 
-# Or build from source
-cargo build --release --features deltanet --example daemon --example infer --example infer_hfq -p engine
+# Pull a model and run
+hipfire pull qwen3.5:9b
+hipfire run qwen3.5:9b "What is the capital of France?"
 
-# Run
-hipfire run models/qwen3.5-4b.q4.hfq "What is the capital of France?"
-# Or directly:
-./target/release/examples/infer models/qwen3.5-4b.q4.hfq "What is the capital of France?"
+# Or just run — auto-pulls if needed
+hipfire run qwen3.5:4b "Hello"
 ```
 
 ## Performance (RX 5700 XT, 8GB)
@@ -81,10 +80,12 @@ Compress the KV cache with FWHT + quantization for longer context in less VRAM:
 ## CLI
 
 ```bash
-hipfire serve [port]                        # OpenAI-compatible HTTP server
-hipfire run <model> [prompt]                # Interactive generation
-hipfire run <model> --image img.png [prompt] # Vision-language
-hipfire list                                # Show local models
+hipfire pull qwen3.5:9b                      # Download model
+hipfire run qwen3.5:9b [prompt]              # Generate (auto-pulls if needed)
+hipfire run qwen3.5:9b --image img.png [prompt]  # Vision-language
+hipfire serve [port]                         # OpenAI-compatible HTTP server
+hipfire list -r                              # Show local + available models
+hipfire rm qwen3.5:9b                        # Delete model
 ```
 
 ## API

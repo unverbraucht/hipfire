@@ -153,13 +153,20 @@ fn load_model(path: &str, max_seq: usize, gpu: &mut rdna_compute::Gpu) -> Result
         // Qwen3.5 DeltaNet
         let config = qwen35::config_from_hfq(&hfq).ok_or("failed to read Qwen3.5 config")?;
 
-        // Detect and load vision weights if this is a VL model
+        // Detect VL model: check if vision config AND vision tensors are present
+        // Text-only models may have vision config in metadata but no actual vision weights
         let vision_config = qwen35_vl::vision_config_from_hfq(&hfq);
-        let vision_weights = if let Some(ref vc) = vision_config {
-            eprintln!("  VL model: loading vision encoder (hidden={}, layers={})", vc.hidden_size, vc.num_layers);
-            Some(qwen35_vl::load_vision_weights(&hfq, vc, gpu).map_err(|e| format!("{e}"))?)
+        let has_vision_tensors = hfq.tensor_data("model.visual.patch_embed.proj.weight").is_some();
+        let (vision_config, vision_weights) = if let Some(vc) = vision_config {
+            if has_vision_tensors {
+                let vw = qwen35_vl::load_vision_weights(&hfq, &vc, gpu).map_err(|e| format!("{e}"))?;
+                eprintln!("  VL model: vision encoder (hidden={}, layers={})", vc.hidden_size, vc.num_layers);
+                (Some(vc), Some(vw))
+            } else {
+                (None, None) // text-only model, no vision tensors
+            }
         } else {
-            None
+            (None, None)
         };
 
         let weights = qwen35::load_weights(&hfq, &config, gpu).map_err(|e| format!("{e}"))?;
