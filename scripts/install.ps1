@@ -248,17 +248,33 @@ $RepoDir = $SrcDir
 Write-Host ""
 Write-Host "Installing hipfire binaries..." -ForegroundColor Cyan
 
-# Look for pre-built daemon.exe
+# Look for pre-built daemon.exe: local first, then download from GitHub release
 $PreBuilt = @(
     "$RepoDir\target\release\examples\daemon.exe",
-    "$RepoDir\bin\daemon.exe"
+    "$RepoDir\bin\daemon.exe",
+    "$BinDir\daemon.exe"
 ) | Where-Object { Test-Path $_ } | Select-Object -First 1
 
-if ($PreBuilt) {
-    Write-Host "  Pre-built daemon.exe found: $PreBuilt ✓" -ForegroundColor Green
+if (-not $PreBuilt) {
+    # Download pre-built Windows binary from GitHub release
+    Write-Host "  Downloading pre-built daemon.exe from GitHub release..."
+    $ReleaseUrl = "https://github.com/$GithubRepo/releases/download/v0.1.0-alpha/daemon.exe"
+    try {
+        Invoke-WebRequest -Uri $ReleaseUrl -OutFile "$BinDir\daemon.exe" -UseBasicParsing
+        $PreBuilt = "$BinDir\daemon.exe"
+        Write-Host "  Downloaded ✓" -ForegroundColor Green
+    } catch {
+        Write-Host "  Download failed: $_" -ForegroundColor Yellow
+    }
+}
+
+if ($PreBuilt -and $PreBuilt -ne "$BinDir\daemon.exe") {
     Copy-Item $PreBuilt "$BinDir\daemon.exe" -Force
+    Write-Host "  daemon.exe installed ✓" -ForegroundColor Green
+} elseif ($PreBuilt) {
+    Write-Host "  daemon.exe ready ✓" -ForegroundColor Green
 } else {
-    Write-Host "  No pre-built binaries. Building from source..." -ForegroundColor Yellow
+    Write-Host "  No pre-built binaries available. Building from source..." -ForegroundColor Yellow
 
     if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
         Write-Host "  Installing Rust via rustup..." -ForegroundColor Yellow
