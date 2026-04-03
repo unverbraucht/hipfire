@@ -407,6 +407,55 @@ switch (cmd) {
     }
     break;
   }
+  case "update": {
+    console.error("Updating hipfire...");
+    const srcDir = join(HIPFIRE_DIR, "src");
+    const repoDir = existsSync(join(srcDir, "Cargo.toml")) ? srcDir : resolve(__dirname, "..");
+    const git = (args: string[]) => Bun.spawnSync(["git", ...args], { cwd: repoDir, stdio: ["inherit", "inherit", "inherit"] });
+    git(["pull", "origin", "master"]);
+    // Rebuild
+    console.error("Rebuilding...");
+    const build = Bun.spawnSync(
+      ["cargo", "build", "--release", "--features", "deltanet", "--example", "daemon", "--example", "infer", "-p", "engine"],
+      { cwd: repoDir, stdio: ["inherit", "inherit", "inherit"] }
+    );
+    if (build.exitCode !== 0) { console.error("Build failed."); process.exit(1); }
+    // Recopy binaries
+    const binDir = join(HIPFIRE_DIR, "bin");
+    const { copyFileSync } = await import("fs");
+    for (const bin of ["daemon", "infer"]) {
+      const src = join(repoDir, "target/release/examples", bin);
+      if (existsSync(src)) { copyFileSync(src, join(binDir, bin)); }
+    }
+    // Recopy CLI
+    copyFileSync(join(repoDir, "cli/index.ts"), join(HIPFIRE_DIR, "cli/index.ts"));
+    // Recopy kernels
+    const arch = Bun.spawnSync(["cat", "/sys/class/kfd/kfd/topology/nodes/1/properties"], { stdout: "pipe" });
+    const archOut = arch.stdout?.toString() || "";
+    const verMatch = archOut.match(/gfx_target_version\s+(\d+)/);
+    let gpuArch = "unknown";
+    if (verMatch) {
+      const v = verMatch[1];
+      if (v === "100100") gpuArch = "gfx1010";
+      else if (v === "100300" || v === "100302") gpuArch = "gfx1030";
+      else if (v === "110000" || v === "110001") gpuArch = "gfx1100";
+      else if (v === "120000") gpuArch = "gfx1200";
+      else if (v === "120001") gpuArch = "gfx1201";
+    }
+    if (gpuArch !== "unknown") {
+      const kernelSrc = join(repoDir, "kernels/compiled", gpuArch);
+      const kernelDst = join(binDir, "kernels/compiled", gpuArch);
+      mkdirSync(kernelDst, { recursive: true });
+      if (existsSync(kernelSrc)) {
+        for (const f of readdirSync(kernelSrc)) {
+          if (f.endsWith(".hsaco")) copyFileSync(join(kernelSrc, f), join(kernelDst, f));
+        }
+        console.error(`  Updated ${gpuArch} kernels ✓`);
+      }
+    }
+    console.error("hipfire updated ✓");
+    break;
+  }
   case "rm": {
     const tag = rest[0] || "";
     const resolved = resolveModelTag(tag);
@@ -428,6 +477,7 @@ switch (cmd) {
   serve [port]          Start OpenAI-compatible server (default: ${DEFAULT_PORT})
   list [-r]             Show local models (-r: show available too)
   rm <model>            Delete model
+  update                Pull latest code, rebuild, update kernels
 
 Models:
   hipfire pull qwen3.5:9b            # 4.5GB, best quality for 8GB cards
