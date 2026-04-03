@@ -12,7 +12,7 @@ OUT_BASE="$SCRIPT_DIR/kernels/compiled"
 if [ $# -gt 0 ]; then
     ARCHS=("$@")
 else
-    ARCHS=(gfx1010 gfx1030 gfx1100 gfx1200)
+    ARCHS=(gfx1010 gfx1030 gfx1100 gfx1200 gfx1201)
 fi
 
 echo "=== hipfire kernel compiler ==="

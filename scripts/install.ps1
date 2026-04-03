@@ -34,7 +34,9 @@ try {
             $GpuArch = "gfx1030"
         } elseif ($GpuName -match "7900|7800|7700|7600|RX 7[0-9]{3}") {
             $GpuArch = "gfx1100"
-        } elseif ($GpuName -match "9070|9060|RX 9[0-9]{3}") {
+        } elseif ($GpuName -match "9070") {
+            $GpuArch = "gfx1201"
+        } elseif ($GpuName -match "9060|RX 9[0-9]{3}") {
             $GpuArch = "gfx1200"
         }
     } else {
@@ -46,7 +48,7 @@ try {
 
 if ($GpuArch -eq "unknown") {
     Write-Host "  WARNING: Could not detect GPU architecture." -ForegroundColor Yellow
-    Write-Host "  Supported: gfx1010 (RX 5700), gfx1030 (RX 6800), gfx1100 (RX 7900), gfx1200 (RX 9070)"
+    Write-Host "  Supported: gfx1010 (RX 5700), gfx1030 (RX 6800), gfx1100 (RX 7900), gfx1200 (RX 9060), gfx1201 (RX 9070)"
     $GpuArch = Read-Host "  Enter your GPU arch [or Enter to skip]"
     if ([string]::IsNullOrWhiteSpace($GpuArch)) { $GpuArch = "unknown" }
 }
