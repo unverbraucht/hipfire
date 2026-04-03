@@ -125,6 +125,49 @@ if ($HipDllFound) {
     $env:PATH = "$RuntimeDir;$env:PATH"
 }
 
+# ─── HIP version vs GPU arch check ──────────────────────
+if ($HipDllFound -and $GpuArch -ne "unknown") {
+    # Try to get HIP version from the DLL or hipconfig
+    $HipVer = ""
+    $hipconfig = "$env:HIP_PATH\bin\hipconfig.exe"
+    if (-not (Test-Path $hipconfig)) { $hipconfig = "C:\Program Files\AMD\ROCm\bin\hipconfig.exe" }
+    if (Test-Path $hipconfig) {
+        try { $HipVer = (& $hipconfig --version 2>$null) -replace '[^\d.]','' | Select-Object -First 1 } catch {}
+    }
+    # Fallback: check DLL file version
+    if (-not $HipVer) {
+        try {
+            $dllPath = if (Test-Path $HipDllDest) { $HipDllDest } else { $candidate }
+            $ver = (Get-Item $dllPath).VersionInfo.ProductVersion
+            if ($ver) { $HipVer = $ver }
+        } catch {}
+    }
+
+    if ($HipVer) {
+        $parts = $HipVer.Split(".")
+        $major = [int]$parts[0]
+        $minor = if ($parts.Length -gt 1) { [int]$parts[1] } else { 0 }
+        Write-Host "  HIP version: $major.$minor" -ForegroundColor Green
+
+        # Minimum versions per arch
+        $minMajor = 5; $minMinor = 0
+        switch ($GpuArch) {
+            { $_ -in "gfx1200","gfx1201" } { $minMajor = 6; $minMinor = 4 }
+            { $_ -in "gfx1100","gfx1101" } { $minMajor = 5; $minMinor = 5 }
+        }
+
+        if ($major -lt $minMajor -or ($major -eq $minMajor -and $minor -lt $minMinor)) {
+            Write-Host ""
+            Write-Host "  WARNING: HIP $major.$minor is too old for $GpuArch (needs $minMajor.$minMinor+)" -ForegroundColor Red
+            Write-Host "  Kernels may fail to load. Update AMD HIP SDK:" -ForegroundColor Yellow
+            Write-Host "    https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html" -ForegroundColor Yellow
+            Write-Host ""
+            $reply = Read-Host "  Continue anyway? [y/N]"
+            if ($reply -notmatch "^[Yy]$") { exit 1 }
+        }
+    }
+}
+
 # ─── Bun (CLI runtime) ───────────────────────────────────
 Write-Host ""
 Write-Host "Checking Bun..." -ForegroundColor Cyan

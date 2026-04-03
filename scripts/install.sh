@@ -102,13 +102,68 @@ echo "  GPU arch: $GPU_ARCH"
 echo ""
 echo "Checking HIP runtime..."
 HIP_FOUND=false
+HIP_LIB=""
 for lib in /opt/rocm/lib/libamdhip64.so /usr/lib/libamdhip64.so /usr/lib/x86_64-linux-gnu/libamdhip64.so; do
     if [ -f "$lib" ]; then
         echo "  libamdhip64.so: found at $lib ✓"
         HIP_FOUND=true
+        HIP_LIB="$lib"
         break
     fi
 done
+
+# Check HIP version matches GPU arch requirements
+if $HIP_FOUND; then
+    HIP_VER=""
+    if command -v /opt/rocm/bin/hipconfig &>/dev/null; then
+        HIP_VER=$(/opt/rocm/bin/hipconfig --version 2>/dev/null | grep -oP '^\d+\.\d+' || true)
+    elif command -v hipconfig &>/dev/null; then
+        HIP_VER=$(hipconfig --version 2>/dev/null | grep -oP '^\d+\.\d+' || true)
+    fi
+
+    if [ -n "$HIP_VER" ]; then
+        HIP_MAJOR=$(echo "$HIP_VER" | cut -d. -f1)
+        HIP_MINOR=$(echo "$HIP_VER" | cut -d. -f2)
+        echo "  HIP version: $HIP_VER"
+
+        # Minimum HIP versions per GPU arch
+        MIN_MAJOR=5; MIN_MINOR=0
+        case "$GPU_ARCH" in
+            gfx1200|gfx1201) MIN_MAJOR=6; MIN_MINOR=4 ;;
+            gfx1100|gfx1101) MIN_MAJOR=5; MIN_MINOR=5 ;;
+        esac
+
+        NEEDS_UPGRADE=false
+        if [ "$HIP_MAJOR" -lt "$MIN_MAJOR" ] 2>/dev/null; then
+            NEEDS_UPGRADE=true
+        elif [ "$HIP_MAJOR" -eq "$MIN_MAJOR" ] && [ "$HIP_MINOR" -lt "$MIN_MINOR" ] 2>/dev/null; then
+            NEEDS_UPGRADE=true
+        fi
+
+        if $NEEDS_UPGRADE; then
+            echo ""
+            echo "  WARNING: HIP $HIP_VER is too old for $GPU_ARCH (needs $MIN_MAJOR.$MIN_MINOR+)"
+            echo "  Kernels may fail to load. Upgrading HIP runtime is recommended."
+            PKG_CMD=""
+            if command -v apt &>/dev/null; then
+                PKG_CMD="sudo apt install -y rocm-hip-runtime"
+            elif command -v dnf &>/dev/null; then
+                PKG_CMD="sudo dnf install -y rocm-hip-runtime"
+            elif command -v pacman &>/dev/null; then
+                PKG_CMD="sudo pacman -S --noconfirm rocm-hip-runtime"
+            fi
+            if [ -n "$PKG_CMD" ]; then
+                reply=$(ask "  Upgrade now? ($PKG_CMD) [Y/n] " "Y")
+                if [ "$reply" != "n" ] && [ "$reply" != "N" ]; then
+                    echo "  Running: $PKG_CMD"
+                    eval "$PKG_CMD" || echo "  Upgrade failed. You may need to add the ROCm repo first."
+                fi
+            else
+                echo "  Upgrade manually: https://rocm.docs.amd.com/en/latest/deploy/linux/quick_start.html"
+            fi
+        fi
+    fi
+fi
 
 if ! $HIP_FOUND; then
     echo "  libamdhip64.so: NOT FOUND"
