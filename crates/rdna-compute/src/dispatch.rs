@@ -5247,7 +5247,15 @@ impl Gpu {
         //            small-M residual projections at prefill-sized batches.
         //            DFlash verify/lm_head runs at B<=16 and large-M draft
         //            FFN/lm_head also prefer k2.
-        //   k4     — 4× K-tile pipeline (output-mapping bug, τ=0 on dflash — debug only)
+        //   k4     — 4× K-tile pipeline. Fixed 2026-05-01 (commit pending):
+        //            output mapping was swapped relative to K2's canonical
+        //            wave32 WMMA C-mapping. Channel-test passes at K∈{256,512,4096}
+        //            × batch∈{1,2,4,16}. At m<8192 (9B residual at m=4096) K4
+        //            ties K2 within FP drift but loses to ksplit by ~33%
+        //            per-call at small batch (CU-starved grid: 3.3 vs 13
+        //            blocks/CU); auto-dispatch correctly stays on ksplit. K4
+        //            vs K2 at m≥8192 not yet benched on available models. See
+        //            plans/k4_plan.md.
         //   wmma   — base WMMA         (output-mapping bug — debug only)
         //   wmma2  — 2-wave block, 32 rows × 16 batch (output-mapping bug — debug only)
         let is_gfx115x = matches!(self.arch.as_str(), "gfx1150" | "gfx1151" | "gfx1152");
