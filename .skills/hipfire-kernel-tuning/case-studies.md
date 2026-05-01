@@ -249,6 +249,9 @@ gfx1100 should pass byte-exact.
 
 ## §7 — LDS-staged X share on gate_up (null result, kept opt-in for posterity)
 
+**Commit**: `feb16a1` — "experiment(gate_up): LDS-staged X share
+variant — pp512 prefill -12% (null result)"
+
 **Variant kernel**: `kernels/src/gemm_gate_up_hfq4g256_wmma_ldsx.hip`,
 opt-in via `HIPFIRE_GATE_UP_VARIANT=ldsx`. Investigation tracked in
 issue #60 (which has the v2 plan + three independent adversarial

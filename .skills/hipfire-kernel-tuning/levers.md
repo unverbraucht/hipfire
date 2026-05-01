@@ -200,8 +200,8 @@ correctness pass.
 
 ### LDS-staged X share on gate_up (gfx1100)
 
-Variant kernel `gemm_gate_up_hfq4g256_wmma_ldsx.hip` opt-in via
-`HIPFIRE_GATE_UP_VARIANT=ldsx`, default off. ISA-clean (75 VGPRs vs
+Commit `feb16a1` — variant kernel `gemm_gate_up_hfq4g256_wmma_ldsx.hip`
+opt-in via `HIPFIRE_GATE_UP_VARIANT=ldsx`, default off. ISA-clean (75 VGPRs vs
 80 baseline, single-wave block makes `__syncthreads()` a no-op so
 the compiler kept weight prefetch above the LDS-write phase) but
 **per-call wall regressed +20% / +29% / +37% at pp32 / pp128 /
