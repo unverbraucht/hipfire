@@ -103,6 +103,45 @@ fn has_mmq_i8_wmma(arch: &str) -> bool {
     matches!(arch, "gfx1100" | "gfx1101" | "gfx1102" | "gfx1103" | "gfx1150" | "gfx1151" | "gfx1152")
 }
 
+/// Decide whether the i8-WMMA MMQ prefill path should be used for a given
+/// GEMM call. Combines the arch gate, the env override, and an empirical
+/// batch-size threshold.
+///
+/// The MMQ kernel uses a 128×128 batch tile (vs the fp16 WMMA path's 16×16),
+/// so it amortizes its high per-launch fixed cost only when batch_size is
+/// large enough to fill multiple tiles. Empirical sweep on Qwen 3.5 9B
+/// (gfx1100, ROCm 7.2, residual at m=4096) across pp ∈ {32..512}:
+///
+///   pp32-pp192: MMQ regresses 23-69% (per-launch overhead dominates).
+///   pp224:      within noise (-8%).
+///   pp256+:     MMQ wins at multiples of 128 (+12% to +29%).
+///
+/// Default threshold is 256 — captures the pp256/pp384/pp512 wins (the
+/// pp512 case is the one issue #60 was filed about) while avoiding the
+/// catastrophic small-batch regression. Set `HIPFIRE_MMQ_MIN_BATCH=N` to
+/// override (e.g. 128 for aggressive routing, 384 for conservative).
+///
+/// `HIPFIRE_MMQ` env override:
+///   `0` / `off`            — force MMQ off (debug / regression bisect)
+///   `1` / `on`             — force MMQ on at every batch (legacy behavior)
+///   `auto` / unset / other — auto-route by batch_size threshold (default)
+fn should_use_mmq(arch: &str, batch_size: usize) -> bool {
+    if !has_mmq_i8_wmma(arch) {
+        return false;
+    }
+    match std::env::var("HIPFIRE_MMQ").ok().as_deref() {
+        Some("0") | Some("off") => false,
+        Some("1") | Some("on") => true,
+        _ => {
+            let min_batch = std::env::var("HIPFIRE_MMQ_MIN_BATCH")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(256);
+            batch_size >= min_batch
+        }
+    }
+}
+
 /// Tensor stored on the GPU. Tracks shape and element type.
 pub struct GpuTensor {
     pub buf: DeviceBuffer,
@@ -2693,7 +2732,7 @@ impl Gpu {
         }
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
         if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
-            if std::env::var("HIPFIRE_MMQ").ok().as_deref() == Some("1") && has_mmq_i8_wmma(&self.arch) {
+            if should_use_mmq(&self.arch, batch_size) {
                 let use_mmq = if self.mmq_screen {
                     self.mmq_screen_weight(a_qkv, qkv_m, k)
                         && self.mmq_screen_weight(a_z, z_m, k)
@@ -2995,7 +3034,7 @@ impl Gpu {
         }
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
         if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
-            if std::env::var("HIPFIRE_MMQ").ok().as_deref() == Some("1") && has_mmq_i8_wmma(&self.arch) {
+            if should_use_mmq(&self.arch, batch_size) {
                 let use_mmq = if self.mmq_screen {
                     self.mmq_screen_weight(a_q, q_m, k)
                         && self.mmq_screen_weight(a_k, k_m, k)
@@ -3276,7 +3315,7 @@ impl Gpu {
         }
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
         if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
-            if std::env::var("HIPFIRE_MMQ").ok().as_deref() == Some("1") && has_mmq_i8_wmma(&self.arch) {
+            if should_use_mmq(&self.arch, batch_size) {
                 let use_mmq = if self.mmq_screen {
                     self.mmq_screen_weight(a_gate, gate_m, k)
                         && self.mmq_screen_weight(a_up, up_m, k)
@@ -4854,9 +4893,8 @@ impl Gpu {
             // screened on first use: a small synthetic comparison detects
             // outlier rows where Q8_1 precision loss exceeds the threshold
             // (#87). Unsafe weights fall through to WMMA instead.
-            if (std::env::var("HIPFIRE_WO_MMQ").ok().as_deref() == Some("1")
-                || std::env::var("HIPFIRE_MMQ").ok().as_deref() == Some("1"))
-                && has_mmq_i8_wmma(&self.arch)
+            if std::env::var("HIPFIRE_WO_MMQ").ok().as_deref() == Some("1")
+                || should_use_mmq(&self.arch, batch_size)
             {
                 let use_mmq = if self.mmq_screen {
                     self.mmq_screen_weight(a_raw, m, k)
