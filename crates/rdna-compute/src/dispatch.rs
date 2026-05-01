@@ -3799,7 +3799,17 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        self.ensure_kernel("gemm_gate_up_hfq4g256_wmma", kernels::GEMM_GATE_UP_HFQ4G256_WMMA_SRC, "gemm_gate_up_hfq4g256_wmma")?;
+        // HIPFIRE_GATE_UP_VARIANT=ldsx routes to the LDS-staged X variant
+        // (Gate 1 microbench, opt-in only, default off). See
+        // docs/perf-checkpoints/2026-05-01-gate-up-lds-x-share-plan.md.
+        let variant_override = std::env::var("HIPFIRE_GATE_UP_VARIANT").ok();
+        let (kernel_name, kernel_src) = match variant_override.as_deref() {
+            Some("ldsx") => ("gemm_gate_up_hfq4g256_wmma_ldsx",
+                             kernels::GEMM_GATE_UP_HFQ4G256_WMMA_LDSX_SRC),
+            _            => ("gemm_gate_up_hfq4g256_wmma",
+                             kernels::GEMM_GATE_UP_HFQ4G256_WMMA_SRC),
+        };
+        self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
         let mut ag = a_gate.buf.as_ptr();
@@ -3832,9 +3842,9 @@ impl Gpu {
                   + crate::profile::gemv_hfq4g256_bytes(up_m, k)
                   + batch_size * k * 2
                   + batch_size * total_m * 4 * 2;
-        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_gate_up_hfq4g256_wmma", bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
         let result = self.launch_maybe_blob(
-            "gemm_gate_up_hfq4g256_wmma",
+            kernel_name,
             [row_tiles as u32, batch_tiles as u32, 1],
             [32, 1, 1],
             0,

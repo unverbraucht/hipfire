@@ -245,6 +245,134 @@ don't expect 2× decode.
 gfx908/gfx940/gfx941/gfx942 only. RDNA archs unchanged. Speed-gate on
 gfx1100 should pass byte-exact.
 
+---
+
+## §7 — LDS-staged X share on gate_up (null result, kept opt-in for posterity)
+
+**Variant kernel**: `kernels/src/gemm_gate_up_hfq4g256_wmma_ldsx.hip`,
+opt-in via `HIPFIRE_GATE_UP_VARIANT=ldsx`. Investigation tracked in
+issue #60 (which has the v2 plan + three independent adversarial
+reviews recorded in the comment thread).
+
+**Bottleneck identified**: per-wave VMEM latency in front of WMMA B in
+the baseline `gemm_gate_up_hfq4g256_wmma` inner loop. ISA dump shows
+`s_waitcnt vmcnt(0)` immediately before the second WMMA each
+K-tile-pair iteration — the compiler couldn't schedule enough
+independent work to hide the b_b load latency.
+
+**Lever attempted**: LDS-staged X share — the "unfinished follow-up"
+from §3's k2x32 lessons. Cooperative global → LDS load once per
+K-tile-pair, then ds_read into the WMMA B operand. Theory: replace
+the ~50 cycle `vmcnt(0)` VMEM stall with a ~20 cycle `lgkmcnt`
+LDS-read stall, hidden by the dequant work that already sits between
+the X load and WMMA.
+
+**Design**: per-K-tile-pair LDS slab (1 KB stages, 2 KB
+double-buffered) — chosen specifically to *avoid* the occupancy
+collapse the v1 design sketch would have hit at 16 KB per block.
+Cooperative load mapping splits the 16 batches × 32 K-element tile
+across all 32 lanes (each loads its own unique 16 fp16) to fix the
+wave-redundancy where lanes 0-15 and lanes 16-31 currently re-read
+the same X columns.
+
+**Numbers** (Qwen 3.5 9B MQ4, gfx1100, ROCm 7.2,
+`HIPFIRE_PROFILE=1 ... --warmup 5 --gen 0`):
+
+| | baseline gate_up µs/call | LDSX gate_up µs/call | Δ per-call |
+|---:|---:|---:|---:|
+| pp32 | 261 | 314 | **+20.3%** |
+| pp128 | 895 | 1157 | **+29.3%** |
+| pp512 | 1760 | 2415 | **+37.2%** |
+
+| | baseline prefill tok/s | LDSX prefill tok/s | Δ |
+|---:|---:|---:|---:|
+| pp32 | 598 | 492 | −17.7% |
+| pp128 | 792 | 760 | −4.0% |
+| pp512 | 1155 | 1012 | −12.4% |
+
+Effective BW collapses 178 → 64 → 41 GiB/s on gate_up as batch grows.
+The kernel is *more* memory-bound at large M than the baseline, not
+less.
+
+**Validation path**:
+
+- **Gate 0 (ISA inspection) — PASSED.** `hipcc -save-temps -S -O3
+  --offload-arch=gfx1100` showed: 75 VGPRs (down from baseline 80),
+  no `s_barrier` emitted (single-wave-per-block elides
+  `__syncthreads()`), weight load preserved at the top of the
+  inner loop, ds_read followed by ~145 instructions of dequant
+  before WMMA. All four Gate 0 criteria from the v2 plan
+  satisfied.
+- **Gate 1 (microbench) — FAILED.** Per-call wall time regressed
+  at every pp size. Issue #60 thread documents the full per-pp
+  breakdown plus the comparison vs the baseline ISA.
+
+**Why ISA-clean still regressed**: the baseline inner loop has
+2 VMEM stalls per K-tile-pair (`vmcnt(2)` before WMMA A,
+`vmcnt(0)` before WMMA B). The LDSX inner loop has 3 VMEM stalls
++ 2 LGKM stalls per iteration (vmcnt waits in the LDS-store phase,
+vmcnt before dequant for the weight load, and lgkmcnt waits before
+each WMMA). More stall events, smaller individual latencies.
+Critically, the baseline's `vmcnt(0)` was already partially hidden
+by wave-level ILP (2 waves/SIMD baseline → wave scheduler swaps to
+sibling wave during the stall), so eliminating it didn't free as
+much wall time as the static analysis suggested. Meanwhile the
+new LDS round-trip costs were paid in full.
+
+**Why kept**: the kernel + dispatch arm stay in the tree
+(default-off opt-in via `HIPFIRE_GATE_UP_VARIANT=ldsx`) so future
+revisits — possibly on RDNA4 (gfx12 gains `s_prefetch_data`) or
+with a fundamentally different LDS layout (e.g., LDS holds
+*dequantized* weights instead of X, making the lever go after the
+A-side load not the B-side) — don't have to rebuild the
+infrastructure from scratch. Mirrors the §3 k2x32 disposition.
+
+**Three reviews caught the headline issues, two of them caught
+issues that turned out to be moot, one caught the issue that
+mattered most**:
+
+- All three (Claude, Gemini, GLM-5): "32× X-load reduction" framing
+  was wrong on multiple axes. Confirmed empirically.
+- Gemini §1 + GLM §2: occupancy collapse risk if LDS budget grows
+  to 16 KB/block. **Moot** — v2 design used 2 KB and Gate 0 ISA
+  showed VGPRs went *down* not up.
+- GLM §4: `__syncthreads()` would force a pipeline flush and
+  destroy compiler scheduling freedom. **Moot** — single-wave
+  blocks elide the barrier entirely.
+- GLM §2: ~50% of `vmcnt(0)` stalls are already hidden by
+  wave-level ILP. **This was the load-bearing critique.**
+  Eliminating already-hidden stalls is the textbook recipe for a
+  null result, and that's exactly what we got — except worse,
+  because we replaced them with new stalls the wave scheduler
+  couldn't hide as well.
+
+**Lesson**: ISA inspection alone is insufficient. A clean ISA
+(no barrier emitted, weight prefetch preserved, VGPR budget healthy)
+predicted a net win that didn't materialize on the bench. The
+missing piece was wave-scheduler-level latency hiding, which is
+invisible in static analysis but dominant in wall-time measurement.
+**Always pair ISA inspection with cycle-counting microbench before
+committing to a kernel rewrite.** And if a stall you're trying to
+remove is in a kernel that's already running at meaningful
+SIMD-utilization (≥20%), assume the wave scheduler is hiding
+*some* of it — your ceiling is smaller than the per-iteration
+cycle count suggests.
+
+**For future revisit**: don't re-try this exact design. If you want
+to attack the same `vmcnt(0)` stall with a different mechanism,
+the candidates are:
+
+- Pre-dequantize the A-side into LDS (move the lever to weights, not
+  X — A is read-once-per-row, X is read-once-per-batch, but A's
+  dequant work is what's currently filling the stall window —
+  removing it changes the schedule).
+- gfx12 `s_prefetch_data` (per `levers.md §5`) — different
+  hardware, different tradeoffs.
+- Restructure the inner loop to issue more independent WMMAs in
+  parallel, giving the scheduler more work to hide individual
+  stalls behind. This loops back to the K4 / K8 deeper-pipelining
+  discussion that's currently blocked on K4's correctness bug.
+
 ## How to add a case study
 
 If you land a real perf win or revert worth documenting, append a

@@ -198,6 +198,21 @@ silent garbage output (dangling stack-pointer kernargs from raw
 worse on most archs. Don't make it default-on without a thorough
 correctness pass.
 
+### LDS-staged X share on gate_up (gfx1100)
+
+Variant kernel `gemm_gate_up_hfq4g256_wmma_ldsx.hip` opt-in via
+`HIPFIRE_GATE_UP_VARIANT=ldsx`, default off. ISA-clean (75 VGPRs vs
+80 baseline, single-wave block makes `__syncthreads()` a no-op so
+the compiler kept weight prefetch above the LDS-write phase) but
+**per-call wall regressed +20% / +29% / +37% at pp32 / pp128 /
+pp512 on Qwen 3.5 9B**. Replaced the baseline's 2 VMEM stalls per
+inner-iteration with 3 VMEM + 2 LGKM stalls — the new stalls
+weren't hidden by wave-level ILP the way the original `vmcnt(0)`
+was. See case-studies §7 for the full diagnosis. Don't re-try
+without (a) a fundamentally different LDS layout that doesn't
+serialize through register, or (b) on RDNA4 (gfx12), where
+`s_prefetch_data` may change the calculus.
+
 ## When you're done
 
 Commit your win (or your null-result revert) with the commit-message
