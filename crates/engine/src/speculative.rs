@@ -17,7 +17,7 @@ use crate::hfq::HfqFile;
 use crate::llama::{self, KvCache};
 use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weights};
 use crate::tokenizer::Tokenizer;
-use hip_bridge::{DeviceBuffer, HipResult};
+use hip_bridge::{DeviceBuffer, HipResult, Stream};
 use rdna_compute::{Gpu, GpuTensor};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1329,6 +1329,60 @@ impl HiddenStateRingBuffer {
                     &self.layer_bufs[ei].buf, 0,
                     &self.staging_bufs[ei].buf, first * row_bytes,
                     (n - first) * row_bytes,
+                )?;
+            }
+        }
+        self.head = (head + n) % max_pos;
+        self.written += n;
+        Ok(())
+    }
+
+    /// Path D D0a: async-on-stream variant of `commit_staging_to_ring`.
+    ///
+    /// Differs from the sync wrapper in two ways:
+    ///   1. Uses `memcpy_dtod_async_at(..., stream)` instead of sync
+    ///      `memcpy_dtod_at` on the null stream. Copies are ordered on
+    ///      `stream` and capturable.
+    ///   2. Does **no** host-side `stream_synchronize`. The caller is
+    ///      responsible for ordering: e.g. recording a `pre_commit` event
+    ///      *before* invoking this and having other streams wait on it,
+    ///      and ensuring prior writes to the staging buffers on `stream`
+    ///      are already enqueued.
+    ///
+    /// CPU bookkeeping (`self.head`, `self.written`) is advanced after the
+    /// async enqueues, mirroring the sync variant. Callers that snapshot
+    /// `head`/`written` *before* calling this see pre-commit values.
+    pub fn commit_staging_to_ring_on_stream(
+        &mut self,
+        gpu: &Gpu,
+        n: usize,
+        stream: &Stream,
+    ) -> HipResult<()> {
+        let row_bytes = self.hidden_dim * 4;
+        let head = self.head;
+        let max_pos = self.max_positions;
+
+        for ei in 0..self.layer_bufs.len() {
+            if head + n <= max_pos {
+                gpu.hip.memcpy_dtod_async_at(
+                    &self.layer_bufs[ei].buf, head * row_bytes,
+                    &self.staging_bufs[ei].buf, 0,
+                    n * row_bytes,
+                    stream,
+                )?;
+            } else {
+                let first = max_pos - head;
+                gpu.hip.memcpy_dtod_async_at(
+                    &self.layer_bufs[ei].buf, head * row_bytes,
+                    &self.staging_bufs[ei].buf, 0,
+                    first * row_bytes,
+                    stream,
+                )?;
+                gpu.hip.memcpy_dtod_async_at(
+                    &self.layer_bufs[ei].buf, 0,
+                    &self.staging_bufs[ei].buf, first * row_bytes,
+                    (n - first) * row_bytes,
+                    stream,
                 )?;
             }
         }
