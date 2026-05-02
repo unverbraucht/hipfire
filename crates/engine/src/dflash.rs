@@ -24,7 +24,7 @@
 
 use crate::hfq::HfqFile;
 use crate::llama::WeightTensor;
-use hip_bridge::HipResult;
+use hip_bridge::{HipResult, Stream};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 // ─── Config ────────────────────────────────────────────────────────────────
@@ -661,6 +661,40 @@ fn upload_slice_i32(gpu: &Gpu, dst: &GpuTensor, data: &[i32]) -> HipResult<()> {
 ///     with `ctx_len × num_extract × hidden` F32 rows.
 #[allow(clippy::too_many_arguments)]
 pub fn draft_forward(
+    gpu: &mut Gpu,
+    weights: &DflashWeights,
+    cfg: &DflashConfig,
+    noise_embedding: Option<&[f32]>,
+    target_hidden: Option<&[f32]>,
+    positions_q: &[i32],
+    positions_k: &[i32],
+    block_size: usize,
+    ctx_len: usize,
+    scratch: &mut DflashScratch,
+    stream_override: Option<&Stream>,
+) -> HipResult<()> {
+    // Path D D0c: when `stream_override` is `Some`, every kernel /
+    // memcpy / memset issued through `gpu.*` inside the closure routes
+    // through that stream instead of `gpu.active_stream`. The override
+    // is restored to its prior value when the closure returns. When
+    // `None`, behavior is byte-exact identical to pre-D0c.
+    let mut body = move |gpu: &mut Gpu| -> HipResult<()> {
+        draft_forward_body(
+            gpu, weights, cfg,
+            noise_embedding, target_hidden,
+            positions_q, positions_k,
+            block_size, ctx_len,
+            scratch,
+        )
+    };
+    match stream_override {
+        Some(s) => gpu.with_stream_override(s, body),
+        None => body(gpu),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draft_forward_body(
     gpu: &mut Gpu,
     weights: &DflashWeights,
     cfg: &DflashConfig,

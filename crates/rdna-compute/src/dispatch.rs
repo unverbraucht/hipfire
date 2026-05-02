@@ -225,6 +225,16 @@ pub struct Gpu {
     /// — Phase A is a non-behavioral scaffold.
     pub draft_stream: Option<hip_bridge::Stream>,
     pub verify_stream: Option<hip_bridge::Stream>,
+    /// Path D D0c stream-override chokepoint. When `Some`, every kernel /
+    /// memcpy / memset routed through `stream_ref()` lands on this stream
+    /// instead of `active_stream`. Designed to be set transiently by
+    /// `dflash::draft_forward` so the draft leg of a pipelined cycle runs
+    /// on `Gpu.draft_stream` while `active_stream` (= verify_stream) keeps
+    /// running verify N. Raw pointer because `hip_bridge::Stream` is not
+    /// `Clone` and we need to refer to a stream owned elsewhere by `Gpu`.
+    /// Lifetime: caller saves the previous value at entry and restores it
+    /// before returning, so the pointer is valid for as long as it's read.
+    pub(crate) stream_override: Option<*const hip_bridge::Stream>,
     /// MagnumQuant FWHT signs (256 floats each) + rotation scratch buffer.
     pub mq_signs1: Option<GpuTensor>,
     pub mq_signs2: Option<GpuTensor>,
@@ -354,8 +364,49 @@ pub struct Gpu {
 
 impl Gpu {
     /// Returns the active stream ref for kernel launches (None = null stream).
+    ///
+    /// Path D D0c: consults `stream_override` first. When set (e.g. by
+    /// `dflash::draft_forward` in a pipelined cycle), kernels enqueue on
+    /// the override stream. Otherwise falls through to `active_stream`.
     fn stream_ref(&self) -> Option<&hip_bridge::Stream> {
+        if let Some(p) = self.stream_override {
+            // Safety: the override is set by a caller that holds a `&Stream`
+            // borrow that outlives the override window. The caller restores
+            // the field to its prior value before returning.
+            return Some(unsafe { &*p });
+        }
         self.active_stream.as_ref()
+    }
+
+    /// Returns whether a stream is selected for async work — `true` if either
+    /// `stream_override` or `active_stream` is set. Used at sites that gate
+    /// async-vs-sync paths on stream availability.
+    fn stream_available(&self) -> bool {
+        self.stream_override.is_some() || self.active_stream.is_some()
+    }
+
+    /// Path D D0c: install a transient stream override and run `f`. The
+    /// previous override (if any) is restored before this returns. Pipelined
+    /// `draft_forward` uses this to redirect every kernel/memcpy/memset
+    /// launched inside `f` onto `draft_stream` while `active_stream`
+    /// (= verify_stream) keeps running verify N.
+    ///
+    /// Panic-safety: if `f` panics, the override is *not* restored. This is
+    /// acceptable here — `Gpu` is single-threaded and a panic that escapes
+    /// `draft_forward` propagates to the daemon's request boundary, which
+    /// drops or rebuilds the Gpu before the next request. No use-after-free
+    /// because the raw pointer is dangling only after the `&Stream` borrow
+    /// expires, which can't happen while we're still in `f`.
+    pub fn with_stream_override<R>(
+        &mut self,
+        stream: &hip_bridge::Stream,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let prev = self.stream_override;
+        self.stream_override = Some(stream as *const hip_bridge::Stream);
+        let result = f(self);
+        self.stream_override = prev;
+        result
     }
 
     /// Drive the GPU to full DPM perf level before a perf-sensitive measurement.
@@ -433,6 +484,7 @@ impl Gpu {
             active_stream: None,
             draft_stream: None,
             verify_stream: None,
+            stream_override: None,
             mq_signs1: None,
             mq_signs2: None,
             mq_x_rot: None,
@@ -811,7 +863,7 @@ impl Gpu {
         src_offset: usize,
         size: usize,
     ) -> HipResult<()> {
-        if let Some(stream) = self.active_stream.as_ref() {
+        if let Some(stream) = self.stream_ref() {
             self.hip.memcpy_dtod_async_at(dst, dst_offset, src, src_offset, size, stream)
         } else {
             self.hip.memcpy_dtod_at(dst, dst_offset, src, src_offset, size)
@@ -858,7 +910,7 @@ impl Gpu {
             }
         } else {
             let func = &self.functions[func_name];
-            let stream = self.active_stream.as_ref().map(|s| s as &hip_bridge::Stream);
+            let stream = self.stream_ref();
             unsafe {
                 self.hip.launch_kernel(func, grid, block, shared_mem, stream, params)
             }
@@ -1248,7 +1300,7 @@ impl Gpu {
 
     pub fn zeros(&mut self, shape: &[usize], dtype: DType) -> HipResult<GpuTensor> {
         let tensor = self.alloc_tensor(shape, dtype)?;
-        match self.active_stream.as_ref() {
+        match self.stream_ref() {
             Some(stream) => self.hip.memset_async(&tensor.buf, 0, tensor.byte_size(), stream)?,
             None => self.hip.memset(&tensor.buf, 0, tensor.byte_size())?,
         }
@@ -6258,7 +6310,7 @@ impl Gpu {
         // Pre-zero Y (residual WMMA does y += acc) and force FP16-X reconversion
         // (the draft reuses the same scratch pointer every cycle with new data).
         self.fp16_x_source_ptr = std::ptr::null_mut();
-        match self.active_stream.as_ref() {
+        match self.stream_ref() {
             Some(stream) => self.hip.memset_async(&y.buf, 0, batch_size * m * 4, stream)?,
             None => self.hip.memset(&y.buf, 0, batch_size * m * 4)?,
         }
@@ -6328,7 +6380,7 @@ impl Gpu {
             && !std::env::var("HIPFIRE_LM_HEAD_WMMA").map_or(false, |v| v == "0");
         if wmma_eligible {
             self.fp16_x_source_ptr = std::ptr::null_mut();
-            match self.active_stream.as_ref() {
+            match self.stream_ref() {
                 Some(stream) => self.hip.memset_async(&y.buf, 0, batch_size * m * 4, stream)?,
                 None => self.hip.memset(&y.buf, 0, batch_size * m * 4)?,
             }
@@ -6366,7 +6418,7 @@ impl Gpu {
             && !std::env::var("HIPFIRE_LM_HEAD_WMMA").map_or(false, |v| v == "0");
         if wmma_eligible {
             self.fp16_x_source_ptr = std::ptr::null_mut();
-            match self.active_stream.as_ref() {
+            match self.stream_ref() {
                 Some(stream) => self.hip.memset_async(&y.buf, 0, batch_size * m * 4, stream)?,
                 None => self.hip.memset(&y.buf, 0, batch_size * m * 4)?,
             }
@@ -8589,7 +8641,7 @@ impl Gpu {
 
         // When a stream is active (graph capture mode), use max_seq for shared mem
         // so the captured graph works for all sequence lengths.
-        let effective_seq = if self.active_stream.is_some() { max_seq } else { seq_len_hint };
+        let effective_seq = if self.stream_available() { max_seq } else { seq_len_hint };
         let block_size = (effective_seq.max(head_dim) as u32).next_power_of_two().min(256);
         let shared_mem = ((effective_seq + block_size as usize) * 4) as u32;
 

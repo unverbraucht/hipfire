@@ -2704,6 +2704,7 @@ pub fn spec_step_dflash(
         b,
         effective_ctx_len,
         draft_scratch,
+        None, // stream_override (Path D D0c) — None = use gpu.active_stream
     )?;
 
     // ── 5. Apply target.lm_head to draft hidden positions 1..B ──────────
@@ -3344,6 +3345,7 @@ fn run_dflash_draft_for_logits(
         b,
         effective_ctx_len,
         draft_scratch,
+        None, // stream_override (Path D D0c)
     )?;
 
     // Step 4: Apply target.lm_head to draft hidden rows [1..B). Same batched
@@ -3488,6 +3490,7 @@ fn run_dflash_draft_for_topk_gpu(
         b,
         effective_ctx_len,
         draft_scratch,
+        None, // stream_override (Path D D0c)
     )?;
 
     // Step 4: lm_head → [batch × vocab] logits (GPU-resident).

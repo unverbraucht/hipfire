@@ -108,6 +108,7 @@ fn main() {
         block_size,
         ctx_len,
         &mut scratch,
+        None, // stream_override (Path D D0c)
     )
     .expect("draft_forward");
     // Ensure all kernels complete before we download.
