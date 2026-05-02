@@ -2326,6 +2326,56 @@ pub fn scatter_hidden_block_to_interleaved(
     Ok(())
 }
 
+/// Path D D0b: async-on-stream variant of `scatter_hidden_block_to_interleaved`.
+///
+/// Differs from the sync variant in two ways:
+///   1. Uses `memcpy_dtod_async_at(..., stream)` so all copies are
+///      ordered on `stream` and capturable.
+///   2. Takes `head_snapshot` as an explicit parameter rather than
+///      reading `hidden_rb.head` live. The pipelined caller passes the
+///      pre-commit head it captured at cycle entry; the sync variant
+///      passes `hidden_rb.head` and gets identical math.
+///
+/// Caller is responsible for ordering: the source layer_bufs must be
+/// in the desired post-commit-N-1 state on `stream` before this is
+/// enqueued (use cross-stream events to pin to the desired commit).
+pub fn scatter_hidden_block_to_interleaved_on_stream(
+    gpu: &Gpu,
+    hidden_rb: &HiddenStateRingBuffer,
+    dst: &GpuTensor,
+    dst_row_offset: usize,
+    block_size: usize,
+    n_rows: usize,
+    head_snapshot: usize,
+    stream: &Stream,
+) -> HipResult<()> {
+    assert!(n_rows <= block_size, "scatter: n_rows {n_rows} > block_size {block_size}");
+    let num_extract = hidden_rb.extract_layers.len();
+    let hidden = hidden_rb.hidden_dim;
+    let max_pos = hidden_rb.max_positions;
+    let row_bytes = hidden * 4;
+    let start_slot = (head_snapshot + max_pos - block_size) % max_pos;
+
+    for r in 0..n_rows {
+        let slot = (start_slot + r) % max_pos;
+        let dst_row = dst_row_offset + r;
+        let dst_row_base_bytes = dst_row * num_extract * row_bytes;
+        for ext in 0..num_extract {
+            let src_offset_bytes = slot * row_bytes;
+            let dst_offset_bytes = dst_row_base_bytes + ext * row_bytes;
+            gpu.hip.memcpy_dtod_async_at(
+                &dst.buf,
+                dst_offset_bytes,
+                &hidden_rb.layer_bufs[ext].buf,
+                src_offset_bytes,
+                row_bytes,
+                stream,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 pub fn download_hidden_block(
     gpu: &Gpu,
     hidden_rb: &HiddenStateRingBuffer,
