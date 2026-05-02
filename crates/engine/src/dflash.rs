@@ -536,6 +536,252 @@ impl DflashScratch {
     }
 }
 
+// ─── DflashScratchPair (Path D D2) ─────────────────────────────────────────
+
+/// Path D D2 (issue #38): paired draft scratch for inter-cycle pipelining.
+///
+/// Holds two `DflashScratch` instances (`a` and `b`) so cycle N's draft can
+/// write into one while cycle N+1's draft reads from the other. `b` is
+/// allocated only when pipelining is enabled (`HIPFIRE_DFLASH_PIPELINE=1`)
+/// AND the startup VRAM headroom check passes — otherwise the pair degrades
+/// to a single scratch (`b = None`) and the caller falls through to the
+/// non-pipelined `spec_step_dflash` path.
+///
+/// Also owns dedicated lm_head logits + FWHT-rotation buffers for the draft
+/// leg. Without this, the pipelined draft would race with verify N's
+/// lm_head on `verify_scratch.logits` / `verify_scratch.rot` (see
+/// speculative.rs:2746-2769 for the existing reuse pattern).
+///
+/// Memory cost: per-half `DflashScratch` is ~30 MB at the spec demo's
+/// example config (5-layer / max_ctx=512) and can exceed 500 MB at
+/// 16-layer / max_ctx=4096. Plus ~10 MB for lm_head_logits at 27B
+/// vocab=152K, batch=16. The pair therefore costs ~64 MB at typical
+/// configs and up to ~1 GB at worst case — gated entirely on env=1, with
+/// a runtime VRAM check before allocation (see `new` for the threshold).
+pub struct DflashScratchPair {
+    /// Always allocated. Holds the "current" cycle's draft state.
+    pub a: DflashScratch,
+    /// Allocated iff pipelining is active. `None` means the pair is
+    /// degraded to single-scratch mode — caller should run the
+    /// non-pipelined spec step. Set to `None` by `drop_unused_half()`
+    /// when D4's adaptive bypass triggers, releasing ~30 MB+ for the
+    /// rest of the request.
+    pub b: Option<DflashScratch>,
+    /// Even cycles use `a`, odd use `b`. Toggled by the pipelined branch
+    /// of `spec_step_dflash` via `flip()`.
+    pub parity: bool,
+    /// Dedicated draft lm_head logits — `[max_block × vocab]` F32.
+    /// `Some` iff pipelining is active.
+    pub draft_lm_head_logits: Option<GpuTensor>,
+    /// FWHT rotation scratch for MQ4 lm_head — `[max_block × hidden_k]`
+    /// F32. `Some` iff pipelining is active. Sized to the same `hidden_k`
+    /// the existing `verify_scratch.rot` uses.
+    pub draft_lm_head_rot: Option<GpuTensor>,
+}
+
+impl DflashScratchPair {
+    /// Build a pair, allocating `b` and the draft lm_head scratches only
+    /// when pipelining is enabled AND VRAM headroom suffices. On
+    /// insufficient VRAM, logs once and returns a degraded pair (single-
+    /// scratch mode).
+    ///
+    /// Per plan §5.1: free VRAM must exceed `b`-size + lm_head + 200 MB
+    /// safety margin, else refuse pipelining for this request rather
+    /// than OOM-crash mid-cycle.
+    pub fn new(
+        gpu: &mut Gpu,
+        cfg: &DflashConfig,
+        max_block_size: usize,
+        max_ctx_len: usize,
+        with_mq: bool,
+        target_vocab: usize,
+        target_hidden_k: usize,
+    ) -> HipResult<Self> {
+        // `a` is always allocated — equivalent to a non-pipelined caller's
+        // single scratch. Existing call sites that don't use the pair pass
+        // through `DflashScratch::new_with_mq` directly and are unaffected.
+        let a = DflashScratch::new_with_mq(gpu, cfg, max_block_size, max_ctx_len, with_mq)?;
+
+        let mut b: Option<DflashScratch> = None;
+        let mut draft_lm_head_logits: Option<GpuTensor> = None;
+        let mut draft_lm_head_rot: Option<GpuTensor> = None;
+
+        if gpu.pipeline_enabled() {
+            let scratch_bytes = Self::estimate_scratch_bytes(
+                cfg, max_block_size, max_ctx_len, with_mq,
+            );
+            let lmhead_bytes =
+                max_block_size * target_vocab * 4 + max_block_size * target_hidden_k * 4;
+            let safety_margin: usize = 200 * 1024 * 1024;
+            let needed = scratch_bytes + lmhead_bytes + safety_margin;
+            let (free_vram, _total) = gpu.hip.get_vram_info().unwrap_or((0, 0));
+            if (free_vram as usize) >= needed {
+                b = Some(DflashScratch::new_with_mq(
+                    gpu, cfg, max_block_size, max_ctx_len, with_mq,
+                )?);
+                draft_lm_head_logits =
+                    Some(gpu.alloc_tensor(&[max_block_size * target_vocab], DType::F32)?);
+                draft_lm_head_rot =
+                    Some(gpu.alloc_tensor(&[max_block_size * target_hidden_k], DType::F32)?);
+            } else {
+                eprintln!(
+                    "[dflash] HIPFIRE_DFLASH_PIPELINE=1 but VRAM headroom is \
+                     insufficient (free={} MB, need={} MB incl 200 MB margin). \
+                     Pipelining disabled for this request — pair degraded to \
+                     single-scratch mode.",
+                    free_vram as usize / (1024 * 1024),
+                    needed / (1024 * 1024),
+                );
+            }
+        }
+
+        Ok(Self {
+            a,
+            b,
+            parity: false,
+            draft_lm_head_logits,
+            draft_lm_head_rot,
+        })
+    }
+
+    /// Returns `true` when pipelining is active for this request — `b` and
+    /// the draft lm_head scratches are allocated. Caller should branch
+    /// here to choose between pipelined and non-pipelined spec step.
+    pub fn pipelining_active(&self) -> bool {
+        self.b.is_some()
+    }
+
+    /// Returns the scratch the current cycle should write into. When
+    /// pipelining is degraded, always returns `a` (parity is forced to
+    /// `false` in `flip()` on a degraded pair).
+    pub fn current(&mut self) -> &mut DflashScratch {
+        if self.parity {
+            self.b.as_mut().expect(
+                "current(): parity=true but b is None — flip() ran on a degraded pair",
+            )
+        } else {
+            &mut self.a
+        }
+    }
+
+    /// Returns the scratch holding the previous cycle's draft state. Only
+    /// meaningful when pipelining is active. Panics if `b` is None — the
+    /// caller is expected to check `pipelining_active()` first.
+    pub fn previous(&mut self) -> &mut DflashScratch {
+        if self.parity {
+            &mut self.a
+        } else {
+            self.b.as_mut().expect(
+                "previous(): pipelining is not active — guard with pipelining_active()",
+            )
+        }
+    }
+
+    /// Toggle parity. No-op when pipelining is degraded (parity stays
+    /// `false`, `current()` keeps returning `a`).
+    pub fn flip(&mut self) {
+        if self.b.is_some() {
+            self.parity = !self.parity;
+        }
+    }
+
+    /// Free the unused half (`b` and the draft lm_head scratches).
+    /// Called by D4's adaptive bypass when τ stays under the pipelined
+    /// floor for 3 consecutive cycles — reclaims ~30 MB+ of VRAM for
+    /// the rest of the request. After this, `pipelining_active()` returns
+    /// `false` and the caller should run the non-pipelined spec step.
+    ///
+    /// If the pair is currently using `b` (parity=true), `b` is moved
+    /// into the `a` slot (replacing the old `a`, which is freed) so the
+    /// surviving scratch holds the most recently written state.
+    pub fn drop_unused_half(&mut self, gpu: &mut Gpu) {
+        if self.parity {
+            if let Some(b) = self.b.take() {
+                let old_a = std::mem::replace(&mut self.a, b);
+                old_a.free_gpu(gpu);
+            }
+            self.parity = false;
+        } else if let Some(b) = self.b.take() {
+            b.free_gpu(gpu);
+        }
+        if let Some(t) = self.draft_lm_head_logits.take() {
+            let _ = gpu.free_tensor(t);
+        }
+        if let Some(t) = self.draft_lm_head_rot.take() {
+            let _ = gpu.free_tensor(t);
+        }
+    }
+
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        self.a.free_gpu(gpu);
+        if let Some(b) = self.b {
+            b.free_gpu(gpu);
+        }
+        if let Some(t) = self.draft_lm_head_logits {
+            let _ = gpu.free_tensor(t);
+        }
+        if let Some(t) = self.draft_lm_head_rot {
+            let _ = gpu.free_tensor(t);
+        }
+    }
+
+    /// Estimated GPU byte cost of one `DflashScratch` for the given config.
+    /// Mirrors the per-tensor allocations in `DflashScratch::new_with_mq`.
+    /// Used for the VRAM headroom check before allocating the pair's
+    /// second half.
+    fn estimate_scratch_bytes(
+        cfg: &DflashConfig,
+        max_block_size: usize,
+        max_ctx_len: usize,
+        with_mq: bool,
+    ) -> usize {
+        let b = max_block_size;
+        let l = max_ctx_len;
+        let tot = l + b;
+        let ne = cfg.num_extract();
+        let h = cfg.hidden;
+        let inter = cfg.intermediate;
+        let qd = cfg.q_dim();
+        let kvd = cfg.kv_dim();
+        let n_layers = cfg.n_layers;
+        const F32_B: usize = 4;
+
+        let mut total = 0usize;
+        // Block-sized activations.
+        total += b * h * F32_B;     // x
+        total += b * h * F32_B;     // x_norm
+        total += b * qd * F32_B;    // q
+        total += b * kvd * F32_B;   // k_noise
+        total += b * kvd * F32_B;   // v_noise
+        total += b * inter * F32_B; // gate
+        total += b * inter * F32_B; // up
+        total += b * inter * F32_B; // gate_up
+        total += b * qd * F32_B;    // attn_out
+        total += b * h * F32_B;     // attn_proj
+        total += b * h * F32_B;     // residual_attn
+        total += b * h * F32_B;     // residual_ffn
+        // Context-sized.
+        total += l * ne * h * F32_B; // target_hidden
+        total += l * h * F32_B;      // target_hidden_proj
+        total += l * kvd * F32_B;    // k_ctx
+        total += l * kvd * F32_B;    // v_ctx
+        // Concatenated.
+        total += tot * kvd * F32_B;  // k_cat
+        total += tot * kvd * F32_B;  // v_cat
+        // Positions.
+        total += b * F32_B;          // positions_q
+        total += tot * F32_B;        // positions_k
+        // Per-layer K/V cache.
+        total += 2 * n_layers * l * kvd * F32_B;
+        // FWHT rotation scratch (when MQ).
+        if with_mq {
+            let widest = std::cmp::max(l * ne * h, b * std::cmp::max(inter, qd));
+            total += widest * F32_B;
+        }
+        total
+    }
+}
+
 // ─── Forward ───────────────────────────────────────────────────────────────
 
 /// Dispatch a batched GEMM by weight dtype.

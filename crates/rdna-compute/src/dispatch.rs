@@ -417,6 +417,14 @@ impl Gpu {
         result
     }
 
+    /// Path D D1 / D2: returns the cached `HIPFIRE_DFLASH_PIPELINE=1` flag.
+    /// Read once at `Gpu::init()`; cycle-hot callers (D2's
+    /// `DflashScratchPair::new`, D3b's pipelined branch in
+    /// `spec_step_dflash`) can consult this without re-reading the env.
+    pub fn pipeline_enabled(&self) -> bool {
+        self.pipeline_enabled
+    }
+
     /// Path D D1 (issue #38): lazily allocate `draft_stream` for inter-cycle
     /// pipelining. Idempotent — second and subsequent calls are no-ops.
     /// No-op when `HIPFIRE_DFLASH_PIPELINE != 1` (cached as
