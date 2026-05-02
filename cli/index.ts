@@ -1942,6 +1942,8 @@ interface QuantizeOpts {
   createRepo?: boolean;              // pass --create-repo to `hf upload`
   installLocal?: boolean;            // copy result into ~/.hipfire/models
   register?: string;                 // tag to add to registry (e.g., "qwopus:4b")
+  includeVision?: boolean;           // include model.visual.* tensors (VL models)
+  visionQuant?: string;              // "" (default F16) | "hfq4" | "bf16"
 }
 
 async function hfDownloadModel(hfId: string): Promise<string> {
@@ -2056,8 +2058,11 @@ async function quantize(input: string, opts: QuantizeOpts): Promise<void> {
     console.error(`\nQuantizing ${inputForBinary}`);
     console.error(`  → ${out} (${format})`);
     const t0 = Date.now();
+    const binArgs = [bin, "--input", inputForBinary, "--output", out, "--format", format];
+    if (opts.includeVision) binArgs.push("--include-vision");
+    if (opts.visionQuant) binArgs.push("--vision-quant", opts.visionQuant);
     const proc = Bun.spawnSync(
-      [bin, "--input", inputForBinary, "--output", out, "--format", format],
+      binArgs,
       { stdio: ["inherit", "inherit", "inherit"] },
     );
     if ((proc.exitCode ?? 1) !== 0) {
@@ -4467,6 +4472,8 @@ Flags:
   --create-repo              Create the HF repo if it doesn't exist
   --install                  Copy outputs into ~/.hipfire/models (so \`hipfire run\` finds them)
   --register <tag>           Add a local alias (e.g. my-finetune:4b) to ~/.hipfire/models.json
+  --include-vision           Include model.visual.* tensors (VL models). Default: skip.
+  --vision-quant <hfq4|bf16> Vision quant format. Default (omit): F16 — safest for quality.
 
 Formats:
   mq4   FWHT-rotated 4-bit, quality-gated — recommended for production
@@ -4519,6 +4526,8 @@ depending on model size. HF downloads cache at ~/.hipfire/hf-cache/.`);
     let createRepo = false;
     let installLocal = false;
     let register: string | undefined;
+    let includeVision = false;
+    let visionQuant: string | undefined;
     for (let i = 1; i < rest.length; i++) {
       const a = rest[i];
       if (a === "--format") {
@@ -4548,6 +4557,14 @@ depending on model size. HF downloads cache at ~/.hipfire/hf-cache/.`);
       } else if (a === "--register") {
         register = rest[++i];
         if (!register) { console.error("--register requires a tag (e.g. my-finetune:4b)"); process.exit(1); }
+      } else if (a === "--include-vision") {
+        includeVision = true;
+      } else if (a === "--vision-quant") {
+        visionQuant = rest[++i];
+        if (!visionQuant || !["hfq4", "bf16"].includes(visionQuant)) {
+          console.error("--vision-quant requires hfq4 or bf16 (omit for F16, the safe default)");
+          process.exit(1);
+        }
       } else {
         console.error(`Unknown argument: ${a}\nRun 'hipfire quantize --help' for usage.`);
         process.exit(1);
@@ -4580,6 +4597,8 @@ depending on model size. HF downloads cache at ~/.hipfire/hf-cache/.`);
       uploadRepo, createRepo,
       installLocal,
       register,
+      includeVision,
+      visionQuant,
     });
     break;
   }
