@@ -1872,6 +1872,7 @@ pub fn verify_dflash_block(
     verify_dflash_block_inner(
         gpu, target, draft_tokens, start_pos, hidden_rb, gdn_tape, want_full_logits, None,
         verify_scratch,
+        false, // skip_internal_commit (Path D D3a — only D3b's pipelined path passes true)
     )
 }
 
@@ -1902,6 +1903,7 @@ pub fn verify_dflash_block_tree(
         gpu, target, draft_tokens, start_pos, hidden_rb, gdn_tape, want_full_logits,
         Some(tree_verify),
         verify_scratch,
+        false, // skip_internal_commit (Path D D3a)
     )
 }
 
@@ -1915,6 +1917,14 @@ fn verify_dflash_block_inner(
     want_full_logits: bool,
     tree_verify: Option<qwen35::TreeVerifyCtx<'_>>,
     verify_scratch: &VerifyScratch,
+    // Path D D3a (issue #38): when `true`, skip the
+    // `hidden_rb.commit_staging_to_ring(gpu, b)` call below the verify
+    // forward and leave the commit to the caller. The pipelined cycle
+    // (D3b) needs to record `pre_commit_evt` *between* the forward and
+    // the commit so the draft N+1 launch can pin to the pre-commit
+    // ring-buffer state — which is impossible while the commit is
+    // buried inside this helper. Default `false` is byte-exact pre-D3a.
+    skip_internal_commit: bool,
 ) -> HipResult<DflashVerifyOutput> {
     let b = draft_tokens.len();
     let vocab = target.config.vocab_size;
@@ -2107,7 +2117,13 @@ fn verify_dflash_block_inner(
     // those rows at the current head and advances head by b. Under the
     // graph path we manually drive this because the non-graph chunk loop
     // (forward_prefill_batch_with_pbs) that usually calls it was bypassed.
-    if verify_graph_ok && batch_result.is_ok() {
+    //
+    // Path D D3a (issue #38): when `skip_internal_commit` is true the
+    // caller (D3b's pipelined branch) is responsible for the commit so
+    // it can record `pre_commit_evt` on the verify stream *between* the
+    // forward and the commit, then have draft_stream wait on that event
+    // before reading the ring. Default false → byte-exact pre-D3a.
+    if verify_graph_ok && batch_result.is_ok() && !skip_internal_commit {
         hidden_rb.commit_staging_to_ring(gpu, b)?;
     }
     // Tree mode at topk>1 REQUIRES this sync. Without it τ degrades badly
