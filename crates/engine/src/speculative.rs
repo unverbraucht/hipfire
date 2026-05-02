@@ -2534,6 +2534,13 @@ pub fn spec_step_dflash(
         gpu.active_stream = Some(gpu.hip.stream_create()?);
     }
 
+    // Path D D1 (issue #38): allocate `gpu.draft_stream` lazily for the
+    // pipelined cycle (gated on `HIPFIRE_DFLASH_PIPELINE=1`, cached at Gpu
+    // init). Idempotent — does real work only the first time per session.
+    // No-op when pipelining is disabled, which keeps default config
+    // byte-exact pre-D1.
+    gpu.init_pipeline_streams()?;
+
     assert!(b >= 2, "dflash block size must be ≥ 2");
     // `target_hidden_host` is only authoritative on the ctx_slice=Some path,
     // where it backs the CPU slice handed to draft_forward. On the default

@@ -1209,6 +1209,10 @@ fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     // memory.
     gpu.invalidate_graph_state();
     gpu.drain_pool();
+    // Path D D1: tear down pipeline streams so a model swap doesn't leak
+    // them. They're recreated lazily on the next spec_step_dflash if the
+    // env still has HIPFIRE_DFLASH_PIPELINE=1.
+    gpu.destroy_pipeline_streams();
 }
 
 fn load_dflash_state(

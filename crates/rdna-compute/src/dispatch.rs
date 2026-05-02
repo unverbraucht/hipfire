@@ -217,14 +217,22 @@ pub struct Gpu {
     pool: crate::pool::GpuPool,
     /// When set, all kernel launches go to this stream instead of null stream.
     pub active_stream: Option<hip_bridge::Stream>,
-    /// Task #93 Phase A (2026-04-24): optional secondary streams for
-    /// inter-cycle pipelining. `draft_stream` is where a speculatively-
-    /// launched draft N+1 runs concurrently with verify N on
-    /// `verify_stream`. Left as None until a pipeline-aware caller opts
-    /// in via `init_pipeline_streams()`. Currently unused by any caller
-    /// — Phase A is a non-behavioral scaffold.
+    /// Path D D1 (issue #38): optional secondary stream for inter-cycle
+    /// pipelining. `draft_stream` is where a speculatively-launched draft
+    /// N+1 runs concurrently with verify N on `active_stream`. (No separate
+    /// `verify_stream` field: it is just `active_stream` by convention.
+    /// `hip_bridge::Stream` is not `Clone` and a parallel field would
+    /// duplicate the handle, which would double-free on destroy.)
+    ///
+    /// Left as `None` until a pipeline-aware caller opts in via
+    /// `init_pipeline_streams()`. Allocation is gated by
+    /// `HIPFIRE_DFLASH_PIPELINE=1` (cached in `pipeline_enabled` at Gpu
+    /// init, so cycle-hot callers don't hit the env per launch).
     pub draft_stream: Option<hip_bridge::Stream>,
-    pub verify_stream: Option<hip_bridge::Stream>,
+    /// Path D D1: cached read of `HIPFIRE_DFLASH_PIPELINE`. Read once at
+    /// `Gpu::init()` so cycle-hot `init_pipeline_streams()` calls don't
+    /// touch the environment on every spec step.
+    pipeline_enabled: bool,
     /// Path D D0c stream-override chokepoint. When `Some`, every kernel /
     /// memcpy / memset routed through `stream_ref()` lands on this stream
     /// instead of `active_stream`. Designed to be set transiently by
@@ -409,6 +417,51 @@ impl Gpu {
         result
     }
 
+    /// Path D D1 (issue #38): lazily allocate `draft_stream` for inter-cycle
+    /// pipelining. Idempotent — second and subsequent calls are no-ops.
+    /// No-op when `HIPFIRE_DFLASH_PIPELINE != 1` (cached as
+    /// `self.pipeline_enabled` at `Gpu::init()` to keep this cheap on the
+    /// hot path).
+    ///
+    /// After creating the stream, runs a small one-shot priming pass (a
+    /// 4 MiB async memset, three iterations, then sync). Cheap (~1 ms total)
+    /// and ensures the driver has touched the stream before the first
+    /// pipelined cycle so DPM ramp-up doesn't show up as a one-shot
+    /// "first cycle is slow" bias.
+    pub fn init_pipeline_streams(&mut self) -> hip_bridge::HipResult<()> {
+        if !self.pipeline_enabled {
+            return Ok(());
+        }
+        if self.draft_stream.is_some() {
+            return Ok(());
+        }
+        let s = self.hip.stream_create()?;
+        const WARMUP_BYTES: usize = 4 * 1024 * 1024;
+        let scratch = self.hip.malloc(WARMUP_BYTES)?;
+        for i in 0..3u8 {
+            // Rotate fill byte so the driver/card can't dedup the writes.
+            self.hip.memset_async(&scratch, i as i32, WARMUP_BYTES, &s)?;
+        }
+        self.hip.stream_synchronize(&s)?;
+        self.hip.free(scratch)?;
+        self.draft_stream = Some(s);
+        Ok(())
+    }
+
+    /// Path D D1: explicit teardown of pipeline streams. Called from `Drop`
+    /// at process exit and from `unload_model` on model swaps in the
+    /// long-running daemon, so streams don't accumulate over hot reloads.
+    /// Both `draft_stream` and `active_stream` are destroyed; the next
+    /// `spec_step_dflash` will re-create as needed.
+    pub fn destroy_pipeline_streams(&mut self) {
+        if let Some(s) = self.draft_stream.take() {
+            let _ = self.hip.stream_destroy(s);
+        }
+        if let Some(s) = self.active_stream.take() {
+            let _ = self.hip.stream_destroy(s);
+        }
+    }
+
     /// Drive the GPU to full DPM perf level before a perf-sensitive measurement.
     ///
     /// gfx1100 (and other RDNA cards) return to a low-power DPM state when
@@ -483,7 +536,8 @@ impl Gpu {
             pool: crate::pool::GpuPool::new(),
             active_stream: None,
             draft_stream: None,
-            verify_stream: None,
+            pipeline_enabled: std::env::var("HIPFIRE_DFLASH_PIPELINE")
+                .ok().as_deref() == Some("1"),
             stream_override: None,
             mq_signs1: None,
             mq_signs2: None,
@@ -12955,5 +13009,16 @@ impl Gpu {
     pub fn profile(&self) -> (crate::profiler::GpuCapability, Vec<crate::profiler::KernelProfile>) {
         let vram = self.hip.get_vram_info().map(|(_, t)| t as u64).unwrap_or(0);
         crate::profiler::profile_kernels(&self.arch, vram, self.compiler.compiled_kernels())
+    }
+}
+
+/// Path D D1: tear down any pipeline streams on Gpu drop. The daemon swaps
+/// models without dropping `Gpu`, so the explicit
+/// `destroy_pipeline_streams` hook is what handles the long-running case;
+/// this Drop catches the process-exit path so streams aren't leaked when
+/// the runtime tears down.
+impl Drop for Gpu {
+    fn drop(&mut self) {
+        self.destroy_pipeline_streams();
     }
 }
