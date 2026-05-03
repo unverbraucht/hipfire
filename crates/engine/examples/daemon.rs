@@ -28,6 +28,7 @@ use engine::speculative::{
     self, DdtreeScratch, DeltaNetSnapshot, GdnTape, HiddenStateRingBuffer, VerifyScratch,
 };
 use engine::triattn::{EvictionCtx, TriAttnCenters};
+use base64::Engine;
 use hip_bridge::HipResult;
 use std::io::{BufRead, Write};
 use std::path::Path;
@@ -220,10 +221,27 @@ fn acquire_daemon_lock() -> std::fs::File {
     f
 }
 
-const IMAGE_SIZE: usize = 448;
 const IMAGE_PAD_ID: u32 = 248056;
 const VISION_START_ID: u32 = 248053;
 const VISION_END_ID: u32 = 248054;
+const MAX_BASE64_LEN: usize = 40 * 1024 * 1024; // ~30 MB raw bytes
+
+enum ImageSource<'a> {
+    Path(&'a str),
+    Base64(&'a str),
+}
+
+struct GenerateVLParams<'a> {
+    id: &'a str,
+    prompt: &'a str,
+    system_prompt: Option<&'a str>,
+    image_source: ImageSource<'a>,
+    temp: f32,
+    top_p: f32,
+    max_tokens: usize,
+    repeat_penalty: f32,
+    repeat_window: usize,
+}
 
 /// Optional DFlash speculative-decoding state. Populated when `load` supplies
 /// a matching draft (.hfq arch=20) via `params.draft`. Used by the daemon's
@@ -577,6 +595,7 @@ fn main() {
                 }
                 let system = msg.get("system").and_then(|v| v.as_str());
                 let image = msg.get("image").and_then(|v| v.as_str());
+                let image_base64 = msg.get("image_base64").and_then(|v| v.as_str());
                 let temp = msg.get("temperature").and_then(|v| v.as_f64()).unwrap_or(0.3) as f32;
                 let max_tokens = msg.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(512) as usize;
                 let top_p = msg.get("top_p").and_then(|v| v.as_f64()).unwrap_or(0.8) as f32;
@@ -621,8 +640,31 @@ fn main() {
                 let max_think_tokens = msg.get("max_think_tokens")
                     .and_then(|v| v.as_u64()).unwrap_or(0) as usize;
 
-                if image.is_some() && m.vision_config.is_some() {
-                    generate_vl(m, &mut gpu, &mut stdout, id, prompt, system, image.unwrap(), temp, top_p, max_tokens, repeat_penalty, repeat_window);
+                let has_image = image_base64.is_some() || image.is_some();
+                let has_vl = m.vision_config.is_some();
+
+                if has_image && !has_vl {
+                    let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"model has no vision encoder"}}"#, id);
+                    let _ = stdout.flush();
+                } else if has_image && has_vl {
+                    if image_base64.is_some() && image.is_some() {
+                        eprintln!("[daemon/vl] both image and image_base64 provided — using image_base64");
+                    }
+                    let source = if let Some(b64) = image_base64 {
+                        if b64.len() > MAX_BASE64_LEN {
+                            let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"image payload exceeds maximum size (30 MB)"}}"#, id);
+                            let _ = stdout.flush();
+                            continue;
+                        }
+                        ImageSource::Base64(b64)
+                    } else {
+                        ImageSource::Path(image.unwrap())
+                    };
+                    let params = GenerateVLParams {
+                        id, prompt, system_prompt: system, image_source: source,
+                        temp, top_p, max_tokens, repeat_penalty, repeat_window,
+                    };
+                    generate_vl(m, &mut gpu, &mut stdout, &params);
                 } else {
                     generate(m, &mut gpu, &mut stdout, id, prompt, system, temp, top_p, max_tokens, repeat_penalty, repeat_window, budget_alert_at_tok, &budget_alert_text, max_think_tokens);
                 }
@@ -2420,13 +2462,57 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
     }
 }
 
-fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, image_path: &str, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize) {
-    // Capacity guard — VL prompts include vision tokens + text + ChatML framing
+fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, params: &GenerateVLParams) {
+    let GenerateVLParams { id, prompt, system_prompt, ref image_source, temp, top_p, max_tokens, repeat_penalty, repeat_window } = *params;
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let vision_config = m.vision_config.as_ref().unwrap();
-    let n_patches = (IMAGE_SIZE / vision_config.patch_size) * (IMAGE_SIZE / vision_config.patch_size);
+
+    let (pixels, img_h, img_w) = match image_source {
+        ImageSource::Path(path) => {
+            eprintln!("[VL-DEBUG] preprocessing image: path: {}", path);
+            engine::image::load_and_preprocess(
+                Path::new(path),
+                vision_config.patch_size,
+                vision_config.spatial_merge_size,
+            )
+        }
+        ImageSource::Base64(b64) => {
+            let raw_b64 = if b64.contains(',') {
+                b64.split_once(',').map(|(_, after)| after).unwrap_or(b64)
+            } else {
+                b64
+            };
+            eprintln!("[VL-DEBUG] preprocessing image: <{}-byte buffer>", raw_b64.len());
+            let bytes = match Engine::decode(&base64::engine::general_purpose::STANDARD, raw_b64) {
+                Ok(b) => b,
+                Err(e) => {
+                    let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"failed to decode base64 image data: {}"}}"#, id, e);
+                    let _ = stdout.flush();
+                    return;
+                }
+            };
+            match engine::image::load_and_preprocess_from_bytes(
+                &bytes,
+                vision_config.patch_size,
+                vision_config.spatial_merge_size,
+            ) {
+                Ok(result) => result,
+                Err(e) => {
+                    let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"{}"}}"#, id, e);
+                    let _ = stdout.flush();
+                    return;
+                }
+            }
+        }
+    };
+    eprintln!("[VL-DEBUG] preprocessed: {}x{}", img_w, img_h);
+
+    let grid_h = img_h / vision_config.patch_size;
+    let grid_w = img_w / vision_config.patch_size;
+    let n_patches = grid_h * grid_w;
     let n_visual_tokens = n_patches / (vision_config.spatial_merge_size * vision_config.spatial_merge_size);
-    let prompt_est = tokenizer.encode(prompt).len() + n_visual_tokens + 20; // text + vision + ChatML overhead
+
+    let prompt_est = tokenizer.encode(prompt).len() + n_visual_tokens + 20;
     if m.eviction.is_none() && m.seq_pos + prompt_est + max_tokens > m.max_seq {
         eprintln!("[daemon/vl] context full ({}/{}) — resetting conversation", m.seq_pos, m.max_seq);
         m.seq_pos = 0;
@@ -2440,25 +2526,11 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
         if let Some(kv) = m.kv_cache.as_mut() { kv.compact_offset = 0; }
     }
     let config = m.q35_config.as_ref().unwrap();
-    let vision_config = m.vision_config.as_ref().unwrap();
     let vision_weights = m.vision_weights.as_ref().unwrap();
     let weights = m.q35_weights.as_ref().unwrap();
     let scratch = m.q35_scratch.as_ref().unwrap();
     let kv = m.kv_cache.as_mut().unwrap();
     let dn = m.dn_state.as_mut().unwrap();
-
-    // Load and preprocess image (smart resize matching HuggingFace)
-    eprintln!("[VL-DEBUG] preprocessing image: {}", image_path);
-    let (pixels, img_h, img_w) = engine::image::load_and_preprocess(
-        Path::new(image_path),
-        vision_config.patch_size,
-        vision_config.spatial_merge_size,
-    );
-    eprintln!("[VL-DEBUG] preprocessed: {}x{}", img_w, img_h);
-    let grid_h = img_h / vision_config.patch_size;
-    let grid_w = img_w / vision_config.patch_size;
-    let n_patches = grid_h * grid_w;
-    let n_visual_tokens = n_patches / (vision_config.spatial_merge_size * vision_config.spatial_merge_size);
 
     // Extract patches and run vision encoder
     let patches = engine::image::extract_patches(
