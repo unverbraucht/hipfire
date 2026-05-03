@@ -12,7 +12,7 @@
 //! on different models sharing the same MQ scratch (which we won't, since
 //! speculative decode serializes draft-generate then target-verify).
 
-use crate::dflash::{self, DflashConfig, DflashScratch, DflashWeights};
+use crate::dflash::{self, DflashConfig, DflashScratch, DflashScratchPair, DflashWeights};
 use crate::hfq::HfqFile;
 use crate::llama::{self, KvCache};
 use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weights};
@@ -2506,7 +2506,7 @@ pub fn spec_step_dflash(
     target: &mut ModelSlot,
     draft_weights: &DflashWeights,
     draft_cfg: &DflashConfig,
-    draft_scratch: &mut DflashScratch,
+    draft_pair: &mut DflashScratchPair,
     hidden_rb: &mut HiddenStateRingBuffer,
     target_hidden_host: &mut Vec<f32>,
     target_snap: &mut DeltaNetSnapshot,
@@ -2524,7 +2524,20 @@ pub fn spec_step_dflash(
     pld_spine: Option<&[u32]>,
     repeat_penalty: f32,
     repeat_window: usize,
+    // Path D D3b (issue #38): when `true`, the pipelined branch may run
+    // (subject to per-cycle bypass conditions in §2.3 — graph-capture
+    // active, prev cycle bypassed, PLD spine, or pair degraded to
+    // single-scratch via VRAM check). When `false`, always runs the
+    // sequential body. Caller typically passes `gpu.pipeline_enabled()`.
+    pipeline_mode: bool,
 ) -> HipResult<SpecStepResult> {
+    // Path D D3b.1: pure refactor — the body still treats the pair as a
+    // single scratch via this alias. D3b.2 will fork into a pipelined
+    // branch when `pipeline_mode && draft_pair.pipelining_active()` and
+    // the §2.3 bypass conditions all permit. For now `pipeline_mode` is
+    // accepted but ignored — byte-exact pre-D3b.1.
+    let _ = pipeline_mode;
+    let draft_scratch: &mut DflashScratch = &mut draft_pair.a;
     // Effective block size for THIS step. Usually `draft_cfg.block_size`
     // (what the draft was trained at, 16 for Qwen3.5-*-DFlash) but a caller
     // doing adaptive-B based on rolling τ can shrink to save per-iter cost.

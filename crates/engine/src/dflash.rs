@@ -577,6 +577,28 @@ pub struct DflashScratchPair {
     /// F32. `Some` iff pipelining is active. Sized to the same `hidden_k`
     /// the existing `verify_scratch.rot` uses.
     pub draft_lm_head_rot: Option<GpuTensor>,
+    /// Path D D3b (model B): cross-cycle storage for draft tokens. Each
+    /// half holds the tokens that were produced when *that* half was the
+    /// pipelined draft target. Cycle N's verify reads `previous_drafted()`
+    /// (the just-flipped opposite half's tokens, drafted in cycle N-1's
+    /// concurrent launch); cycle N's pipelined draft writes
+    /// `current_drafted_mut()` (the half flipped INTO this cycle, will be
+    /// read by cycle N+1's verify after the next flip).
+    ///
+    /// Length 0 when no pipelined draft has been launched into that half
+    /// yet — used as the "first pipelined cycle" sentinel: if
+    /// `pair.pipelining_active() && pair.previous_drafted().is_empty()`
+    /// the cycle bypasses to sequential, then runs the trailing pipelined
+    /// draft launch on its way out so the next cycle has tokens to verify.
+    pub drafted_a: Vec<u32>,
+    pub drafted_b: Vec<u32>,
+    /// Path D D3b: per-pair flag set when the *previous* cycle bypassed
+    /// pipelining (cycle 0, PLD spine, graph capture, runtime VRAM
+    /// failure mid-session). When `true`, `current_drafted` may not
+    /// correspond to a fresh pipelined launch — the next cycle must also
+    /// bypass to sequential and re-bootstrap the pipeline. Cleared when a
+    /// successful pipelined cycle completes.
+    pub prev_cycle_bypassed: bool,
 }
 
 impl DflashScratchPair {
@@ -641,7 +663,34 @@ impl DflashScratchPair {
             parity: false,
             draft_lm_head_logits,
             draft_lm_head_rot,
+            drafted_a: Vec::new(),
+            drafted_b: Vec::new(),
+            prev_cycle_bypassed: true, // session-start counts as "no pipelined cycle yet"
         })
+    }
+
+    /// Path D D3b: tokens produced by the *previous* cycle's pipelined
+    /// draft launch (the "previous" half after the most recent `flip()`).
+    /// Returns an empty slice when no pipelined draft has run yet — the
+    /// caller treats that as a "bootstrap" signal and bypasses to
+    /// sequential for the cycle.
+    pub fn previous_drafted(&self) -> &[u32] {
+        if self.parity {
+            &self.drafted_a
+        } else {
+            &self.drafted_b
+        }
+    }
+
+    /// Mutable handle for the *current* half's drafted tokens. The
+    /// pipelined draft launch in cycle N writes here; cycle N+1's verify
+    /// reads `previous_drafted()` after `flip()`.
+    pub fn current_drafted_mut(&mut self) -> &mut Vec<u32> {
+        if self.parity {
+            &mut self.drafted_b
+        } else {
+            &mut self.drafted_a
+        }
     }
 
     /// Returns `true` when pipelining is active for this request — `b` and

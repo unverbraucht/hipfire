@@ -22,7 +22,7 @@ fn main() {
 #[cfg(feature = "deltanet")]
 fn main() {
     use engine::cask::CaskCtx;
-    use engine::dflash::{DflashConfig, DflashScratch, DflashWeights};
+    use engine::dflash::{DflashConfig, DflashScratchPair, DflashWeights};
     use engine::hfq::HfqFile;
     use engine::qwen35::LayerType;
     use engine::speculative::{
@@ -372,6 +372,11 @@ fn main() {
 
     // ── Init GPU ──────────────────────────────────────────────────────
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
+    // Path D D3b (issue #38): cache pipelining decision once per session
+    // and pass into `spec_step_dflash` so it doesn't re-read the env per
+    // cycle. False unless `HIPFIRE_DFLASH_PIPELINE=1` AND the pair allocates
+    // its second half (VRAM check inside `DflashScratchPair::new`).
+    let gpu_pipeline_enabled = gpu.pipeline_enabled();
     eprintln!("gpu: {}", gpu.arch);
     let vram_report = |hip: &hip_bridge::HipRuntime, label: &str| {
         if let Ok((free, total)) = hip.get_vram_info() {
@@ -463,11 +468,20 @@ fn main() {
             draft_scratch_b, draft_cfg.block_size,
         );
     }
-    let mut draft_scratch = DflashScratch::new_with_mq(
+    // Path D D3b.1 (issue #38): construct a `DflashScratchPair` instead
+    // of a plain `DflashScratch`. With env=0 (default) the pair degrades
+    // to a single scratch (`b = None`, no draft lm_head buffers) — same
+    // VRAM and behavior as before. With env=1 the pair allocates the
+    // pipelined half iff VRAM headroom suffices.
+    let mut draft_pair = DflashScratchPair::new(
         &mut gpu, &draft_cfg, draft_scratch_b, ctx_capacity, draft_weights.has_mq,
-    ).expect("alloc draft scratch");
+        target.config.vocab_size, target.config.dim,
+    ).expect("alloc draft scratch pair");
     if draft_weights.has_mq {
         eprintln!("draft: MQ4 weights detected, FWHT rotation scratch enabled");
+    }
+    if draft_pair.pipelining_active() {
+        eprintln!("draft: pipelining active — `b` half allocated for inter-cycle pipeline");
     }
 
     // ── Check vocab compatibility ─────────────────────────────────────
@@ -601,23 +615,23 @@ fn main() {
     )
     .expect("seed target hidden");
     // Mirror the prompt rows from the hidden ring buffer straight into
-    // draft_scratch.target_hidden on GPU. This primes the GPU-resident
+    // draft_pair.a.target_hidden on GPU. This primes the GPU-resident
     // path in spec_step_dflash (ctx_slice=None) so it doesn't need to
     // round-trip target_hidden through the CPU shadow each cycle.
     speculative::scatter_hidden_block_to_interleaved(
         &gpu,
         &hidden_rb,
-        &draft_scratch.target_hidden,
+        &draft_pair.a.target_hidden,
         0,
         prompt_tokens.len(), // block_size: seed wrote prompt_len contiguous slots
         prompt_tokens.len(), // n_rows:     keep all of them
     )
     .expect("seed scatter");
-    draft_scratch.uploaded_target_hidden_rows = prompt_tokens.len();
+    draft_pair.a.uploaded_target_hidden_rows = prompt_tokens.len();
     // Seed per-row absolute positions for the draft's cross-attention RoPE.
     // Pre-eviction these match [0..prompt_len) exactly, so FlashCASK-free runs
     // stay byte-identical to the old contiguous-range behaviour.
-    draft_scratch.target_hidden_abs_positions =
+    draft_pair.a.target_hidden_abs_positions =
         (0..prompt_tokens.len() as i32).collect();
     let prefill_secs = t2.elapsed().as_secs_f64();
     let prefill_tok_s = prompt_tokens.len() as f64 / prefill_secs.max(1e-9);
@@ -676,7 +690,7 @@ fn main() {
             if !ev.retain_mask.is_empty() {
                 speculative::apply_eviction_retain_to_draft(
                     &mut gpu,
-                    &mut draft_scratch,
+                    &mut draft_pair.a,
                     &ev.retain_mask,
                     draft_cfg.num_extract(),
                     draft_cfg.hidden,
@@ -1150,7 +1164,7 @@ fn main() {
                     &mut target,
                     &draft_weights,
                     &draft_cfg,
-                    &mut draft_scratch,
+                    &mut draft_pair.a,
                     &mut hidden_rb,
                     &mut target_hidden_host,
                     &mut target_snap,
@@ -1170,7 +1184,7 @@ fn main() {
                     &mut target,
                     &draft_weights,
                     &draft_cfg,
-                    &mut draft_scratch,
+                    &mut draft_pair.a,
                     &mut hidden_rb,
                     &mut target_hidden_host,
                     &mut target_snap,
@@ -1191,7 +1205,7 @@ fn main() {
                     &mut target,
                     &draft_weights,
                     &draft_cfg,
-                    &mut draft_scratch,
+                    &mut draft_pair.a,
                     &mut hidden_rb,
                     &mut target_hidden_host,
                     &mut target_snap,
@@ -1212,7 +1226,7 @@ fn main() {
                 &mut target,
                 &draft_weights,
                 &draft_cfg,
-                &mut draft_scratch,
+                &mut draft_pair,
                 &mut hidden_rb,
                 &mut target_hidden_host,
                 &mut target_snap,
@@ -1230,6 +1244,7 @@ fn main() {
                 pld_spine,
                 runtime_repeat_penalty,
                 repeat_window,
+                gpu_pipeline_enabled, // pipeline_mode (Path D D3b)
             )
             .expect("spec step")
         };
@@ -1454,7 +1469,7 @@ fn main() {
                 if !ev.retain_mask.is_empty() {
                     speculative::apply_eviction_retain_to_draft(
                         &mut gpu,
-                        &mut draft_scratch,
+                        &mut draft_pair.a,
                         &ev.retain_mask,
                         draft_cfg.num_extract(),
                         draft_cfg.hidden,

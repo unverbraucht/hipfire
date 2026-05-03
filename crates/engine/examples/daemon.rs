@@ -18,7 +18,7 @@
 //!   ← {"type":"unloaded"}
 
 use engine::cask::CaskCtx;
-use engine::dflash::{DflashConfig, DflashScratch, DflashWeights};
+use engine::dflash::{DflashConfig, DflashScratchPair, DflashWeights};
 use engine::hfq::HfqFile;
 use engine::llama;
 use engine::qwen35;
@@ -232,7 +232,7 @@ const VISION_END_ID: u32 = 248054;
 struct DflashState {
     draft_config: DflashConfig,
     draft_weights: DflashWeights,
-    draft_scratch: DflashScratch,
+    draft_pair: DflashScratchPair,
     hidden_rb: HiddenStateRingBuffer,
     verify_scratch: VerifyScratch,
     target_snap: DeltaNetSnapshot,
@@ -1181,7 +1181,7 @@ fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     // bulk of the VRAM anyway.
     if let Some(df) = m.dflash {
         df.draft_weights.free_gpu(gpu);
-        df.draft_scratch.free_gpu(gpu);
+        df.draft_pair.free_gpu(gpu);
     }
     // Free eviction context (centers + scratch tensors) if active.
     if let Some(ev) = m.eviction { ev.free_gpu(gpu); }
@@ -1225,9 +1225,14 @@ fn load_dflash_state(
     let hfq = HfqFile::open(Path::new(draft_path)).map_err(|e| format!("open draft: {e}"))?;
     let draft_config = DflashConfig::from_hfq(&hfq).ok_or("parse DflashConfig")?;
     let draft_weights = DflashWeights::load(gpu, &hfq, &draft_config).map_err(|e| format!("load weights: {e}"))?;
-    let draft_scratch = DflashScratch::new_with_mq(
+    // Path D D3b.1 (issue #38): construct a `DflashScratchPair` instead
+    // of a plain `DflashScratch`. With env=0 the pair degrades to single-
+    // scratch (b=None); with env=1 it allocates the pipelined half iff
+    // VRAM headroom suffices.
+    let draft_pair = DflashScratchPair::new(
         gpu, &draft_config, draft_config.block_size, ctx_capacity, draft_weights.has_mq,
-    ).map_err(|e| format!("draft scratch: {e}"))?;
+        target_config.vocab_size, target_config.dim,
+    ).map_err(|e| format!("draft scratch pair: {e}"))?;
 
     // Hidden ring: one row per target-layer selected by the draft config,
     // captured during each target forward. Sized so the whole context plus
@@ -1398,7 +1403,7 @@ fn load_dflash_state(
     Ok(DflashState {
         draft_config,
         draft_weights,
-        draft_scratch,
+        draft_pair,
         hidden_rb,
         verify_scratch,
         target_snap,
@@ -1480,7 +1485,7 @@ fn generate_dflash(
     }
     let df = m.dflash.as_mut().unwrap();
     df.target_hidden_host.clear();
-    df.draft_scratch.reset_upload_tracking();
+    df.draft_pair.a.reset_upload_tracking();
 
     // Assemble a transient ModelSlot for the spec helpers — they both take
     // `&mut ModelSlot`. We own the pieces on LoadedModel individually, so
@@ -1570,13 +1575,13 @@ fn generate_dflash(
     // Prime the draft's GPU target_hidden buffer from the prompt rows so the
     // first spec step can skip the CPU→GPU upload of the whole context.
     if let Err(e) = speculative::scatter_hidden_block_to_interleaved(
-        gpu, &df.hidden_rb, &df.draft_scratch.target_hidden,
+        gpu, &df.hidden_rb, &df.draft_pair.a.target_hidden,
         0, prompt_tokens.len(), prompt_tokens.len(),
     ) {
         eprintln!("[dflash] scatter failed: {e} — falling back to per-cycle upload");
     }
-    df.draft_scratch.uploaded_target_hidden_rows = prompt_tokens.len();
-    df.draft_scratch.target_hidden_abs_positions =
+    df.draft_pair.a.uploaded_target_hidden_rows = prompt_tokens.len();
+    df.draft_pair.a.target_hidden_abs_positions =
         (0..prompt_tokens.len() as i32).collect();
 
     // First emit = target's argmax at the final prompt position. seed_target_hidden
@@ -1625,7 +1630,7 @@ fn generate_dflash(
             position = res.new_physical;
             if !res.retain_mask.is_empty() {
                 let _ = speculative::apply_eviction_retain_to_draft(
-                    gpu, &mut df.draft_scratch, &res.retain_mask,
+                    gpu, &mut df.draft_pair.a, &res.retain_mask,
                     df.draft_config.num_extract(), df.draft_config.hidden, pre_phys,
                 );
             }
@@ -1697,7 +1702,7 @@ fn generate_dflash(
                 };
                 spec_step_ddtree_path_c(
                     gpu, &mut target, &df.draft_weights, &df.draft_config,
-                    &mut df.draft_scratch, &mut df.hidden_rb, &mut df.target_hidden_host,
+                    &mut df.draft_pair.a, &mut df.hidden_rb, &mut df.target_hidden_host,
                     &mut df.target_snap, &mut df.gdn_tape, &df.verify_scratch,
                     position, seed_token,
                     None,                      // ctx_slice = full history
@@ -1708,7 +1713,7 @@ fn generate_dflash(
             } else {
                 spec_step_ddtree_batched(
                     gpu, &mut target, &df.draft_weights, &df.draft_config,
-                    &mut df.draft_scratch, &mut df.hidden_rb, &mut df.target_hidden_host,
+                    &mut df.draft_pair.a, &mut df.hidden_rb, &mut df.target_hidden_host,
                     &mut df.target_snap, &mut dd.post_seed_snap, &mut df.gdn_tape,
                     &dd.scratch, &df.verify_scratch,
                     position, seed_token,
@@ -1720,7 +1725,7 @@ fn generate_dflash(
         } else {
             spec_step_dflash(
                 gpu, &mut target, &df.draft_weights, &df.draft_config,
-                &mut df.draft_scratch, &mut df.hidden_rb, &mut df.target_hidden_host,
+                &mut df.draft_pair, &mut df.hidden_rb, &mut df.target_hidden_host,
                 &mut df.target_snap, &df.verify_scratch,
                 position, seed_token,
                 None,                      // ctx_slice = full history
@@ -1734,6 +1739,7 @@ fn generate_dflash(
                 None,                      // pld_spine
                 1.0_f32,                   // repeat_penalty (off)
                 0,                         // repeat_window
+                gpu.pipeline_enabled(),    // pipeline_mode (Path D D3b)
             )
         };
         let step = match step_result {
@@ -1775,7 +1781,7 @@ fn generate_dflash(
                 position = res.new_physical;
                 if !res.retain_mask.is_empty() {
                     let _ = speculative::apply_eviction_retain_to_draft(
-                        gpu, &mut df.draft_scratch, &res.retain_mask,
+                        gpu, &mut df.draft_pair.a, &res.retain_mask,
                         df.draft_config.num_extract(), df.draft_config.hidden, pre_phys,
                     );
                 }
