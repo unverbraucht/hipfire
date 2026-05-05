@@ -241,6 +241,7 @@ struct GenerateVLParams<'a> {
     max_tokens: usize,
     repeat_penalty: f32,
     repeat_window: usize,
+    max_think_tokens: usize,
 }
 
 /// Optional DFlash speculative-decoding state. Populated when `load` supplies
@@ -663,6 +664,7 @@ fn main() {
                     let params = GenerateVLParams {
                         id, prompt, system_prompt: system, image_source: source,
                         temp, top_p, max_tokens, repeat_penalty, repeat_window,
+                        max_think_tokens,
                     };
                     generate_vl(m, &mut gpu, &mut stdout, &params);
                 } else {
@@ -2463,7 +2465,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
 }
 
 fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, params: &GenerateVLParams) {
-    let GenerateVLParams { id, prompt, system_prompt, ref image_source, temp, top_p, max_tokens, repeat_penalty, repeat_window } = *params;
+    let GenerateVLParams { id, prompt, system_prompt, ref image_source, temp, top_p, max_tokens, repeat_penalty, repeat_window, max_think_tokens } = *params;
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let vision_config = m.vision_config.as_ref().unwrap();
 
@@ -2628,18 +2630,40 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
     }
     m.conversation_tokens.extend_from_slice(&prompt_tokens);
 
-    // Generate
+    let think_pair = match (
+        tokenizer.special_token_id("💭"),
+        tokenizer.special_token_id("💭"),
+    ) {
+        (Some(o), Some(c)) => Some((o, c)),
+        _ => None,
+    };
+
     let mut logits = gpu.download_f32(&scratch.logits).unwrap();
     let mut next_token = llama::sample_top_p(&logits, temp, top_p);
     let t_prefill = Instant::now();
     let mut generated = 0;
+    let mut streamed_tokens: Vec<u32> = Vec::new();
+    let mut emitted_bytes = 0usize;
+    let mut think_count: usize = 0;
+    let mut prev_in_think: bool = false;
 
-    for _ in 0..max_tokens {
+    while generated < max_tokens {
         generated += 1;
         m.conversation_tokens.push(next_token);
-        let text = tokenizer.decode(&[next_token]);
-        let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#, id, serde_json::to_string(&text).unwrap_or_default());
-        let _ = stdout.flush();
+        streamed_tokens.push(next_token);
+
+        let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
+        let new_bytes = &all_bytes[emitted_bytes..];
+        let valid_len = match std::str::from_utf8(new_bytes) {
+            Ok(_) => new_bytes.len(),
+            Err(e) => e.valid_up_to(),
+        };
+        if valid_len > 0 {
+            let text = std::str::from_utf8(&new_bytes[..valid_len]).unwrap();
+            let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#, id, serde_json::to_string(&text).unwrap_or_default());
+            let _ = stdout.flush();
+            emitted_bytes += valid_len;
+        }
 
         if next_token == config.eos_token { break; }
         if im_end_token == Some(next_token) { break; }
@@ -2656,6 +2680,57 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
         llama::apply_ngram_block(&mut logits, &m.conversation_tokens);
         llama::apply_repeat_penalty(&mut logits, &m.conversation_tokens, repeat_window, repeat_penalty);
         next_token = llama::sample_top_p(&logits, temp, top_p);
+
+        if max_think_tokens > 0 {
+            let raw_so_far = tokenizer.decode_bytes(&streamed_tokens);
+            let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
+            let open_idx = raw_str.rfind("💭");
+            let close_idx = raw_str.rfind("💭");
+            let in_think = match (open_idx, close_idx) {
+                (Some(o), Some(c)) => o > c,
+                (Some(_), None) => true,
+                _ => false,
+            };
+            if in_think {
+                if !prev_in_think { think_count = 1; } else { think_count += 1; }
+            } else {
+                think_count = 0;
+            }
+            prev_in_think = in_think;
+
+            if in_think && think_count >= max_think_tokens {
+                let close_tokens = tokenizer.encode("💭\n");
+                let budget_left = max_tokens.saturating_sub(generated);
+                let take = close_tokens.len().min(budget_left);
+                for &t in &close_tokens[..take] {
+                    qwen35::forward_scratch(gpu, weights, config, t, m.seq_pos, kv, dn, scratch).unwrap();
+                    m.seq_pos += 1;
+                    if let Some(ref ev) = m.eviction {
+                        if let Some(engine::triattn::EvictionResult { new_physical: new_phys, .. }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap() {
+                            m.seq_pos = new_phys;
+                        }
+                    }
+                    m.conversation_tokens.push(t);
+                    streamed_tokens.push(t);
+                    let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
+                    let new_bytes = &all_bytes[emitted_bytes..];
+                    let vl = match std::str::from_utf8(new_bytes) {
+                        Ok(_) => new_bytes.len(),
+                        Err(e) => e.valid_up_to(),
+                    };
+                    if vl > 0 {
+                        let text = std::str::from_utf8(&new_bytes[..vl]).unwrap();
+                        let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#, id, serde_json::to_string(&text).unwrap_or_default());
+                        let _ = stdout.flush();
+                        emitted_bytes += vl;
+                    }
+                    generated += 1;
+                }
+                think_count = 0;
+                prev_in_think = false;
+                if generated >= max_tokens { break; }
+            }
+        }
     }
 
     // ChatML \n boundary — run through forward to keep KV cache + DeltaNet in sync

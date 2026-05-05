@@ -1458,7 +1458,16 @@ async function serve(port: number) {
             }
           } else if (role === "user") {
             const content = extractContent(m.content);
-            requestImages.push(...content.images);
+            if (content.images.length > 0) {
+              if (i < nonSystem.length - 1) {
+                safeRelease();
+                return Response.json(
+                  { error: { message: "images in earlier user turns are not supported — image must be in the last user message", type: "invalid_request_error" } },
+                  { status: 400 },
+                );
+              }
+              requestImages.push(...content.images);
+            }
             if (content.unsupportedImage) hasUnsupportedImage = true;
             text = content.text;
           } else {
@@ -1486,15 +1495,7 @@ async function serve(port: number) {
             { error: { message: "multiple images not supported — only one image per request", type: "invalid_request_error" } },
             { status: 400 },
           );
-        }
-
-        if (requestImages.length > 0 && nonSystem.length > 1) {
-          safeRelease();
-          return Response.json(
-            { error: { message: "multi-turn vision is not supported — images must be in the last user message of a single-turn request", type: "invalid_request_error" } },
-            { status: 400 },
-          );
-        }
+         }
 
         if (hasUnsupportedImage) {
           safeRelease();
@@ -1815,6 +1816,8 @@ async function serve(port: number) {
               // bytes — heartbeat must keep firing until the first real
               // outgoing chunk.
               let visibleChunkSent = false;
+              let streamCompletionTokens = 0;
+              let streamPromptTokens = 0;
               const heartbeat = setInterval(() => {
                 if (visibleChunkSent || streamCancelled) return;
                 try { ctrl.enqueue(enc.encode(": prefill\n\n")); } catch {}
@@ -1827,6 +1830,7 @@ async function serve(port: number) {
                 for await (const msg of e.generate(genParams)) {
                   if (streamCancelled) continue; // drain remaining tokens, don't enqueue
                   if (msg.type === "token") {
+                    streamCompletionTokens++;
                     let text = msg.text as string;
                     if (!inThink && text.includes("<think>")) { inThink = true; text = text.replace(/<think>/g, ""); }
                     if (inThink) {
@@ -1873,6 +1877,7 @@ async function serve(port: number) {
                       visibleChunkSent = true;
                     }
                   } else if (msg.type === "done") {
+                    streamPromptTokens = msg.prefill_tokens ?? 0;
                     // Every path below enqueues at least the [DONE] sentinel.
                     visibleChunkSent = true;
                     // When tools are present, parse accumulated text for tool calls
@@ -1893,10 +1898,10 @@ async function serve(port: number) {
                         }
                         ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
                           id: reqId, object: "chat.completion.chunk", created, model: modelName,
-                          choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }]
+                          choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+                          usage: { prompt_tokens: streamPromptTokens, completion_tokens: streamCompletionTokens, total_tokens: streamPromptTokens + streamCompletionTokens },
                         })}\n\n`));
                       } else {
-                        // No tool calls — flush accumulated content
                         if (accumulated) {
                           ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
                             id: reqId, object: "chat.completion.chunk", created, model: modelName,
@@ -1905,13 +1910,15 @@ async function serve(port: number) {
                         }
                         ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
                           id: reqId, object: "chat.completion.chunk", created, model: modelName,
-                          choices: [{ index: 0, delta: {}, finish_reason: "stop" }]
+                          choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+                          usage: { prompt_tokens: streamPromptTokens, completion_tokens: streamCompletionTokens, total_tokens: streamPromptTokens + streamCompletionTokens },
                         })}\n\n`));
                       }
                     } else {
                       ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
                         id: reqId, object: "chat.completion.chunk", created, model: modelName,
-                        choices: [{ index: 0, delta: {}, finish_reason: "stop" }]
+                        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+                        usage: { prompt_tokens: streamPromptTokens, completion_tokens: streamCompletionTokens, total_tokens: streamPromptTokens + streamCompletionTokens },
                       })}\n\n`));
                     }
                     ctrl.enqueue(enc.encode("data: [DONE]\n\n"));
