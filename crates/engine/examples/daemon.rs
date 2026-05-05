@@ -2479,7 +2479,7 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
             )
         }
         ImageSource::Base64(b64) => {
-            let raw_b64 = if b64.contains(',') {
+            let raw_b64 = if b64.starts_with("data:") {
                 b64.split_once(',').map(|(_, after)| after).unwrap_or(b64)
             } else {
                 b64
@@ -2526,6 +2526,12 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
             for s in &dn.conv_states { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
         }
         if let Some(kv) = m.kv_cache.as_mut() { kv.compact_offset = 0; }
+    }
+
+    if m.eviction.is_none() && prompt_est + max_tokens > m.max_seq {
+        let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"request size ({} tokens) exceeds loaded KV budget ({})"}}"#, id, prompt_est + max_tokens, m.max_seq);
+        let _ = stdout.flush();
+        return;
     }
     let config = m.q35_config.as_ref().unwrap();
     let vision_weights = m.vision_weights.as_ref().unwrap();
@@ -2607,6 +2613,14 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
     let prefill_tokens = prompt_tokens.len();
     let t0 = Instant::now();
 
+    let think_pair = match (
+        tokenizer.special_token_id("💭"),
+        tokenizer.special_token_id("💭"),
+    ) {
+        (Some(o), Some(c)) => Some((o, c)),
+        _ => None,
+    };
+
     // Prefill with vision token embedding for IMAGE_PAD positions.
     // VL prefill is already per-token (forward_scratch_embed isn't batched),
     // so we advance m.seq_pos in-loop and call maybe_evict after every write.
@@ -2628,15 +2642,11 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
             }
         }
     }
-    m.conversation_tokens.extend_from_slice(&prompt_tokens);
 
-    let think_pair = match (
-        tokenizer.special_token_id("💭"),
-        tokenizer.special_token_id("💭"),
-    ) {
-        (Some(o), Some(c)) => Some((o, c)),
-        _ => None,
-    };
+    if let Some((open, close)) = think_pair {
+        gpu_block_attractor_unclosed(gpu, &scratch.logits.buf, &m.conversation_tokens, open, close, 20, 2);
+    }
+    m.conversation_tokens.extend_from_slice(&prompt_tokens);
 
     let mut logits = gpu.download_f32(&scratch.logits).unwrap();
     let mut next_token = llama::sample_top_p(&logits, temp, top_p);
@@ -2679,6 +2689,13 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
         logits = gpu.download_f32(&scratch.logits).unwrap();
         llama::apply_ngram_block(&mut logits, &m.conversation_tokens);
         llama::apply_repeat_penalty(&mut logits, &m.conversation_tokens, repeat_window, repeat_penalty);
+
+        if let Some((open, close)) = think_pair {
+            gpu_block_attractor_unclosed(gpu, &scratch.logits.buf, &m.conversation_tokens, open, close, 20, 2);
+            // Re-download after blocking
+            logits = gpu.download_f32(&scratch.logits).unwrap();
+        }
+
         next_token = llama::sample_top_p(&logits, temp, top_p);
 
         if max_think_tokens > 0 {
@@ -2712,6 +2729,8 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
                     }
                     m.conversation_tokens.push(t);
                     streamed_tokens.push(t);
+
+                    // Optimized L3: use raw_so_far + append manually instead of full decode_bytes
                     let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
                     let new_bytes = &all_bytes[emitted_bytes..];
                     let vl = match std::str::from_utf8(new_bytes) {
@@ -2729,6 +2748,9 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
                 think_count = 0;
                 prev_in_think = false;
                 if generated >= max_tokens { break; }
+                // Re-download logits after forcing close tokens
+                logits = gpu.download_f32(&scratch.logits).unwrap();
+                next_token = llama::sample_top_p(&logits, temp, top_p);
             }
         }
     }

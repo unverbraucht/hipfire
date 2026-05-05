@@ -785,7 +785,6 @@ async function runViaHttp(
   // VL flows go through the image-base64 path on the daemon which the HTTP
   // wrapper now exposes via `image_base64` in genParams. Remove the guard
   // so `hipfire run --image` can also proxy through a running serve daemon.
-  // if (image) return false;
 
   const body: any = {
     model, stream: true,
@@ -1266,8 +1265,8 @@ async function serve(port: number) {
       await e.recv();
       current = null;
       currentMaxSeq = null;
-    } catch (err: any) {
-      console.error(`[hipfire] eviction failed: ${err?.message ?? err}`);
+      modelHasVL = false;
+      } catch (err: any) {      console.error(`[hipfire] eviction failed: ${err?.message ?? err}`);
     }
   }, Math.min(60_000, idleTimeoutMs)) : null;
   // Keep process alive irrespective of the interval; clean up on exit.
@@ -1374,30 +1373,35 @@ async function serve(port: number) {
         // prompt, which the model has no way to recover from. Issue #79.
         // Image parts are filtered out (no vision encoder in serve path);
         // matches the daemon's existing text-only behaviour.
-        const extractContent = (content: any): { text: string, images: string[], unsupportedImage: boolean } => {
-          if (typeof content === "string") return { text: content, images: [], unsupportedImage: false };
+        const extractContent = (content: any): { text: string, images: string[], unsupportedImage: boolean, malformedImage: boolean } => {
+          if (typeof content === "string") return { text: content, images: [], unsupportedImage: false, malformedImage: false };
           if (Array.isArray(content)) {
             const textParts: string[] = [];
             const images: string[] = [];
             let unsupportedImage = false;
+            let malformedImage = false;
             for (const p of content) {
               if (p?.type === "text") textParts.push(p.text ?? "");
-              else if (p?.type === "image_url" && p?.image_url?.url) {
-                const url: string = p.image_url.url;
-                if (url.startsWith("data:")) {
-                  const mimeMatch = url.match(/^data:(image\/(png|jpeg));base64,/);
-                  if (mimeMatch) {
-                    const raw = url.slice(url.indexOf(",") + 1);
-                    images.push(raw);
-                  } else if (/^data:image\//.test(url)) {
-                    unsupportedImage = true;
+              else if (p?.type === "image_url") {
+                if (p.image_url?.url) {
+                  const url: string = p.image_url.url;
+                  if (url.startsWith("data:")) {
+                    const mimeMatch = url.match(/^data:(image\/(png|jpeg));base64,/);
+                    if (mimeMatch) {
+                      const raw = url.slice(url.indexOf(",") + 1);
+                      images.push(raw);
+                    } else if (/^data:image\//.test(url)) {
+                      unsupportedImage = true;
+                    }
                   }
+                } else {
+                  malformedImage = true;
                 }
               }
             }
-            return { text: textParts.join(""), images, unsupportedImage };
+            return { text: textParts.join(""), images, unsupportedImage, malformedImage };
           }
-          return { text: String(content), images: [], unsupportedImage: false };
+          return { text: String(content), images: [], unsupportedImage: false, malformedImage: false };
         };
 
         const extractText = (content: any): string => extractContent(content).text;
@@ -1440,6 +1444,7 @@ async function serve(port: number) {
         const nonSystem = messages.filter((m: any) => m.role !== "system" && m.role !== "developer");
         let requestImages: string[] = [];
         let hasUnsupportedImage = false;
+        let hasMalformedImage = false;
         const convParts: string[] = [];
         for (let i = 0; i < nonSystem.length; i++) {
           const m = nonSystem[i];
@@ -1447,13 +1452,15 @@ async function serve(port: number) {
           let text = "";
 
           if (role === "tool") {
-            text = `<tool_call>\n${extractText(m.content)}\n</tool_call>`;
+            text = `<tool_response>\n${extractText(m.content)}\n</tool_response>`;
           } else if (role === "assistant") {
             text = stripThinking(extractText(m.content));
             if (m.tool_calls) {
               for (const tc of m.tool_calls) {
                 const fn = tc.function || tc;
-                text += `\n<tool_call>\n${JSON.stringify({ name: fn.name, arguments: JSON.parse(fn.arguments || "{}") })}\n</tool_call>`;
+                let args = {};
+                try { args = JSON.parse(fn.arguments || "{}"); } catch {}
+                text += `\n<tool_call>\n${JSON.stringify({ name: fn.name, arguments: args })}\n</tool_call>`;
               }
             }
           } else if (role === "user") {
@@ -1469,6 +1476,7 @@ async function serve(port: number) {
               requestImages.push(...content.images);
             }
             if (content.unsupportedImage) hasUnsupportedImage = true;
+            if (content.malformedImage) hasMalformedImage = true;
             text = content.text;
           } else {
             text = extractText(m.content);
@@ -1501,6 +1509,14 @@ async function serve(port: number) {
           safeRelease();
           return Response.json(
             { error: { message: "unsupported image format — supported: png, jpeg", type: "invalid_request_error" } },
+            { status: 400 },
+          );
+        }
+
+        if (hasMalformedImage) {
+          safeRelease();
+          return Response.json(
+            { error: { message: "malformed image part — image_url.url is required", type: "invalid_request_error" } },
             { status: 400 },
           );
         }
