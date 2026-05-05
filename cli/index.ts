@@ -1446,7 +1446,7 @@ async function serve(port: number) {
       }
 
       try {
-        const body = await req.json();
+        const body = (await req.json()) as any;
         const messages: any[] = body.messages || [];
         const tools: any[] = body.tools || [];
 
@@ -1690,6 +1690,10 @@ async function serve(port: number) {
         const enableThinking: boolean | null = typeof ctk.enable_thinking === "boolean" ? ctk.enable_thinking : null;
         const preserveThinking: boolean = ctk.preserve_thinking === true;
 
+        // Include usage 
+        // https://developers.openai.com/api/reference/resources/chat/subresources/completions/streaming-events
+        const includeUsage = (body.stream_options && body?.stream_options?.include_usage && body?.stream_options?.include_usage === true);
+
         // OpenAI o1/o3-style `reasoning.effort` (none / minimal / low /
         // medium / high / xhigh). Open WebUI, OpenCode, and pi-coding-agent
         // pass this when the user picks a reasoning depth in their UI. Map
@@ -1908,6 +1912,7 @@ async function serve(port: number) {
 
         if (body.stream) {
           const enc = new TextEncoder();
+          let completionTokens = 0;
           let streamCancelled = false;
           e.generating = true;
           const hasTool = tools.length > 0;
@@ -1930,8 +1935,6 @@ async function serve(port: number) {
               // bytes — heartbeat must keep firing until the first real
               // outgoing chunk.
               let visibleChunkSent = false;
-              let streamCompletionTokens = 0;
-              let streamPromptTokens = 0;
               const heartbeat = setInterval(() => {
                 if (visibleChunkSent || streamCancelled) return;
                 try { ctrl.enqueue(enc.encode(": prefill\n\n")); } catch {}
@@ -1944,7 +1947,7 @@ async function serve(port: number) {
                 for await (const msg of e.generate(genParams)) {
                   if (streamCancelled) continue; // drain remaining tokens, don't enqueue
                   if (msg.type === "token") {
-                    streamCompletionTokens++;
+                    completionTokens++;
                     let text = msg.text as string;
                     if (!inThink && text.includes("<think>")) { inThink = true; text = text.replace(/<think>/g, ""); }
                     if (inThink) {
@@ -1991,7 +1994,6 @@ async function serve(port: number) {
                       visibleChunkSent = true;
                     }
                   } else if (msg.type === "done") {
-                    streamPromptTokens = msg.prefill_tokens ?? 0;
                     // Every path below enqueues at least the [DONE] sentinel.
                     visibleChunkSent = true;
                     // When tools are present, parse accumulated text for tool calls
@@ -2013,7 +2015,7 @@ async function serve(port: number) {
                         ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
                           id: reqId, object: "chat.completion.chunk", created, model: modelName,
                           choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
-                          usage: { prompt_tokens: streamPromptTokens, completion_tokens: streamCompletionTokens, total_tokens: streamPromptTokens + streamCompletionTokens },
+                          ...includeUsage && { usage: { prompt_tokens: msg.prefill_tokens, completion_tokens: completionTokens, total_tokens: (msg.prefill_tokens ?? 0) + completionTokens } },
                         })}\n\n`));
                       } else {
                         if (accumulated) {
@@ -2025,14 +2027,16 @@ async function serve(port: number) {
                         ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
                           id: reqId, object: "chat.completion.chunk", created, model: modelName,
                           choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-                          usage: { prompt_tokens: streamPromptTokens, completion_tokens: streamCompletionTokens, total_tokens: streamPromptTokens + streamCompletionTokens },
+                          ...includeUsage && { usage: { prompt_tokens: msg.prefill_tokens, completion_tokens: completionTokens, total_tokens: (msg.prefill_tokens ?? 0) + completionTokens } },
                         })}\n\n`));
                       }
                     } else {
+                      const { tokens, tok_s, prefill_tokens, prefill_ms, prefill_tok_s, decode_tok_s, ttft_ms } = msg;
                       ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
                         id: reqId, object: "chat.completion.chunk", created, model: modelName,
                         choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-                        usage: { prompt_tokens: streamPromptTokens, completion_tokens: streamCompletionTokens, total_tokens: streamPromptTokens + streamCompletionTokens },
+                        ...includeUsage && { usage: { prompt_tokens: msg.prefill_tokens, completion_tokens: completionTokens, total_tokens: (msg.prefill_tokens ?? 0) + completionTokens } },
+                        timings: { tokens, tok_s, prefill_tokens, prefill_ms, prefill_tok_s, decode_tok_s, ttft_ms }
                       })}\n\n`));
                     }
                     ctrl.enqueue(enc.encode("data: [DONE]\n\n"));
