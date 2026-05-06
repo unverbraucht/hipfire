@@ -943,6 +943,76 @@ Cumulative journey:
 per iteration) or batched-shape changes (move the bench to prefill or
 a different harness shape that better matches the kernel's strengths).
 
+## Calibration matrix — is the 5% decode gap real or bench artifact?
+
+Ran the bench across 5 model × quant configs (gen=100, GRAPH=1,
+asym3 KV, gfx1100, 7900 XTX). Goal: assess whether 115 tok/s on 9B
+Lloyd-MQ3 is hitting a hardware ceiling or there's compute headroom.
+
+| Model              | Size GiB | gen tok/s | Eff BW GiB/s | % of 893 GiB/s peak |
+|--------------------|---------:|----------:|-------------:|--------------------:|
+| 9B Lloyd-MQ3       |     4.25 |     114.0 |        484.9 |              **54.3%** |
+| 9B MQ4             |     4.95 |     114.0 |        563.8 |              **63.2%** |
+| 9B uniform MQ3     |     4.02 |     126.2 |        507.6 |              **56.9%** |
+| 4B Lloyd-MQ3       |     2.10 |     150.6 |        315.9 |              35.4%   |
+| 4B MQ4             |     2.41 |     158.4 |        381.6 |              42.7%   |
+
+### Findings
+
+**1. The decode gap is real, structural, and consistent across model
+sizes.** Lloyd-MQ3 sits at ~54% peak BW; MQ4 reaches ~63%. Gap is
+~9 percentage points (~17% relative headroom). 4B shows the same
+~7 pp gap. This is a kernel property, not size-dependent noise.
+
+**2. 120 tok/s on Lloyd-MQ3 is achievable.** Uniform MQ3 9B already
+hits 126.2 tok/s at 57% peak with the simpler `sc*q + zp` recon. To
+clear ≥120 we need ~half the 17% BW-utilization headroom (the other
+half would put us above uniform MQ3, which is the structural target).
+
+**3. Lloyd-MQ3 and MQ4 tie at 114 tok/s but for different reasons.**
+MQ4 is BIGGER (4.95 vs 4.25 GiB) but pulls more effective BW. So:
+- tok/s ∝ effective BW / model size (pure bandwidth-bound)
+- Lloyd needs HIGHER BW utilization OR smaller model to beat MQ4
+- It's already smaller; the bottleneck is per-byte compute cost
+
+**4. Why MQ4 is faster per-byte:**
+- MQ4 recon: `sc*q + zp` — pure VALU, fully pipelined
+- Lloyd recon: `cb_lds[lds_off + q]` — ds_read_b32 + LDS bank load
+  (4-way conflict per bank average), plus the cooperative-load
+  barrier at quad boundaries. Each Lloyd lookup costs more cycles
+  than each MQ4 multiply-add.
+
+**5. Prefill is the real elephant.**
+- 9B MQ4 prefill:        493 tok/s (batched kernel via is_batchable_la)
+- 9B Lloyd-MQ3 prefill:  108 tok/s (per-token fallback — Lloyd not in
+                         allowlist; see followup checklist doc)
+- 5× slower. Closing this requires writing batched Lloyd-MQ3 prefill
+  kernels — separate scope, documented in
+  `docs/plans/mq-lloyd-batched-prefill-followup.md`.
+
+### Conclusion + direction
+
+**The decode 115 → 120 gap is real but bounded.** Closing it requires
+kernel-internal compute optimization to push Lloyd's BW utilization
+from 54% → ~58-60% peak (matching uniform MQ3, halfway to MQ4).
+Candidate levers, in order of expected ROI:
+
+- **Wider unroll K8** — 8 accumulators instead of 4, more ILP per
+  iteration body. Risk: VGPR pressure (74 → likely 100+, may push
+  past the 96-VGPR budget for 16-way occupancy).
+- **LDS layout / cooperative-load improvements** — current path
+  is fp16→fp32 + LDS write + barrier per quad. Possible refinements:
+  prefetch into a SECOND LDS slot while computing on the first
+  (double-buffered LDS staging), or shrink the barrier domain.
+- **Codebook precompute for hot quants** — if a small fraction of
+  q values dominate (codebook is non-uniform by Lloyd's design),
+  could shortcut common cases. Risky / data-dependent.
+
+Bonus finding: **the 5× prefill gap dwarfs the 5% decode gap.** If
+the top-line goal is "make Lloyd-MQ3 fast", future investment should
+go to batched prefill, not further decode tuning. But that's
+out-of-scope for the current ship gate (decode tok/s ≥120).
+
 **Follow-up note for CDNA / RDNA1/2 maintainers:** the intrinsic's
 async-load semantics ARE available on those archs and could deliver
 the latency-hiding the source-level prefetch couldn't. If someone
