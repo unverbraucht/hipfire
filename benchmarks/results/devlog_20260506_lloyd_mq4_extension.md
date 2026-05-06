@@ -1072,6 +1072,96 @@ original switch-dispatch kernel, is the headline win. The 5% to
 120 is in noise-adjacent territory where session drift (±10-15%
 per CLAUDE.md) approaches the gain target.
 
+## ❌ The "ship at 115" conclusion was WRONG — fused QKVZA cleared the gate
+
+After re-examining the post-all-commits decode profile, the lever I
+had missed: the per-LA-layer 4 standalone GEMVs (wqkv + wz + w_beta
++ w_alpha) were each paying full launch overhead, with the 16-row
+beta/alpha calls being especially wasteful (28 KB of weight per call,
+~1 µs of GPU work, ~9 µs total — pure launch overhead).
+
+**Decisive observation in the fresh profile:** `fused_gate_up_mq3g256_lloyd`
+hits 514 GiB/s (57.6% peak) while standalone `gemv_mq3g256_lloyd`
+averages only 364 GiB/s (40.8% peak). The gap isn't the kernel
+body — it's the launch-amortization regime. Standalone GEMV is
+launch-overhead-bounded for the small calls, not BW-ceiling-bounded.
+The "115 is the ceiling" claim conflated body BW (~514) with the
+call-mix-weighted average (~364).
+
+### Step 6 — Fused QKVZA MQ3-Lloyd (decode), the actual gate-clearer
+
+Shipped `kernels/src/fused_qkvza_mq3g256_lloyd.{,gfx1100.}hip` mirroring
+the MQ4 `fused_qkvza_hfq4g256` pattern: grid = qkv_m + z_m + beta_m +
+alpha_m blocks, each block routes via `gid` range to pick A/y, K4 +
+LDS body for gfx1100. Wired through `kernels.rs` arch selector,
+`dispatch.rs::fused_qkvza_mq3g256_lloyd`, and 3 LA-decode call sites
+in `qwen35.rs` (each adds a `fused_la4_lloyd_mq3` branch alongside
+the existing `fused_la4_mq4`).
+
+VGPR: 74 (same as standalone GEMV), 0 spills, 128 B LDS — no resource
+regression. PPL=13.1804 (4B Lloyd-MQ3, bit-identical, correctness
+preserved).
+
+Bench at the canonical ship-gate harness shape (probe_commits.sh:
+--prefill 16 --warmup 3 --gen 30), 5 consecutive runs:
+
+```
+gen_tok_s = 120.9 / 120.8 / 120.8 / 120.8 / 120.7
+bw_gib_s  = 514.3 / 513.8 / 513.8 / 513.7 / 513.4
+```
+
+**5/5 runs ≥120. Range 0.2 tok/s. Ship gate cleared.**
+
+Profile delta (gen=50, GRAPH=0, before vs after):
+- gemv_mq3g256_lloyd: 6050 calls / 364 GiB/s → **1250 calls / 493 GiB/s**
+  (96 calls/token saved = 4 LA projections × 24 LA layers; the
+  small/launch-bound calls eliminated, raising avg BW for what remains)
+- fused_qkvza_mq3g256_lloyd (NEW): 1200 calls / 482 GiB/s
+- Wall: 115.0 → ~120.8 = **+5.0%**, **the actual gate-clearing lever**
+
+### Final cumulative journey (corrected, 2026-05-06 evening)
+
+```
+baseline (pre-Lloyd-rewrite):       42.9 tok/s
+K4 + LDS gfx1100 kernel:           112.6 tok/s   (2.62× — original)
+residual fusion arm:               113.2 tok/s   (+0.5%, noise)
+swiglu_residual MQ3-Lloyd arm:     113.3 tok/s   (+0.1%, noise)
+fused gate+up Lloyd-MQ3:           115.0 tok/s   (+1.5%, real)
+**fused QKVZA Lloyd-MQ3:           120.8 tok/s** **(+5.0%, GATE CLEARED)**
+
+Total: 2.82× from baseline. Ship gate ≥120 tok/s achieved.
+```
+
+### Lesson: "structural ceiling" was a mis-framing
+
+The earlier "structural ceiling" claim was based on the standalone
+GEMV's 364 GiB/s, treating it as the kernel-body limit. The
+fused_gate_up data point at 514 GiB/s (already in the profile!)
+should have told me sooner that the body itself can hit 57.6% peak
+— the avg was being dragged down by launch-overhead-bounded small
+calls. **Per-byte BW utilization is the right metric for the body;
+total BW is dragged by call-mix.**
+
+Refined principle: **launch-count reduction via fusion DOES pay off
+in wall time, but only when the fused kernels each have non-trivial
+work AND tiny ancillary bodies are co-scheduled with larger ones in
+the same launch.** Tiny standalone ancillary ops (silu_mul,
+add_inplace) were already pipelining-overlapping the dominant GEMV
+— fusing those is profile-time-saving but wall-noise. Fusing 4
+Lloyd GEMVs (one big + one medium + 2 tiny) into one launch lets the
+2 tiny ones co-schedule with the big body in the same wave-dispatch
+window, AND eliminates 3 launch overheads per layer.
+
+### Bonus finding still on the table
+
+The 5× prefill gap (~108 vs 493 tok/s for MQ4) remains the biggest
+real-workload lever. Out of scope for this PR; documented in
+`docs/plans/mq-lloyd-batched-prefill-followup.md`. Also worth noting
+on followup: a **fused QKV MQ3-Lloyd for FA decode** (~8 layers ×
+3→1 launches) is the natural sibling of fused QKVZA — smaller
+fraction of decode time (FA is 8/32 layers) but mechanically the
+same pattern; estimated ~0.5-1% additional wall.
+
 **Follow-up note for CDNA / RDNA1/2 maintainers:** the intrinsic's
 async-load semantics ARE available on those archs and could deliver
 the latency-hiding the source-level prefetch couldn't. If someone

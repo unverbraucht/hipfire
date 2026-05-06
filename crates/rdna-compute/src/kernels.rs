@@ -51,6 +51,12 @@ pub const GEMV_MQ3G256_LLOYD_RESIDUAL_GFX1100_SRC: &str = include_str!("../../..
 /// per FFN). Mirrors fused_gate_up_hfq4g256.{,gfx1100.}hip.
 pub const FUSED_GATE_UP_MQ3G256_LLOYD_SRC: &str = include_str!("../../../kernels/src/fused_gate_up_mq3g256_lloyd.hip");
 pub const FUSED_GATE_UP_MQ3G256_LLOYD_GFX1100_SRC: &str = include_str!("../../../kernels/src/fused_gate_up_mq3g256_lloyd.gfx1100.hip");
+/// MQ3G256Lloyd fused QKVZA GEMV: four LA-preamble GEMVs (wqkv + wz + w_beta
+/// + w_alpha) in one launch. Saves 3 launches per LA layer per token + lets
+/// the 16-row beta/alpha tails co-schedule with the 6144-row qkv body.
+/// Mirrors fused_qkvza_hfq4g256.hip.
+pub const FUSED_QKVZA_MQ3G256_LLOYD_SRC: &str = include_str!("../../../kernels/src/fused_qkvza_mq3g256_lloyd.hip");
+pub const FUSED_QKVZA_MQ3G256_LLOYD_GFX1100_SRC: &str = include_str!("../../../kernels/src/fused_qkvza_mq3g256_lloyd.gfx1100.hip");
 
 /// Returns the MQ3G256-Lloyd GEMV kernel source AND module name for the given
 /// arch. gfx1100/1101/1102 (RDNA3) gets the K4-unrolled + LDS-codebook variant
@@ -100,6 +106,21 @@ pub fn fused_gate_up_mq3g256_lloyd_for_arch(arch: &str) -> (&'static str, &'stat
             (FUSED_GATE_UP_MQ3G256_LLOYD_GFX1100_SRC, "fused_gate_up_mq3g256_lloyd_rdna3")
         }
         _ => (FUSED_GATE_UP_MQ3G256_LLOYD_SRC, "fused_gate_up_mq3g256_lloyd"),
+    }
+}
+
+/// Arch dispatch for fused QKVZA MQ3-Lloyd. Used by `qwen35.rs` LA decode
+/// when all four projections (wqkv, wz, w_beta, w_alpha) are MQ3G256Lloyd
+/// to collapse 4 GEMV launches into 1.
+pub fn fused_qkvza_mq3g256_lloyd_for_arch(arch: &str) -> (&'static str, &'static str) {
+    if std::env::var("HIPFIRE_LLOYD_FORCE_BASELINE").ok().as_deref() == Some("1") {
+        return (FUSED_QKVZA_MQ3G256_LLOYD_SRC, "fused_qkvza_mq3g256_lloyd");
+    }
+    match arch {
+        "gfx1100" | "gfx1101" | "gfx1102" => {
+            (FUSED_QKVZA_MQ3G256_LLOYD_GFX1100_SRC, "fused_qkvza_mq3g256_lloyd_rdna3")
+        }
+        _ => (FUSED_QKVZA_MQ3G256_LLOYD_SRC, "fused_qkvza_mq3g256_lloyd"),
     }
 }
 
