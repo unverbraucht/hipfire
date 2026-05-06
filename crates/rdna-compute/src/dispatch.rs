@@ -2925,6 +2925,7 @@ impl Gpu {
         q_m: usize, k_m: usize, v_m: usize,
         k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         let xq_ptr = self.ensure_q8_1_mmq_x(x, 1, k)?;
 
         self.ensure_kernel(
@@ -3174,6 +3175,7 @@ impl Gpu {
         qkv_m: usize, z_m: usize, beta_m: usize, alpha_m: usize,
         k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         let xq_ptr = self.ensure_q8_1_mmq_x(x, 1, k)?;
 
         self.ensure_kernel(
@@ -5969,6 +5971,7 @@ impl Gpu {
         n_exp: usize,
         norm_topk: bool,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "moe_topk_renorm_k8",
             kernels::MOE_TOPK_RENORM_K8_SRC,
@@ -6195,6 +6198,7 @@ impl Gpu {
         norm_topk: bool,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "moe_topk_renorm_k8_batched",
             kernels::MOE_TOPK_RENORM_K8_BATCHED_SRC,
@@ -6890,6 +6894,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         // DIAGNOSTIC: HIPFIRE_MMQ_DIAG_PASSTHROUGH=1 forwards to the FP16
         // wave64 kernel instead of running the dp4a kernel.
         if std::env::var("HIPFIRE_MMQ_DIAG_PASSTHROUGH").ok().as_deref() == Some("1") {
@@ -7010,6 +7015,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         let mmq_x = if batch_size <= 8 { 8 }
             else if batch_size <= 16 { 16 }
             else if batch_size <= 24 { 24 }
@@ -7737,6 +7743,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         // Quantize x → Xq[K/128 * batch_size] block_q8_1_mmq via the
         // shared scratch. Stride layout: kblock-major (matches
         // quantize_q8_1_mmq_ds4 at gemm_hfq4g256_residual_mmq.hip:80).
@@ -10389,6 +10396,7 @@ impl Gpu {
         y_gate: &GpuTensor, y_up: &GpuTensor,
         gate_m: usize, up_m: usize, k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         // Quantize x → Xq[K/128] block_q8_1_mmq via the existing shared
         // scratch path. Batch=1 for GEMV.
         let xq_ptr = self.ensure_q8_1_mmq_x(x, 1, k)?;
