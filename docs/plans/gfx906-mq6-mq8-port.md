@@ -866,36 +866,46 @@ The audit confirms every other "shipped on gfx906" claim in §3.1 /
 §3.2 is build-verified. Phase A estimates can be treated as
 load-bearing again.
 
-### 5.6 dot2 (`v_dot2_f32_f16`) gfx906 opportunity — deferred Phase B candidate
+### 5.6 dot2 (`v_dot2_f32_f16`) gfx906 — RULED OUT BY MEASUREMENT (2026-05-06)
 
 The `has_dot2_f32_f16()` allowlist at `dispatch.rs:123-130` excludes
-gfx906 even though gfx906 hardware carries the `dot2-insts` feature
-(per LLVM `AMDGPUUsage`). The `gemm_*_dot2.hip` kernels build cleanly
-on gfx906 (§5.5). Adding gfx906 to the allowlist would shift dispatch
-behavior depending on the call site:
+gfx906 even though gfx906 hardware carries the `dot2-insts` feature.
+v3.2.1 flagged adding gfx906 to the allowlist as a deferred Phase B
+candidate. Tested 2026-05-06; **measured negative on prefill,
+unaffected on decode by design.**
 
-| Quant family | Affected? | Why |
-|---|---|---|
-| **HFQ4 / MQ4** | No | gfx906 is `wave64-native` and takes the `cdna_wave64` branch *before* the dot2 fall-through. The change wouldn't reach this dispatch. |
-| **HFQ6 / MQ6** | **Yes** — batched-fused only | `gemm_qkvza_hfq6g256` / `gemm_qkv_hfq6g256` / `gemm_gate_up_hfq6g256` would swap from wave32 scalar FP32 → wave32 dot2 FP16 |
-| HFQ8 / MQ8 | No | no `*_dot2` kernel exists for HFQ8 |
+| Workload | Δ vs baseline (5-run median) |
+|---|---|
+| 9B mq6 prefill pp=32 | **-2.4%** |
+| 9B mq6 prefill pp=128 | **-2.4%** |
+| 27B mq6 prefill pp=32 | **-2.2%** |
+| 27B mq6 prefill pp=128 | 0% (3.0% spread) |
+| 9B / 27B decode pp={32,128} | 0% (decode never enters the dot2 path) |
 
-**Affected workloads** (HFQ6 / MQ6 only): batched fused GEMM at B>1.
-Specifically prefill + DFlash verify-pass through the gate_up / qkv /
-qkvza projection trio. Not AR decode (B=1 GEMV bypasses the dot2
-dispatch).
+**Root cause:** the dot2 dispatch path requires an FP32→FP16
+conversion of the entire X buffer before each kernel invocation
+(`ensure_fp16_x` at `dispatch.rs:1150+`). Under graph capture
+(`HIPFIRE_GRAPH=1`, the bench-cold default), the conversion fires
+on every replay because the X data changes per chunk even though the
+buffer pointer is stable (see comment at `dispatch.rs:1167`). Per
+mq6 prefill layer, three of these conversions land (qkvza + qkv +
+gate_up). On gfx906 the dot2 kernel's bandwidth saving (X reads
+16 B/iter vs 32 B/iter) does not compensate for the ~180 MB extra
+HBM traffic per prefill pass at 27B-scale.
 
-**Bench protocol** (when this is taken up as a Phase B experiment):
-1. Baseline `bench_qwen35_mq4 qwen3.5-9b.mq6 --prefill 128 ...` on
-   the current wave32 scalar path.
-2. Add gfx906 to `has_dot2_f32_f16()` (one-line patch) and rebuild.
-3. Re-bench prefill tok/s and DFlash verify-share.
-4. AGENTS.md §5: 5-run fresh-process median, prompt md5, binary md5.
-   PMC pass to verify VALUBusy and v_dot2 issue rate match expectation.
+The wave32 scalar baseline reads X directly as FP32 with no
+conversion; the dot2 path is net-negative under graph capture.
 
-**Status: not in scope for the v3.1 plan.** Recorded here so a future
-agent doesn't duplicate the discovery work. Keep the allowlist
-conservative until the bench result lands.
+**Impact on §5.1 priority list:** none. dot2 isn't on the priority
+list. The §5.6 was originally documented as a deferred candidate;
+this experiment closes the loop.
+
+**See:** `docs/perf-checkpoints/2026-05-06-dot2-gfx906-experiment.md`
+for full numbers, kernel-source comparison (VGPR=32 / SGPR=50
+identical across scalar/fp16/dot2 — so the regression isn't
+register-pressure driven), and the cross-arch note explaining why
+dot2 wins on RDNA2/RDNA3 archs but loses on gfx906 (different
+graph-capture FP16 plumbing on those archs).
 
 ### 5.7 Runtime-dispatch sweep results (v3.2.1, 2026-05-06)
 
