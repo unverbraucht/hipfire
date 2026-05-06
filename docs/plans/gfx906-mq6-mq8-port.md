@@ -30,6 +30,52 @@ HFQ8-family kernels) with one extra activation-rotate kernel layered
 in front. The kernel surfaces "HFQ6 has wave32 GEMV" and "MQ6 has
 wave32 GEMV" describe the same kernels.
 
+### v3.1 errata (2026-05-06): `gemv_mq8g256.hip` was not actually buildable on gfx906
+
+§3.2 of v3 framed MQ8 as Priority 1 partly because "the dp4a-on-int8
+inner loop is already shipped in `gemv_mq8g256.hip`; Phase A items are
+mechanical mirrors with the same proven inner loop." **That was wrong
+about the *gfx906* path.** The kernel as-shipped used
+`__builtin_amdgcn_sudot4` for the dp4a call, which lowers to
+`v_dot4_i32_iu8` (mixed-sign int8 dp4a). That instruction needs the
+`dot8-insts` target feature — RDNA3+ only. On gfx906 (Vega 20, MI50)
+the kernel **failed to compile** with `error: '__builtin_amdgcn_sudot4'
+needs target feature dot8-insts`. The kernel had been validated on
+gfx1100 / gfx1201 only; there was no shipped gfx906 mq8 path.
+
+Discovered 2026-05-06 during the Priority 0 baseline run. Fix in
+commit `ee0fac6`: substitute `sudot4(true, w, true, x, acc, false)` →
+`sdot4(w, x, acc, false)` (signed×signed dp4a, gfx906+, dot2-insts).
+Math is identical — both operands are signed int8 (Q8_1 activations
++ symmetric MQ8 weights `[-127, 127]`); the sudot4 mixed-mode form
+was gratuitous. Cross-arch portability preserved per LLVM's per-arch
+syntax docs (sdot4 is supported on gfx906/908/9/10/11/12).
+
+**Implications for the priority list (§5.1):**
+
+- **MQ8 Phase A is no longer "low risk because the inner loop ships."**
+  The fixed B=1 kernel was validated only as far as a single-process
+  bench on Qwen 9B mq8: 45.4 tok/s, p50 21.46 ms/tok, tight
+  per-token determinism (1.4% spread). No coherence-gate run yet
+  (NFS-bound on this box). Treat the inner loop as freshly-validated,
+  not battle-tested.
+- **The "MQ8 first" reasoning weakens.** The argument was "no MMQ
+  port required and the dp4a inner loop already ships" — only the
+  first half survives. MQ6 Phase A's competitive case (wave32 → wave64
+  mechanical port pattern is the same one PR #158 used for HFQ4 and
+  is genuinely shipped) is now relatively stronger.
+- **Audit-the-other-mq-kernels work item added.** §6 priority list
+  should include a sweep for other latent gfx906-only build failures
+  in MQ/HFQ kernels using RDNA3+-only intrinsics. Cheap (~½ session,
+  pure compile-test) and forces the "is this kernel actually shipped
+  on the target arch?" question to be answered before any Phase A
+  estimate is treated as load-bearing.
+
+This errata does not invalidate the v3 scope reframe (MQ6/MQ8 are
+still the deployed targets). It does mean every "shipped on gfx906"
+claim in the body of this doc deserves a build-verification step
+before being relied on for prioritization.
+
 This document is **analysis-only**. It maps what's missing for MQ6
 and MQ8 to reach the same kernel-coverage level we have for HFQ4
 post-PR-158, separately considering AR-only and DFlash workloads.
@@ -417,6 +463,12 @@ to using them without measurement.
 
 ### 3.2 MQ8 — extend dp4a-on-int8 from B=1 reference to wave64 / batched / MoE
 
+**Errata note:** the v3 framing called the B=1 kernel "shipped" — it
+was, but only on RDNA3+. Until commit `ee0fac6` (2026-05-06) the
+kernel failed to compile on gfx906 because it used the RDNA3-only
+`sudot4` builtin. See the v3.1 errata in the header section. The
+discussion below describes the fixed kernel.
+
 **Reference kernel ships today:** `kernels/src/gemv_mq8g256.hip` is
 the int8-weight × Q8_1-activation dp4a GEMV at B=1. Inner loop:
 
@@ -608,14 +660,26 @@ entire plan. The lessons from PR #158's diagnostic-first methodology
 + the closed dot8 PRD's negative result both point toward "don't
 build speculative kernel optimizations."
 
-**Why MQ8 is priority 1 over MQ6:**
-- The dp4a-on-int8 inner loop is already shipped in
+**Why MQ8 was provisionally priority 1 over MQ6 (weakened by v3.1 errata):**
+- ~~The dp4a-on-int8 inner loop is already shipped in
   `gemv_mq8g256.hip`; Phase A items are mechanical mirrors with the
-  same proven inner loop.
+  same proven inner loop.~~ **Reframed by v3.1 errata.** The kernel
+  was unbuildable on gfx906 until commit `ee0fac6` (2026-05-06) and
+  the post-fix B=1 path has only single-process bench validation
+  (45.4 tok/s on Qwen 9B mq8), not coherence-gate. Treat as
+  freshly-validated.
 - No MMQ-streaming port required (Phase A item 4 covers batched
-  directly with register-tile dp4a).
+  directly with register-tile dp4a). **Still applies.**
 - Smaller total scope (~2.5 sessions vs MQ6's ~3 + optional ~1 + ~5
-  sessions for full coverage).
+  sessions for full coverage). **Still applies.**
+
+**Net:** MQ8 priority-1 vs MQ6 priority-2 ranking is *softened* but
+not inverted. The "smaller scope + no MMQ" arguments survive; the
+"battle-tested inner loop" argument doesn't. Re-evaluate after
+Priority 0 baselines if the freshly-fixed B=1 kernel shows
+unexpected behavior in the bench-cold harness's 5-run-fresh-process
+median (e.g. wider spread than mq4 / mq6 paths would indicate
+something subtle is still off).
 
 ### 5.2 Coherence-gate cost (per glm5 3.4)
 
@@ -629,6 +693,27 @@ This work is **gfx906-only**. gfx11 / gfx12 (RDNA3 / RDNA4) WMMA
 paths are unaffected. `gemv_hfq6g256.gfx1201.hip` and other RDNA-
 specific HFQ6 kernels need no changes.
 
+### 5.4 Audit-other-MQ-kernels-on-gfx906 (~½ session, added by v3.1 errata)
+
+The `sudot4` bug in `gemv_mq8g256.hip` sat undetected because no
+gfx906 build or bench had exercised the mq8 path before 2026-05-06.
+Other MQ / HFQ kernels may have similar latent gfx906-only build
+failures from RDNA3+-only intrinsics. Cheap to audit:
+
+1. `grep -rn '__builtin_amdgcn_\(sudot\|wmma\|s_wait_event\|v_dot.*bf16\|v_dot.*f16\)' kernels/src/`
+2. For each match, check the kernel's dispatch path: is it ever
+   instantiated on gfx906 today? If yes, build-test it via the
+   runtime's JIT path (not just by reading the source).
+3. Also worth: build-test every kernel listed in `kernels::*_SRC`
+   constants on gfx906 to catch any other dot8/wmma/RDNA3+-only
+   reliance.
+
+**Why before any Phase A:** every "shipped on gfx906" claim in §3.1
+and §3.2 is load-bearing for the priority list. If any other path
+is also unbuildable, the priority order changes again. Treat this
+as Priority 0.5 — between the baseline measurement and any kernel
+work.
+
 ---
 
 ## 6. What's not blocked by this analysis
@@ -636,6 +721,8 @@ specific HFQ6 kernels need no changes.
 - The HFQ4 / MQ4 production path (PR #158 work) is not affected.
 - The existing wave32 MQ6 / B=1 dp4a MQ8 paths remain functional
   throughout (Phase A adds wave64 alongside; doesn't remove wave32).
+  *(MQ8 B=1 path verified 2026-05-06 via single-process bench; see
+  v3.1 errata.)*
 - gfx11 / gfx12 WMMA paths unchanged.
 - mq6 / mq8 production deployments continue working at current
   performance unless / until Priority 0 + Phase A land.
