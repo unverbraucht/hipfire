@@ -201,9 +201,9 @@ separate per-layer kernel, not part of the GEMV/GEMM inner loop.
 | wave64 GEMV (AR decode B=1) | ~½ session | ~¼ session | MQ8 dword-aligned and trivially ports; MQ6 needs split-load handling |
 | wave64 residual GEMV + ILP-prefetch | ~½ session | ~½ session | mechanical mirror of HFQ4 work |
 | Single-token fused GEMVs (gate_up / qkv / qkvza) | ~1 session | ~1 session | new GEMV-level surface for both quants |
-| Wave64 batched GEMM (dp4a) | ~1 session | ~½ session | MQ6 needs MMQ-streaming Phase C; MQ8 covered by direct register-tile dp4a |
+| Wave64 batched GEMM (LM-head + per-layer residual, dp4a) | ~1 session | ~½ session | MQ6 needs both `_wave64` and `_residual_wave64` (per-layer residual fires at 6 call sites — see §5.8); MMQ Phase C separate. MQ8 covered by direct register-tile dp4a IF wiring exists (see v3.2 errata). |
 | MoE-indexed kernels (5 files per quant) | ~1 session | ~½ session | A3B / MoE workload coverage |
-| **AR-only complete coverage** | **~3 sessions** | **~2.5 sessions** | MQ8 lighter because B=1 dp4a kernel already shipped |
+| **AR-only complete coverage** | **~3.5 sessions** (revised v3.2.1 +½ for residual_wave64) | **~2.5 sessions** | MQ8 lighter only counts kernels, not the 14 missing dispatch sites — see v3.2 errata for the expanded MQ8 estimate (~5–6 sessions). |
 | dp4a port for fused GEMVs (MQ6 only — MQ8 is dp4a from day one) | ~1 session | n/a | PMC-gated before commit |
 | MMQ-equivalent dp4a path (DFlash verify) | **5 sessions** | **not needed** (Phase A item 4 covers it) | MQ6 needs full MMQ port; MQ8 batched is structurally simpler |
 
@@ -710,7 +710,7 @@ new kernels + 14 dispatch sites; no deployed per-layer model).
 
 | Priority | Phase | Cost | Expected lift | Risk | Demand gate |
 |---:|---|---:|---|---|---|
-| 1 | **MQ6 Phase A** (wave64 GEMV + residual + fused + batched + MoE, FP-only) | ~3 sessions | TBD by P0 | low — mirror of HFQ4 wave64 work; wave32 path works end-to-end today | needed if mq6 has measured production demand |
+| 1 | **MQ6 Phase A** (wave64 GEMV + residual + fused + batched + per-layer residual + MoE, FP-only) | ~3.5 sessions (v3.2.1) | TBD by P0 | low — mirror of HFQ4 wave64 work; wave32 path works end-to-end today | needed if mq6 has measured production demand |
 | 2 | MQ6 Phase B (dp4a port for fused GEMVs, AR optimization) | ~1 session | TBD; PMC-gated | medium — needs PMC validation | only if Phase A's MQ6 kernels show ALU headroom |
 | 3 | MQ6 Phase C (MMQ batched, DFlash verify) | **5 sessions** | TBD; up to +90% on Qwen 27B mq6 DFlash *if anyone uses that combo* | high — full LDS bank-conflict diagnostic + mmq_screen plumbing | only if 27B mq6 + DFlash becomes a real workload |
 | 4 | MQ8 Phase A (per-layer wiring + 4-7 new batched-GEMM kernels + 14 dispatch sites) | **~5-6 sessions** (revised up from ~2.5 by v3.2) | unmeasured — requires correct inference baseline first | high — both kernels and runtime dispatch must be added; coherence-gate and quality validation needed for each new kernel | **deferred until a production model ships raw MQ8 per-layer weights, OR measured advantage over MQ6 motivates the work** |
@@ -896,6 +896,80 @@ dispatch).
 **Status: not in scope for the v3.1 plan.** Recorded here so a future
 agent doesn't duplicate the discovery work. Keep the allowlist
 conservative until the bench result lands.
+
+### 5.7 Runtime-dispatch sweep results (v3.2.1, 2026-05-06)
+
+Per §5.4 part 2, swept all 28 `gpu_dtype` matchers in
+`crates/hipfire-arch-qwen35/src/qwen35.rs` plus 4 in
+`crates/hipfire-arch-qwen35/src/speculative.rs` for coverage of the
+12 loader-producible quant types.
+
+**Per-quant matcher coverage:**
+
+| Quant | qwen35.rs `is_mq` | qwen35.rs `is_6bit` | speculative.rs lm_head batched | Production |
+|---|---|---|---|---|
+| HFQ4G256 | n/a (not rotated) | n/a | ✓ | ✓ ships |
+| HFQ4G128 | n/a | n/a | n/a | ✓ ships |
+| HFQ6G256 | n/a | ✓ all sites | ✗ (perf miss only — falls through to unbatched) | rare |
+| HFQ3G256/G128 | n/a | n/a | n/a | rare |
+| MQ4G256 | ✓ all 28 | n/a | ✓ | ✓ ships (default) |
+| MQ6G256 | ✓ all 28 | ✓ all 10 | ✗ (perf miss) | ✓ ships |
+| **MQ3G256** | **partial 26/28** — missing from MoE-batched LA (line 4651) and MoE-batched FA (line 4802) | n/a | ✓ | ✓ ships gfx11/12 dense; A3B+MQ3 not deployed |
+| MQ8G256 | ✗ 0/28 (per §5.4 / dev-log) | n/a | ✗ | only as lm_head |
+| **MQ2G256** | **✗ 0/28** | n/a | ✗ | unknown — quantize-tool supports it |
+| Q8_0 | n/a | n/a | ✓ | ✓ ships |
+| F32 | n/a | n/a | n/a | rare |
+
+**Three latent silent-correctness gaps found beyond MQ8:**
+
+1. **MQ3 dropped from MoE-batched matchers** (lines 4651, 4802 in
+   `qwen35.rs`). Pattern: copy-paste from dense LA/FA bodies (which
+   include MQ3) into the duplicated MoE bodies (which dropped MQ3).
+   Trigger: any MoE model with MQ3 weights — e.g. a hypothetical
+   Qwen3.6-35B-A3B mq3 quant. Failure mode: rotation pre-pass
+   skipped → activation handed to GEMV without FWHT → wrong
+   arithmetic. **No deployed model triggers this today** (only
+   `qwen3.6-35b-a3b.mq4` ships).
+
+2. **MQ2G256 has zero matcher coverage** (28/28). Same class as
+   MQ8: loader produces it, quantize-tool supports `--format mq2`,
+   but every per-layer prefill-batched dispatch site silently
+   falls through to HFQ4-stride read. Failure mode: stride-mismatch
+   corruption (72 vs 136 B/group). **No deployed `*.mq2` model.**
+
+3. **MoE `use_kernarg_fused` predicate gap** at
+   `qwen35.rs:1931`. Currently:
+   ```
+   let use_kernarg_fused = k == 8 && routed_gate_up_mq4 && x_rot_local.is_some();
+   ```
+   The check gates on `routed_gate_up_mq4` but not `routed_mq4`
+   (which checks `down`). Mixed-precision MoE (gate_up=MQ4 but
+   down=MQ6/MQ3) would silently corrupt the down kernel. Trivial
+   one-token fix:
+   ```
+   let use_kernarg_fused = k == 8 && routed_gate_up_mq4 && routed_mq4 && x_rot_local.is_some();
+   ```
+   **Mixed-precision MoE not deployed today** — `--format <X>`
+   produces uniform expert quants — but recommended to land
+   alongside any future MoE-mq6 work.
+
+### 5.8 Phase A scope freshness check (v3.2.1, 2026-05-06)
+
+Reconciled §3.1.1's enumerated 5 wave64 ports against the current
+kernel tree. All 5 are confirmed missing. **One additional kernel
+should be added to Phase A scope:**
+
+- `gemm_hfq6g256_residual_wave64.hip` — wave64 sibling of the
+  shipped `gemm_hfq6g256_residual.hip`. The existing wave32
+  variant fires at 6 call sites (`qwen35.rs:4130, 4210, 4520,
+  4590` for dense LA/FA wo+w_down prefill batched; `llama.rs:1625,
+  1680` for the same projection family).
+
+Phase A item 4 in §3.1.1 is named "LM-head batched GEMM" and
+implies non-residual `gemm_hfq6g256_wave64.hip` only. The
+per-layer batched residual is a separate kernel shape and adds
+~½ session to the estimate — **revised Phase A total: ~3.5
+sessions** (was ~3 sessions in §1.3 / §3.1.1).
 
 ---
 
