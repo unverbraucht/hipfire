@@ -3657,6 +3657,16 @@ pub fn forward_prefill_batch_with_pbs(
 /// eligibility check in `forward_prefill_batch` and the per-layer dtype
 /// branches in `forward_prefill_chunk`).
 #[inline]
+// IMPORTANT: This allowlist is paired with the `is_mq*` matchers in
+// forward_prefill_chunk (lines 4063+, 4360+, 4768, 4919) and with the
+// MoE FFN gate `moe_ffn_all_mq4`. They MUST be updated together when
+// adding a new batchable dtype. Updating one without the others either
+// produces dead code (safe but useless) or silent prefill corruption
+// (HFQ4-stride GEMM reading a different-stride weight block). See
+// docs/plans/mq-lloyd-batched-prefill-followup.md for the full
+// checklist + rationale. MQ3G256Lloyd / MQ2G256Lloyd intentionally
+// excluded today: no batched Lloyd-prefill kernel exists; per-token
+// fallback is correct.
 fn is_batchable_la(dt: DType, arch: &str) -> bool {
     let always_ok = matches!(dt,
         DType::MQ4G256 | DType::HFQ4G256
@@ -4060,6 +4070,14 @@ fn forward_prefill_chunk(
                 // plain rmsnormed activations. The GEMM kernels themselves
                 // are dtype-agnostic — they just consume whatever [N × K]
                 // activation buffer we point them at.
+                // GAP NOTE: this matcher (and the 7 sibling dense LA/FA
+                // matchers in this file) is missing DType::MQ3G256Lloyd /
+                // MQ2G256Lloyd. Currently dead code for those dtypes —
+                // is_batchable_la (line 3660) keeps Lloyd weights on the
+                // per-token forward_scratch fallback. To enable batched
+                // Lloyd prefill: update is_batchable_la, ALL is_mq* matchers,
+                // AND add a Lloyd-specific GEMM dispatch arm together. See
+                // docs/plans/mq-lloyd-batched-prefill-followup.md.
                 let is_mq = matches!(layer.wqkv.gpu_dtype, DType::MQ4G256 | DType::MQ6G256 | DType::MQ3G256);
                 let is_6bit = matches!(layer.wqkv.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
                 let is_mq3 = matches!(layer.wqkv.gpu_dtype, DType::MQ3G256);
@@ -4765,6 +4783,12 @@ fn forward_prefill_chunk(
                 // only the FFN differs. Duplicated inline for now — can
                 // be factored into a `prefill_la_body_batched` helper
                 // when dense and MoE LA paths are proven byte-exact.
+                // GAP NOTE: this matcher is missing plain DType::MQ3G256 (upstream
+                // issue #179) and DType::MQ3G256Lloyd / MQ2G256Lloyd. Currently
+                // dead code — moe_ffn_all_mq4 (line 3707) keeps non-MQ4 MoE
+                // layers off the batched path. Re-evaluate this comment when
+                // touching is_batchable_la or moe_ffn_all_mq4. See
+                // docs/plans/mq-lloyd-batched-prefill-followup.md.
                 let is_mq = matches!(layer.wqkv.gpu_dtype, DType::MQ4G256 | DType::MQ6G256);
                 let is_6bit = matches!(layer.wqkv.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
 
@@ -4916,6 +4940,10 @@ fn forward_prefill_chunk(
                 // MoE path is proven byte-exact.
                 let kv_dim = config.n_kv_heads * config.head_dim;
                 let q_dim = config.n_heads * config.head_dim;
+                // GAP NOTE: this matcher is missing plain DType::MQ3G256 (upstream
+                // issue #179) and DType::MQ3G256Lloyd / MQ2G256Lloyd. Currently
+                // dead code — moe_ffn_all_mq4 keeps non-MQ4 MoE off the batched
+                // path. See docs/plans/mq-lloyd-batched-prefill-followup.md.
                 let qkv_is_mq = matches!(layer.wq.gpu_dtype, DType::MQ4G256 | DType::MQ6G256);
                 let qkv_is_6bit = matches!(layer.wq.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
 
