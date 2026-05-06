@@ -532,3 +532,185 @@ that codebook prefetching or wider unroll likely closes it.
 Step 3 (coherence-gate) and Step 4 (perf gate). Then iterate on the
 remaining 7% gap to ≥120 tok/s.
 
+## 2026-05-06 cont. — decode profiling for the 7% gap
+
+Goal: localize the bottleneck for the remaining 7% (112.6 → ≥120 tok/s)
+before sinking effort into a particular optimization. Profile both
+end-to-end (kernel time breakdown via the in-process profiler) and
+GPU-internal (rocprofv3 counters: spills, L2, LDS).
+
+### Decode-loop profile (in-process, gen=50, 9B Lloyd-MQ3, GRAPH=0)
+
+Added `HIPFIRE_PROFILE_DECODE=1` to `bench_qwen35_mq4` (wraps the timed
+gen loop in `rdna_compute::profile::start/stop`; distinct from the
+existing `HIPFIRE_PROFILE=1` which only profiles prefill). Also added
+profile timer wrapping to `gemv_mq3g256_lloyd` dispatch (was previously
+un-instrumented; profile cost is one atomic load when off).
+
+Total profiled time (50 tokens): 610.7ms; wall: 1035 ms. Profiler adds
+~50% overhead via per-launch sync, so absolute tok/s under profile (48
+vs unprofiled 112) isn't comparable — the ratios are.
+
+| Kernel | Time | % | BW | Per-call | Launches |
+|---|---:|---:|---:|---:|---:|
+| **gemv_mq3g256_lloyd** | **386.2ms** | **63.2%** | **420 GiB/s** | **31µs** | 12450 |
+| fused_rmsnorm_mq_rotate | 55.0ms | 9.0% | 2.8 GiB/s | 17µs | 3200 |
+| mq_rotate_x | 28.4ms | 4.6% | 7.2 GiB/s | 9µs | 3250 |
+| add_inplace_f32 | 27.1ms | 4.4% | 5.4 GiB/s | 8µs | 3200 |
+| gated_delta_net_q8 | 17.5ms | 2.9% | 73.1 GiB/s | 15µs | 1200 |
+| silu_mul_f32 | 13.9ms | 2.3% | 15.9 GiB/s | 9µs | 1600 |
+| fused_qk_l2_norm_scale_f32 | 13.0ms | 2.1% | 2.8 GiB/s | 11µs | 1200 |
+| gated_norm_f32 | 12.5ms | 2.0% | 5.9 GiB/s | 10µs | 1200 |
+| fused_sigmoid_alpha_gate_f32 | 11.0ms | 1.8% | 0.1 GiB/s | 9µs | 1200 |
+| conv1d_silu_split_f32_n | 10.9ms | 1.8% | 40.2 GiB/s | 9µs | 1200 |
+| repeat_interleave_qk_f32 | 10.6ms | 1.7% | 5.2 GiB/s | 9µs | 1200 |
+| (12 more, each <2%) | 35.6ms | 5.8% | varies | varies | varies |
+
+**Lloyd GEMV is 63% of decode at 420 GiB/s** — already in-regime for
+small-batch GEMV (RDNA3 typical ceiling is 50-60% of theoretical 960
+GB/s peak). 12,450 launches / 50 tokens = 249 GEMVs per token (32
+layers × ~8 GEMVs/layer for QKV/O/gate/up/down).
+
+The next-largest bucket is the `fused_rmsnorm_mq_rotate` at 9% —
+**but only 2.8 GiB/s** (very low). That's compute-bound on the FWHT,
+not memory-bound; bandwidth ratio doesn't apply.
+
+### GPU-internal counters (rocprofv3 on gfx1100)
+
+Ran `rocprofv3 --kernel-include-regex 'gemv_mq3g256_lloyd'` against the
+bench. 12,699 dispatches captured.
+
+**Register file:** clean across three checks.
+
+| Check | Source | Result |
+|---|---|---|
+| Static .s | `.vgpr_spill_count` | 0 |
+| Static .s | `.sgpr_spill_count` | 0 |
+| rocprof per-dispatch | `Scratch_Size` | 0 (all 12,699 launches) |
+
+VGPR allocation: 80 (rocprof's hardware allocation-granular round of
+the .s file's 74). Below the 96-VGPR/wave ceiling for 16-way
+occupancy on gfx1100's 1536-VGPR/SIMD file. **No register pressure to
+address.**
+
+**LDS:** clean by design.
+
+- `LDS_Block_Size: 512` (declared 128 B for `cb_lds[32]`; HIP loader
+  appears to round up to 512 — well below 64 KB budget per CU).
+- rocprof `LDSBankConflict`: 0 across all dispatches (matches the
+  fp32-spans-8-banks design rationale; same-q reads broadcast on
+  RDNA3, distinct-q reads spread across 8 distinct banks).
+
+**L2 cache:** structural ceiling, not a kernel-tuning issue.
+
+- 9B model weights: 4.25 GB. 7900 XTX L2: 6 MB. Working set exceeds
+  L2 by ~700×.
+- For decode (each token reads ALL weights exactly once), weight L2
+  hit rate is fundamentally ~0% — there's nothing to cache.
+- Activation vector x[] (~16 KB) fits trivially; its L2 hit rate is
+  ~100% naturally.
+- 420 GiB/s achieved = 47% of theoretical 960 GB/s. Real ceiling for
+  this kernel shape on RDNA3 is 50-60% (bookended by HFQ4-G256 numbers
+  in `tests/speed-baselines/gfx1100.txt`). **There IS some room here**
+  — codebook prefetch across the quad boundary or wider unroll could
+  push toward 480-500 GiB/s, which would be ~5-7% perf at the
+  end-to-end level.
+
+**Other counters problematic:** rocprofv3 returned 0 for
+`L2CacheHit`/`LDSBankConflict`/`MemUnitBusy`/`MeanOccupancyPerActiveCU`/
+`SQ_INSTS_VALU` etc. across multiple invocation patterns
+(`-i`/`--pmc`/single-counter/multi-counter). `SQ_WAVES` did populate
+correctly (avg 6728 waves/dispatch, max 248K). The non-populating
+counters appear to be a rocprofv3-on-gfx1100 quirk on ROCm 7.2 rather
+than a kernel issue — they returned 0 even on `__amd_rocclr_copyBuffer`
+(which definitely uses VALU). Static analysis covered the same
+questions.
+
+### Findings → optimization decision
+
+1. No register/LDS issues to fix. The kernel is structurally clean.
+2. Lloyd GEMV is dominant (63%); pushing its bandwidth higher is
+   highest single-lever ROI but the gain is bounded by the structural
+   ceiling (~5-7% best case from 47% → 52-55% of peak).
+3. **Residual fusion is the cleanest and most-confident win.**
+   `add_inplace_f32` at 4.4% (27.1ms) immediately after attn-O and
+   FFN-down would disappear if `gemv_mq3g256_lloyd_residual` existed
+   (initialize acc from y[row] instead of 0). Mirrors the existing
+   `gemv_hfq3g256_residual` pattern.
+4. Fused gate+up / fused QKV (already exist for MQ4) would reduce
+   launch overhead but require new kernel files.
+
+**Next concrete:** ship residual-fusion variant of the Lloyd-MQ3 GEMV
++ wire through the FFN-down / attn-O dispatch arms in llama.rs.
+Expected gain: ~4% (eliminates ~27ms over 50 tokens).
+
+### Residual fusion result — gain is within noise (lesson logged)
+
+Shipped `gemv_mq3g256_lloyd_residual.{,gfx1100.}hip`, wired through
+`weight_gemv_residual` MQ3G256Lloyd arm in `llama.rs`. Correctness
+verified: 4B Lloyd-MQ3 ppl=13.1804 (bit-identical to pre-fusion run).
+
+Decode profile (gen=50, GRAPH=0, before vs after):
+
+```
+                                BEFORE    AFTER     Δ
+gemv_mq3g256_lloyd              386.2ms   278.5ms   −107.7ms (3200 calls shifted out)
+gemv_mq3g256_lloyd_residual     —         107.5ms   +107.5ms (3200 NEW calls)
+add_inplace_f32                  27.1ms    —        −27.1ms  (eliminated)
+TOTAL serialized                610.7ms   582.2ms   −28.5ms  (4.7% serial save)
+```
+
+Residual variant runs ~4 µs/call slower (34 vs 31 µs) — single-thread
+`y[row] += acc` adds one global read + add + write at the end. Net of
+shifted-call cost vs eliminated `add_inplace_f32` launches: −28.5ms
+in profile, matches the 4.4% prediction.
+
+**But unprofiled tok/s: 112.6 → 113.2 (within session noise).**
+
+Lesson: **profile-attribution overestimates wall-time savings for
+small kernels that pipeline-overlap the dominant GEMV.** The
+profiler's per-launch event-sync forces serialization; in normal
+graph-mode execution, `add_inplace_f32` was already running in
+parallel with the surrounding work, so eliminating it didn't shorten
+the wall-time critical path.
+
+Implication for the 7% gap: serial-profile-share is not a reliable
+lever for optimization here. Real wall-time gains need either:
+- **Reduced GEMV per-call latency** (codebook prefetch across quad
+  boundary, wider unroll K8) — directly shortens the critical path
+- **Reduced GEMV launch count** (fused QKV / fused gate+up — exists
+  for MQ4, not yet for Lloyd-MQ3) — reduces both per-kernel overhead
+  and synchronization barriers between launches
+- **Higher GEMV bandwidth utilization** (currently 47% of theoretical
+  peak; structural ceiling is ~50-60% on RDNA3 small-batch GEMV)
+
+Keeping the residual fusion as committed. It's correct, clean,
+matches the rest of the codebase pattern, and removes per-step
+alloc+free churn — but the headline tok/s number is unchanged.
+
+### Status
+
+- [x] Step 0 — bench harness
+- [x] Step 0a — disassembly preflight
+- [x] Step 1 — build clean
+- [x] Step 2 — ppl correctness vs baseline
+- [x] Step 2.5 — VGPR budget
+- [x] Step 2.6 — tail K-sweep
+- [x] Step 3 — coherence-gate
+- [x] Step 4b — launch_maybe_blob migration
+- [x] Decode profiling — Lloyd GEMV is 63%, no register/LDS issues
+- [x] Residual fusion — correct, 0.5% wall (4.7% profile-attribution)
+- [ ] Step 4 — cross-process perf gate (≥120 tok/s; currently 113.2)
+
+7% gap remains. Next levers: kernel-internal optimization (codebook
+prefetch, wider unroll) or fusion-across-GEMVs (QKV / gate+up).
+
+### Files touched
+
+- `crates/hipfire-runtime/examples/bench_qwen35_mq4.rs` — added
+  `HIPFIRE_PROFILE_DECODE=1` switch to profile the gen loop.
+- `crates/rdna-compute/src/profile.rs` — added
+  `gemv_mq3g256_lloyd_bytes()` byte counter.
+- `crates/rdna-compute/src/dispatch.rs` — wrapped `gemv_mq3g256_lloyd`
+  dispatch with `begin_timer`/`finish` for profile attribution.
+

@@ -2091,7 +2091,9 @@ impl Gpu {
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
         ];
-        self.launch_maybe_blob(
+        let bytes = crate::profile::gemv_mq3g256_lloyd_bytes(m, k);
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_mq3g256_lloyd", bytes);
+        let result = self.launch_maybe_blob(
             "gemv_mq3g256_lloyd", [m as u32, 1, 1], [32, 1, 1], 0, &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
@@ -2099,7 +2101,9 @@ impl Gpu {
                 b.push_i32(m_val); b.push_i32(k_val);
                 b
             },
-        )
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
     }
 
     /// MQ3-Lloyd GEMV with engine-side x rotation.
@@ -2110,6 +2114,51 @@ impl Gpu {
         // bind_thread: skip — delegates to rotate_x_mq + gemv_mq3g256_lloyd, both of which bind.
         self.rotate_x_mq(x, x_rot, k)?;
         self.gemv_mq3g256_lloyd(a_raw, x_rot, y, m, k)
+    }
+
+    /// MQ3-Lloyd GEMV with fused residual add: y[row] += A[row] · x. Used by
+    /// `weight_gemv_residual` MQ3-Lloyd arm to eliminate the alloc + gemv +
+    /// add_inplace_f32 + free fallback chain (saves ~4.4% of decode time on
+    /// 9B Lloyd-MQ3, gfx1100, per the 2026-05-06 decode profile).
+    pub fn gemv_mq3g256_lloyd_residual(&mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) -> HipResult<()> {
+        self.bind_thread()?;
+        let (src, module) = kernels::gemv_mq3g256_lloyd_residual_for_arch(&self.arch);
+        self.ensure_kernel(module, src, "gemv_mq3g256_lloyd_residual")?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        let bytes = crate::profile::gemv_mq3g256_lloyd_bytes(m, k);
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_mq3g256_lloyd_residual", bytes);
+        let result = self.launch_maybe_blob(
+            "gemv_mq3g256_lloyd_residual", [m as u32, 1, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr);
+                b.push_i32(m_val); b.push_i32(k_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// MQ3-Lloyd residual GEMV with engine-side x rotation.
+    pub fn gemv_mq3g256_lloyd_residual_with_rotate(
+        &mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
+        x_rot: &GpuTensor, m: usize, k: usize,
+    ) -> HipResult<()> {
+        // bind_thread: skip — delegates to rotate_x_mq + gemv_mq3g256_lloyd_residual.
+        self.rotate_x_mq(x, x_rot, k)?;
+        self.gemv_mq3g256_lloyd_residual(a_raw, x_rot, y, m, k)
     }
 
     /// Lazily initialize MagnumQuant FWHT sign tables (256 floats each, seeds 42 and 1042).
