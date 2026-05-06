@@ -714,6 +714,63 @@ is also unbuildable, the priority order changes again. Treat this
 as Priority 0.5 — between the baseline measurement and any kernel
 work.
 
+### 5.5 Audit results (2026-05-06)
+
+Build-tested every MQ / HFQ6 / HFQ8 kernel that the gfx906 dispatch
+routing requests, plus a sample of WMMA / dot2 kernels for
+gate-correctness verification. All build via
+`hipcc --genco --offload-arch=gfx906 -O3` with the same flags the
+runtime uses.
+
+**14 dispatched-on-gfx906 kernels: all build clean.**
+
+| Kernel | Result | Notes |
+|---|---|---|
+| `gemv_mq8g256.hip` | ✓ post-`ee0fac6` | fixed by v3.1 errata |
+| `gemv_mq6g256.hip` | ✓ | shipped wave32 path |
+| `gemv_mq4g256.hip` | ✓ | shipped (PR #158) |
+| `gemv_hfq6g256.hip` | ✓ | shipped wave32 |
+| `gemv_hfq6g256_residual.hip` | ✓ | shipped wave32 |
+| `gemv_hfq8g256.hip` | ✓ | shipped wave32 |
+| `gemm_hfq6g256_residual.hip` | ✓ | shipped FP32 batched |
+| `gemm_hfq6g256_residual_fp16.hip` | ✓ | shipped FP16 batched |
+| `gemm_qkvza_hfq6g256.hip` | ✓ | shipped fused batched |
+| `gemm_qkv_hfq6g256.hip` | ✓ | shipped fused batched |
+| `gemm_gate_up_hfq6g256.hip` | ✓ | shipped fused batched |
+| `kv_cache_write_int8.hip` | ✓ | KV cache write path |
+| `fused_rmsnorm_mq_rotate.hip` | ✓ | activation-rotate prepass |
+| `fused_silu_mul_mq_rotate.hip` | ✓ | activation-rotate prepass |
+
+**WMMA kernels: build FAIL on gfx906, gates are required and correct.**
+
+| Kernel | gfx906 build | Gate |
+|---|---|---|
+| `gemm_hfq4g256_residual_wmma.hip` | ✗ (`gfx11-insts,wavefrontsize32`) | `has_wmma_f16` (gfx11+) ✓ |
+| `gemm_qkvza_hfq4g256_wmma.hip` | ✗ (same) | `has_wmma_f16` ✓ |
+| `gemm_gate_up_hfq6g256_wmma.hip` | ✗ (same) | `has_wmma_f16` ✓ |
+
+**dot2 kernels: build OK on gfx906, but dispatch is gated to RDNA2+.**
+
+| Kernel | gfx906 build | Dispatch gate |
+|---|---|---|
+| `gemm_gate_up_hfq4g256_dot2.hip` | ✓ | `has_dot2_f32_f16()` allowlist excludes gfx906 |
+| `gemm_gate_up_hfq6g256_dot2.hip` | ✓ | same |
+
+The `dot2` allowlist at `crates/rdna-compute/src/dispatch.rs:123-130`
+explicitly omits gfx906 despite gfx906 hardware supporting
+`v_dot2_f32_f16` (it carries the `dot2-insts` feature in LLVM). This
+may be a missed FP16-GEMM optimization opportunity for gfx906 —
+unmeasured. Treat as a **deferred Phase B candidate** for the MQ6 /
+HFQ6 batched GEMM surface, not a blocker. Whether it beats the
+current wave32 FP32 path on gfx906 is a PMC-gated experiment.
+
+**Conclusion: no further audit-driven plan changes.** The `sudot4`
+bug in `gemv_mq8g256.hip` was a one-off, caused by the kernel being
+authored on RDNA3+ hardware without a gfx906 build-test in the loop.
+The audit confirms every other "shipped on gfx906" claim in §3.1 /
+§3.2 is build-verified. Phase A estimates can be treated as
+load-bearing again.
+
 ---
 
 ## 6. What's not blocked by this analysis
