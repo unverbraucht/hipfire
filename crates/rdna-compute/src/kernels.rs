@@ -57,6 +57,11 @@ pub const FUSED_GATE_UP_MQ3G256_LLOYD_GFX1100_SRC: &str = include_str!("../../..
 /// Mirrors fused_qkvza_hfq4g256.hip.
 pub const FUSED_QKVZA_MQ3G256_LLOYD_SRC: &str = include_str!("../../../kernels/src/fused_qkvza_mq3g256_lloyd.hip");
 pub const FUSED_QKVZA_MQ3G256_LLOYD_GFX1100_SRC: &str = include_str!("../../../kernels/src/fused_qkvza_mq3g256_lloyd.gfx1100.hip");
+/// MQ3G256Lloyd fused QKV GEMV: three FA-preamble GEMVs (wq + wk + wv) in
+/// one launch. Saves 2 launches per FA layer per token. Mirrors
+/// fused_qkv_hfq4g256.hip — sibling of fused_qkvza for FullAttention.
+pub const FUSED_QKV_MQ3G256_LLOYD_SRC: &str = include_str!("../../../kernels/src/fused_qkv_mq3g256_lloyd.hip");
+pub const FUSED_QKV_MQ3G256_LLOYD_GFX1100_SRC: &str = include_str!("../../../kernels/src/fused_qkv_mq3g256_lloyd.gfx1100.hip");
 
 /// Returns the MQ3G256-Lloyd GEMV kernel source AND module name for the given
 /// arch. gfx1100/1101/1102 (RDNA3) gets the K4-unrolled + LDS-codebook variant
@@ -121,6 +126,20 @@ pub fn fused_qkvza_mq3g256_lloyd_for_arch(arch: &str) -> (&'static str, &'static
             (FUSED_QKVZA_MQ3G256_LLOYD_GFX1100_SRC, "fused_qkvza_mq3g256_lloyd_rdna3")
         }
         _ => (FUSED_QKVZA_MQ3G256_LLOYD_SRC, "fused_qkvza_mq3g256_lloyd"),
+    }
+}
+
+/// Arch dispatch for fused QKV MQ3-Lloyd. Used by `qwen35.rs` FA decode
+/// when wq, wk, wv are all MQ3G256Lloyd to collapse 3 GEMV launches into 1.
+pub fn fused_qkv_mq3g256_lloyd_for_arch(arch: &str) -> (&'static str, &'static str) {
+    if std::env::var("HIPFIRE_LLOYD_FORCE_BASELINE").ok().as_deref() == Some("1") {
+        return (FUSED_QKV_MQ3G256_LLOYD_SRC, "fused_qkv_mq3g256_lloyd");
+    }
+    match arch {
+        "gfx1100" | "gfx1101" | "gfx1102" => {
+            (FUSED_QKV_MQ3G256_LLOYD_GFX1100_SRC, "fused_qkv_mq3g256_lloyd_rdna3")
+        }
+        _ => (FUSED_QKV_MQ3G256_LLOYD_SRC, "fused_qkv_mq3g256_lloyd"),
     }
 }
 

@@ -2274,6 +2274,66 @@ impl Gpu {
         result
     }
 
+    /// Fused QKV MQ3-Lloyd: 3 FA-preamble GEMVs in one launch. Used by
+    /// qwen35.rs FullAttention decode when wq + wk + wv are all
+    /// MQ3G256Lloyd. Sibling of `fused_qkvza_mq3g256_lloyd` for the
+    /// 3-projection FA case (vs LA's 4-projection QKVZA). Caller is
+    /// responsible for pre-rotating x; the kernel only does the GEMVs.
+    pub fn fused_qkv_mq3g256_lloyd(
+        &mut self,
+        a_q: &GpuTensor, a_k: &GpuTensor, a_v: &GpuTensor,
+        x: &GpuTensor,
+        y_q: &GpuTensor, y_k: &GpuTensor, y_v: &GpuTensor,
+        q_m: usize, k_m: usize, v_m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let (src, module) = kernels::fused_qkv_mq3g256_lloyd_for_arch(&self.arch);
+        self.ensure_kernel(module, src, "fused_qkv_mq3g256_lloyd")?;
+        let aq = a_q.buf.as_ptr();
+        let ak = a_k.buf.as_ptr();
+        let av = a_v.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let yq = y_q.buf.as_ptr();
+        let yk = y_k.buf.as_ptr();
+        let yv = y_v.buf.as_ptr();
+        let q_m_i = q_m as i32;
+        let k_m_i = k_m as i32;
+        let v_m_i = v_m as i32;
+        let k_i = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &aq as *const _ as *mut c_void, &ak as *const _ as *mut c_void,
+            &av as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yq as *const _ as *mut c_void, &yk as *const _ as *mut c_void,
+            &yv as *const _ as *mut c_void,
+            &q_m_i as *const _ as *mut c_void, &k_m_i as *const _ as *mut c_void,
+            &v_m_i as *const _ as *mut c_void,
+            &k_i as *const _ as *mut c_void,
+        ];
+        let total = (q_m + k_m + v_m) as u32;
+        // Bandwidth: 3 weight matrices read once each, x shared (read once).
+        let bytes = crate::profile::gemv_mq3g256_lloyd_bytes(q_m, k)
+            + crate::profile::gemv_mq3g256_lloyd_bytes(k_m, k)
+            + crate::profile::gemv_mq3g256_lloyd_bytes(v_m, k)
+            - 2 * (k * 4); // x is shared, don't triple-count
+        let timer = crate::profile::begin_timer(&self.hip, "fused", "fused_qkv_mq3g256_lloyd", bytes);
+        let result = self.launch_maybe_blob(
+            "fused_qkv_mq3g256_lloyd", [total, 1, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(aq); b.push_ptr(ak); b.push_ptr(av);
+                b.push_ptr(xp);
+                b.push_ptr(yq); b.push_ptr(yk); b.push_ptr(yv);
+                b.push_i32(q_m_i); b.push_i32(k_m_i); b.push_i32(v_m_i);
+                b.push_i32(k_i);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// Lazily initialize MagnumQuant FWHT sign tables (256 floats each, seeds 42 and 1042).
     pub fn ensure_mq_signs(&mut self) -> HipResult<()> {
         self.bind_thread()?;
