@@ -3275,8 +3275,6 @@ impl Gpu {
     /// add_inplace_f32 follow-up launch can be elided.
     pub fn gemv_hfq6g256_residual(&mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel("gemv_hfq6g256_residual", kernels::GEMV_HFQ6G256_RESIDUAL_SRC, "gemv_hfq6g256_residual")?;
-        let func = &self.functions["gemv_hfq6g256_residual"];
         let mut a_ptr = a_raw.buf.as_ptr(); let mut x_ptr = x.buf.as_ptr(); let mut y_ptr = y.buf.as_ptr();
         let mut m_val = m as i32; let mut k_val = k as i32;
         let mut params: Vec<*mut c_void> = vec![
@@ -3284,6 +3282,24 @@ impl Gpu {
             &mut y_ptr as *mut _ as *mut c_void, &mut m_val as *mut _ as *mut c_void,
             &mut k_val as *mut _ as *mut c_void,
         ];
+
+        // Wave64-native fast path (gfx906/908/94x): 2 rows per block, halves
+        // grid.x. Mirrors the HFQ4 sibling at line ~5378. Plan §3.1.1 item 2
+        // (gfx906-mq6-mq8-port.md v3.2.1). Byte-exact with the wave32 base
+        // since each warp's 32-lane reduction stays in-warp.
+        if has_wave64_native(&self.arch) {
+            self.ensure_kernel(
+                "gemv_hfq6g256_residual_wave64",
+                kernels::GEMV_HFQ6G256_RESIDUAL_WAVE64_SRC,
+                "gemv_hfq6g256_residual_wave64",
+            )?;
+            let func = &self.functions["gemv_hfq6g256_residual_wave64"];
+            let grid = ((m as u32) + 1) / 2;
+            return unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [64, 1, 1], 0, self.stream_ref(), &mut params) };
+        }
+
+        self.ensure_kernel("gemv_hfq6g256_residual", kernels::GEMV_HFQ6G256_RESIDUAL_SRC, "gemv_hfq6g256_residual")?;
+        let func = &self.functions["gemv_hfq6g256_residual"];
         unsafe { self.hip.launch_kernel(func, [m as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
     }
 
