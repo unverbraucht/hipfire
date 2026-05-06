@@ -1152,15 +1152,115 @@ Lloyd GEMVs (one big + one medium + 2 tiny) into one launch lets the
 2 tiny ones co-schedule with the big body in the same wave-dispatch
 window, AND eliminates 3 launch overheads per layer.
 
-### Bonus finding still on the table
+### Step 7 — Fused QKV MQ3-Lloyd (FA decode), comfort margin above the gate
 
-The 5× prefill gap (~108 vs 493 tok/s for MQ4) remains the biggest
-real-workload lever. Out of scope for this PR; documented in
-`docs/plans/mq-lloyd-batched-prefill-followup.md`. Also worth noting
-on followup: a **fused QKV MQ3-Lloyd for FA decode** (~8 layers ×
-3→1 launches) is the natural sibling of fused QKVZA — smaller
-fraction of decode time (FA is 8/32 layers) but mechanically the
-same pattern; estimated ~0.5-1% additional wall.
+Sibling of fused QKVZA for FA layers. Same launch-amortization pattern,
+smaller scope (8 FA vs 24 LA layers).
+
+Shipped `kernels/src/fused_qkv_mq3g256_lloyd.{,gfx1100.}hip` mirroring
+`fused_qkv_hfq4g256.hip`: grid = q_m + k_m + v_m blocks, conditional
+A/y routing by gid range, K4 + LDS body. Wired through the standard
+trio (kernels.rs selector, dispatch.rs arm, 5 FA-decode call sites in
+qwen35.rs).
+
+PPL=13.1804 unchanged. VGPR/spills/LDS identical to standalone GEMV.
+
+Bench (5 runs, gen=30, GRAPH=1):
+```
+gen_tok_s = 121.7 / 121.8 / 121.6 / 122.1 / 121.1   (avg 121.7)
+bw_gib_s  = 517.6 / 518.2 / 517.4 / 519.3 / 515.0
+```
+
+Profile delta on standalone `gemv_mq3g256_lloyd`: **1250 → 50 calls**
+per 50 tokens. The remaining 50 calls are exactly the lm_head (1/token).
+And lm_head hits **660 µs / 629 GiB/s = 70% peak BW** — single-very-
+large-GEMV is the ideal case for this kernel architecture, definitively
+proving the kernel body itself is excellent and the earlier 364 GiB/s
+average really was launch-amortization noise from the small-call mix.
+
+### Final cumulative journey (final, post all wins)
+
+```
+baseline (pre-Lloyd-rewrite):       42.9 tok/s
+K4 + LDS gfx1100 kernel:           112.6 tok/s   (2.62× — original headline)
+residual fusion:                   113.2          (+0.5%, noise)
+swiglu_residual MQ3-Lloyd arm:     113.3          (+0.1%, noise)
+fused gate+up Lloyd-MQ3:           115.0          (+1.5%, real)
+fused QKVZA Lloyd-MQ3 (LA):        120.8          (+5.0%, gate cleared)
+fused QKV   Lloyd-MQ3 (FA):        121.7          (+0.7%, comfort margin)
+
+Total: 2.84× from baseline. Ship gate ≥120 tok/s cleared with
+1.7 tok/s margin.
+```
+
+## Future work — consolidated checklist
+
+In rough ROI order. Documented here so someone picking up this branch
+later doesn't have to re-derive the analysis.
+
+### A. Batched Lloyd-prefill kernels (BIGGEST real-world lever)
+
+Currently 9B Lloyd-MQ3 prefill = 108 tok/s; 9B MQ4 prefill = 493 tok/s.
+**5× gap.** Lloyd takes the per-token forward_scratch fallback because
+`is_batchable_la` excludes the dtype (no batched-MQ3-Lloyd kernels
+exist). Closing this requires the full path described in
+`docs/plans/mq-lloyd-batched-prefill-followup.md`:
+
+1. Write `gemm_qkvza_mq3g256_lloyd_wmma.gfx1100.hip` (and similar for
+   FA QKV, gate+up, residual w_down) — ports the K4+LDS body to a
+   batched B>1 GEMM shape. Probably needs the WMMA family (the
+   MQ3 batched kernel uses `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32`).
+2. Add `MQ3G256Lloyd` to `is_batchable_la` allowlist.
+3. Add Lloyd-specific dispatch arms in the existing `is_mq* matchers`
+   (qwen35.rs lines 4063+, 4360+, 4768, 4919) — not just the matchers,
+   the GEMM call selection too.
+4. Test end-to-end with long-prompt coherence battery (>16 tokens to
+   exercise batched path).
+
+Out-of-scope for #115. Multi-day effort. Highest top-line ROI for
+real prompt workloads.
+
+### B. Same as A, for MoE layers (issue #179 + Lloyd)
+
+If targeting MoE models with MQ3 (plain or Lloyd), the MoE-LA matcher
+at `qwen35.rs:4768` and MoE-FA at `:4919` need MQ3 + MQ3-Lloyd entries
+plus `gemm_qkvza_hfq3g256_wmma`-family dispatch arms. Currently dead
+code (`moe_ffn_all_mq4` gates non-MQ4 MoE off the batched path).
+Issue #179 from upstream.
+
+### C. Small-kernel chain fusions in the LA inner path
+
+The decode profile shows several small kernels at very low BW:
+
+| Kernel | Wall % | BW | Why low |
+|---|---:|---:|---|
+| `fused_sigmoid_alpha_gate_f32` | 2.0% | 0.1 GiB/s | Pure launch overhead, 28 KB/call |
+| `fused_qk_l2_norm_scale_f32` | 2.3% | 2.8 GiB/s | Small but not tiny |
+| `gated_norm_f32` | 2.3% | 5.6 GiB/s | Small |
+| `mq_rotate_x` | 2.6% | 3.7 GiB/s | Launch-bound |
+
+Per the lesson learned (small-overlapping fusion is profile-time-
+saving but wall-noise), each individually expected <0.5% wall. Fusing
+multiple of them into one mega-kernel could net ~1-2%, but the
+correctness surface area is large (each touches different LA state).
+Skip unless a specific profile-time concern pops up.
+
+### D. CDNA / RDNA1/2 follow-up
+
+`__builtin_amdgcn_global_load_lds` is supported on CDNA (gfx9xx,
+gfx94x) and RDNA1/2 (gfx1030) but NOT on RDNA3 (our target). On those
+archs an async-prefetch variant of the GEMV could deliver the
+latency-hiding the source-level prefetch couldn't on RDNA3. Recipe in
+`docs/plans/mq-lloyd-batched-prefill-followup.md` follow-up section.
+Estimated <5% wall on those archs; gfx906 is the most likely target.
+
+### E. Wider K8/K16 unroll on a future Lloyd kernel redesign
+
+K8 in the simple form regressed VGPR pressure to exactly 96 (the
+16-way occupancy ceiling on gfx1100) with no perf gain. A K8 variant
+that pairs with reduced VGPR usage (e.g., merged accumulators, packed
+intermediates) might give ILP without the occupancy cliff. Not
+attempted here. Nice-to-have, not gate-blocking.
 
 **Follow-up note for CDNA / RDNA1/2 maintainers:** the intrinsic's
 async-load semantics ARE available on those archs and could deliver
