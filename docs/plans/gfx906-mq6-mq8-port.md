@@ -771,6 +771,37 @@ The audit confirms every other "shipped on gfx906" claim in §3.1 /
 §3.2 is build-verified. Phase A estimates can be treated as
 load-bearing again.
 
+### 5.6 dot2 (`v_dot2_f32_f16`) gfx906 opportunity — deferred Phase B candidate
+
+The `has_dot2_f32_f16()` allowlist at `dispatch.rs:123-130` excludes
+gfx906 even though gfx906 hardware carries the `dot2-insts` feature
+(per LLVM `AMDGPUUsage`). The `gemm_*_dot2.hip` kernels build cleanly
+on gfx906 (§5.5). Adding gfx906 to the allowlist would shift dispatch
+behavior depending on the call site:
+
+| Quant family | Affected? | Why |
+|---|---|---|
+| **HFQ4 / MQ4** | No | gfx906 is `wave64-native` and takes the `cdna_wave64` branch *before* the dot2 fall-through. The change wouldn't reach this dispatch. |
+| **HFQ6 / MQ6** | **Yes** — batched-fused only | `gemm_qkvza_hfq6g256` / `gemm_qkv_hfq6g256` / `gemm_gate_up_hfq6g256` would swap from wave32 scalar FP32 → wave32 dot2 FP16 |
+| HFQ8 / MQ8 | No | no `*_dot2` kernel exists for HFQ8 |
+
+**Affected workloads** (HFQ6 / MQ6 only): batched fused GEMM at B>1.
+Specifically prefill + DFlash verify-pass through the gate_up / qkv /
+qkvza projection trio. Not AR decode (B=1 GEMV bypasses the dot2
+dispatch).
+
+**Bench protocol** (when this is taken up as a Phase B experiment):
+1. Baseline `bench_qwen35_mq4 qwen3.5-9b.mq6 --prefill 128 ...` on
+   the current wave32 scalar path.
+2. Add gfx906 to `has_dot2_f32_f16()` (one-line patch) and rebuild.
+3. Re-bench prefill tok/s and DFlash verify-share.
+4. AGENTS.md §5: 5-run fresh-process median, prompt md5, binary md5.
+   PMC pass to verify VALUBusy and v_dot2 issue rate match expectation.
+
+**Status: not in scope for the v3.1 plan.** Recorded here so a future
+agent doesn't duplicate the discovery work. Keep the allowlist
+conservative until the bench result lands.
+
 ---
 
 ## 6. What's not blocked by this analysis
