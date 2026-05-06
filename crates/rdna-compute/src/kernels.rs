@@ -41,6 +41,29 @@ pub const GEMV_MQ2G256_LLOYD_SRC: &str = include_str!("../../../kernels/src/gemv
 
 /// MQ3G256Lloyd: 3-bit + per-block 8-entry fp16 codebook (112 B/group).
 pub const GEMV_MQ3G256_LLOYD_SRC: &str = include_str!("../../../kernels/src/gemv_mq3g256_lloyd.hip");
+/// gfx1100 (RDNA3) variant: K4 unroll + LDS-resident codebook lookup.
+pub const GEMV_MQ3G256_LLOYD_GFX1100_SRC: &str = include_str!("../../../kernels/src/gemv_mq3g256_lloyd.gfx1100.hip");
+
+/// Returns the MQ3G256-Lloyd GEMV kernel source AND module name for the given
+/// arch. gfx1100/1101/1102 (RDNA3) gets the K4-unrolled + LDS-codebook variant
+/// that closes the per-launch perf gap from the divergent-execution switch.
+/// Other archs use the baseline (slower but correct switch-dispatch path).
+pub fn gemv_mq3g256_lloyd_for_arch(arch: &str) -> (&'static str, &'static str) {
+    // Debug escape hatch: HIPFIRE_LLOYD_FORCE_BASELINE=1 forces the slow generic
+    // switch-dispatch kernel even on RDNA3, so the K4+LDS variant can be
+    // logits-Δ'd against the baseline on the same model file. No perf cost when
+    // unset (one missed-getenv per dispatch arm), and ensure_kernel short-
+    // circuits after the first call regardless.
+    if std::env::var("HIPFIRE_LLOYD_FORCE_BASELINE").ok().as_deref() == Some("1") {
+        return (GEMV_MQ3G256_LLOYD_SRC, "gemv_mq3g256_lloyd");
+    }
+    match arch {
+        "gfx1100" | "gfx1101" | "gfx1102" => {
+            (GEMV_MQ3G256_LLOYD_GFX1100_SRC, "gemv_mq3g256_lloyd_rdna3")
+        }
+        _ => (GEMV_MQ3G256_LLOYD_SRC, "gemv_mq3g256_lloyd"),
+    }
+}
 
 
 /// HFQ8-G256: flat 8-bit with 256-weight groups.

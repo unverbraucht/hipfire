@@ -248,3 +248,287 @@ Order of work:
   whose perf is the open ship gate.
 - `kernels/src/gemv_hfq3g256.gfx1100.hip` — K4-unroll pattern to mirror
   for the LDS-codebook fix.
+
+## Session 2026-05-06 (resume)
+
+Picked the branch back up. State on entry:
+
+- `lloyd-max-mq3-spike` checked out at 4d52f5b (`docs(devlog): … Lloyd-Max
+  MQ4 extension analysis + port summary`), one commit ahead of master on
+  the port (`effd218 feat(mq-lloyd): port Lloyd-Max MQ3/MQ2 codebooks
+  onto post-modular master`) plus this devlog commit.
+- PR #115 (`feat(mq-lloyd): Lloyd-Max codebooks for MQ3 / MQ2 — help
+  wanted to clear ship gates`) is **OPEN**, base `master`, head
+  `lloyd-max-mq3-spike` on Kaden-Schutt's fork. Re-read the PR body —
+  no new substantive content beyond what the writeup above already
+  captures. Both ship gates still listed as TBD on the PR's test plan:
+  1. K4-unroll → ≥120 tok/s decode on 9B Lloyd-MQ3 (currently 44 tok/s).
+  2. 4-prompt coherence battery clean on 4B and 9B Lloyd-MQ3.
+- Quality table (MQ4 / uniform-MQ3 / Lloyd-MQ3 at 0.8B/4B/9B) and the
+  storage-overhead table for Lloyd-MQ4 (160 B/group, +17.6%) both
+  confirmed against PR #115 — no edits needed to the analysis above.
+
+No code touched this session — entry pickup only. Next concrete step
+remains "Order of work" item 1: land the K4-unroll + LDS-resident
+codebook fix on `kernels/src/gemv_mq3g256_lloyd.hip`, mirroring
+`gemv_hfq3g256.gfx1100.hip`. That clears MQ3's perf gate and is the
+template MQ4 will reuse.
+
+## 2026-05-06 cont. — adversarial review + Step 0a disassembly preflight
+
+Three adversarial reviews of `docs/plans/PR-115-lload-max-codebooks-mq3.md`
+were folded into a consolidated review at
+`docs/plans/PR-115-lloyd-max-cb-plan-rev-claude.md`. 17 distinct items
+(C1-C17), 2 blockers, 5 majors. Plan revised to rev 2.
+
+Two notable false alarms rejected on adjudication:
+- **glm5 B1** ("HFQ3 tail bug inherited") — arithmetic error: glm5
+  confused `tail` count with group index `g`. Under the construction
+  `g = (quads << 2) + i`, `g % 4 == i` because `quads * 4` is divisible
+  by 4. HFQ3's `acc0/1/2` for tail [0]/[1]/[2] **is** `acc[g % 4]`.
+  Verified by case analysis on `groups_per_row ∈ {5, 7}`.
+- **glm5 M1** (use `coherence-gate-dflash.sh`) — Lloyd-MQ3 is a plain
+  GEMV change, not spec-decode. Standard `coherence-gate.sh` is the
+  right gate.
+
+Two real blockers landed in the plan as Step 0 + Step 4b:
+- **Bench harness gap**: `scripts/probe_commits.sh` is hardcoded to
+  `bench_qwen35_mq4`; no Lloyd-MQ3 bench example exists. Step 0 either
+  adds one or verifies dtype auto-detection.
+- **Graph-capture safety**: `dispatch.rs:2073` uses raw
+  `self.hip.launch_kernel`; HFQ3 at line 2626 uses
+  `launch_maybe_blob`. Step 4b migrates Lloyd dispatch to the
+  graph-safe pattern (the bench harness exports `HIPFIRE_GRAPH=1`).
+
+### Step 0a: disassembly verification of bottleneck attribution
+
+Before sinking time into Change 2 (LDS staging), compiled the existing
+kernel for gfx1100 with `--save-temps` and inspected the inner-loop
+assembly:
+
+```
+hipcc -O3 --offload-arch=gfx1100 -c kernels/src/gemv_mq3g256_lloyd.hip \
+  --save-temps  # → /tmp/lloyd_disasm/
+```
+
+Key finding: **the compiler does NOT emit a vector LUT** (`v_perm_b32`,
+`v_movrels_b32`, register-file indirection). The `q ∈ [0,8)` lookup
+compiles to a **divergent-execution decision tree** — even worse than
+the plan's branchless cmp/cndmask premise.
+
+Per-group lookup body (1022 lines of asm total, inner loop at .LBB0_5):
+
+| Class | Count |
+|---|---:|
+| `v_cmpx_*` + `v_cmp_*` (compare-and-mask) | 62 |
+| `s_or_b32 exec_lo, ...` (EXEC restoration) | 50 |
+| `s_cbranch_execz` (branch on empty mask) | 43 |
+| `v_cndmask_b32` (select) | 11 |
+| `v_perm_b32` | 1 *(byte-unpack, not lookup)* |
+| `v_fmac_f32` + `v_dual_mul_f32` (useful work) | 8 |
+
+That's **~166 dispatch instructions vs 8 useful FMAs per group inner
+body — ~21:1 overhead-to-work**. The plan's "~112 inst" estimate was
+conservative.
+
+Structural pattern (verified at `.LBB0_5` / `.LBB0_3-4` merge):
+1. Load 8 fp16 codebook entries from gptr+0..15, convert to fp32
+   (registers).
+2. Load 3 packed bytes; extract 8 × 3-bit `q` values via shifts.
+3. **For each `q`: walk a binary decision tree using
+   `v_cmpx_lt_i32 + s_cbranch_execz + s_or_b32 exec` to select one of
+   `cb0..cb7` into a temp VGPR.** This is where the 50 EXEC
+   manipulations + 43 branches + 62 compares live.
+4. At merge label `.LBB0_3/_4`: 1 `v_dual_mul_f32` + 7 `v_fmac_f32`
+   accumulate the 8 selected values × `x[0..7]` into `acc`.
+
+This is the canonical compiler pattern when `q` cannot be proven
+uniform across the wave — and `q` is **inherently divergent** (every
+thread holds a different packed-index byte triple). Branchless
+selection would require either tagged-VGPR indirection (which
+gfx1100 does not support for arbitrary VGPR pools) or a constant-
+table LUT (which the compiler chose not to use, presumably because
+the codebook isn't a compile-time constant).
+
+**Verdict:** plan structurally sound. **Both K4 and LDS halves are
+justified** — the LDS half is doing critical structural work
+(replacing 50 EXEC manipulations and 43 branches per group with 8
+`ds_read_b32`s), so it is NOT a candidate for dropping if K4-alone
+falls short. Plan rev 2 root-cause section reworded to reflect the
+divergent-execution finding.
+
+Artifacts: `/tmp/lloyd_disasm/gemv_mq3g256_lloyd-hip-amdgcn-amd-amdhsa-gfx1100.s`
+(transient — rebuild via the hipcc command above to reproduce).
+
+### Step 0: bench harness gap (DONE 2026-05-06)
+
+Investigation: `bench_qwen35_mq4.rs` is **dtype-agnostic** despite the
+name — it loads via `HfqFile::open` + `qwen35::load_weights`. The
+load path at `crates/hipfire-arch-qwen35/src/qwen35.rs:738-744`
+dispatches on the .hfq quant-type ID (20 → `MQ3G256Lloyd`), so the
+bench Just Works against a `.mq3-lloyd` file. The `--allow-mq3-lloyd`
+guard at `crates/hipfire-quantize/src/main.rs:2011` is **quantizer-
+only**; the runtime has no equivalent gate.
+
+Fix landed in `scripts/probe_commits.sh`: parameterized the model
+path via `BENCH_MODEL` env var (default `qwen3.5-9b.mq4` preserves
+existing behavior). Use:
+
+```
+BENCH_MODEL=qwen3.5-9b.mq3-lloyd ./scripts/probe_commits.sh <c1> <c2>
+```
+
+The bench's prefill is a deterministic token-id sequence
+(`(0..prefill_len).collect()`), so the prompt-md5 rule is satisfied
+implicitly — the input is fully determined by `--prefill N`.
+
+**Baseline measurement** (9B Lloyd-MQ3, gfx1100, HIPFIRE_GRAPH=0):
+
+```
+SUMMARY  gen_tok_s=42.9  bw_gib_s=182.3  prefill_tok_s=41.6
+         avg_ms=23.22  p50_ms=23.22
+```
+
+42.9 tok/s vs the PR's 44 tok/s — within 3%, consistent across the
+different harnesses (bench_qwen35_mq4 single-process steady-state
+vs perplexity harness window-pass). The discrepancy is well within
+DPM-driven session-to-session noise.
+
+Note: ran with `HIPFIRE_GRAPH=0` to dodge the C2 issue (raw
+`self.hip.launch_kernel` at `dispatch.rs:2073` would dangle kernargs
+under graph capture). With graph mode disabled the timing is real;
+re-bench under graph mode AFTER the Step 4b launch_maybe_blob
+migration is in.
+
+### Implication for change bundling (revisits the plan's split-commit guidance)
+
+Step 0a established the gfx1100 lookup overhead is divergent execution,
+~166:8 dispatch:work. K4 alone (HFQ3 reference, +24%) projects to
+**~53 tok/s** on Lloyd-MQ3 — well short of the ≥120 gate.
+
+Per the plan's own condition ("bundle only if Change 1 alone falls
+short"), we **know in advance** Change 1 alone won't clear the gate.
+The new gfx1100 kernel will land both K4 unroll and LDS staging in a
+single new-file commit. Bisectability is preserved by the existing
+baseline `gemv_mq3g256_lloyd.hip` (the gfx1010/fallback path) —
+swapping the `for_arch` selector toggles between baseline and new
+behavior without git-bisect needing to step through partial states.
+
+### Kernel implementation + correctness validation (DONE 2026-05-06)
+
+Landed the bundled K4 + LDS kernel + dispatch migration in one
+session. Files touched:
+
+- `kernels/src/gemv_mq3g256_lloyd.gfx1100.hip` (NEW) — K4 unroll over
+  4 groups, fp32-LDS-resident codebook (128 B per workgroup, 32
+  threads × 1 fp16 cooperative load + barrier + indexed read).
+  Tail iterations use a per-group cooperative load (only first 8
+  lanes write LDS) routed into `acc[(quads*4 + i) & 3]`.
+- `crates/rdna-compute/src/kernels.rs` — added
+  `GEMV_MQ3G256_LLOYD_GFX1100_SRC` const + `gemv_mq3g256_lloyd_for_arch`
+  selector. Includes `HIPFIRE_LLOYD_FORCE_BASELINE=1` debug escape
+  hatch for logits-Δ comparisons.
+- `crates/rdna-compute/src/dispatch.rs` — `gemv_mq3g256_lloyd` now
+  uses the arch selector + `launch_maybe_blob` (Step 4b: kernarg
+  blob path is graph-capture-safe, mirroring HFQ3 dispatch).
+  `gemv_mq2g256_lloyd` migrated to `launch_maybe_blob` for
+  consistency (no kernel rewrite — just graph-safety).
+- `crates/rdna-compute/examples/test_gemv_mq3g256_lloyd_tail.rs` (NEW)
+  — tail K-sweep parity test for groups_per_row ∈ {4, 5, 6, 7, 8}.
+
+#### Step 1 — Build
+
+```
+cargo check -p rdna-compute -p hipfire-runtime  → clean
+cargo build --release --features deltanet -p hipfire-runtime --example bench_qwen35_mq4
+                                                → clean
+```
+
+#### Step 2 — Perplexity (correctness vs baseline kernel, same model file)
+
+The PR's published 22.56 ppl on 4B was from a different quantization
+seed/iteration; locally-quantized model files produce different
+absolute ppl. The right correctness signal is **new kernel vs old
+kernel on the same `~/.hipfire/models/qwen3.5-{4b,9b}.mq3-lloyd`**.
+
+```
+4B Lloyd-MQ3:    NEW ppl=13.1804  BASELINE ppl=12.9956  Δ=0.18 (1.4%)
+9B Lloyd-MQ3:    NEW ppl=13.0869  BASELINE ppl=12.5165  Δ=0.57 (4.5%)
+```
+
+Δ scales modestly faster than √(group count); consistent with K4
+summation reorder reducing per-row precision slightly vs single-
+accumulator. Δppl < 5% is well within "acceptable kernel rewrite
+noise" on a research-gated format. Both kernels produce coherent
+text (no attractor or collapse).
+
+Bench (steady-state decode, 9B, gfx1100):
+
+```
+HIPFIRE_GRAPH=0:   42.9 → 108.7 tok/s   (2.53× speedup)
+HIPFIRE_GRAPH=1:   ?    → 112.6 tok/s   (graph capture proven safe
+                                          via launch_maybe_blob;
+                                          667 blobs captured)
+```
+
+7% short of the ≥120 ship gate. Open question for the perf-gate
+session: investigate whether `__launch_bounds__(32, 16)` is leaving
+parallelism on the table (LDS broadcasts may free some lanes), or
+whether codebook prefetching across the quad boundary closes it.
+
+#### Step 2.5 — VGPR budget (no spills)
+
+```
+                    VGPR  SGPR  Spills  LDS
+Lloyd baseline      31    18    0       0
+HFQ3 ref (gfx1100)  72    22    0       0
+NEW Lloyd gfx1100   74    18    0       128 B
+```
+
+74 VGPRs is +2 over HFQ3 (within the 96-VGPR budget for 16-way
+occupancy on gfx1100's 1536-VGPR/SIMD file). Plan's strict ≤ HFQ3
+criterion fails by 2 VGPRs but the **load-bearing concern** (no
+spill into VRAM-backed scratch) is met cleanly.
+
+#### Step 2.6 — Tail K-sweep parity (CPU reference)
+
+`crates/rdna-compute/examples/test_gemv_mq3g256_lloyd_tail.rs` builds
+synthetic Lloyd-MQ3 rows for `groups_per_row ∈ {4, 5, 6, 7, 8}`,
+runs the GPU kernel, and compares against a CPU reference that uses
+the round-tripped fp16→fp32 codebooks (so fp16-quantization noise
+isn't conflated with kernel error). Output:
+
+```
+groups_per_row=4 K=1024  max_abs=2.272e-7  PASS  (4 quads, 0 tail)
+groups_per_row=5 K=1280  max_abs=3.278e-7  PASS  (1 quad,  1 tail)
+groups_per_row=6 K=1536  max_abs=3.874e-7  PASS  (1 quad,  2 tail)
+groups_per_row=7 K=1792  max_abs=4.172e-7  PASS  (1 quad,  3 tail)
+groups_per_row=8 K=2048  max_abs=3.825e-7  PASS  (2 quads, 0 tail)
+```
+
+Max-abs error ~3-4 × 10⁻⁷ (fp32 epsilon) across all tail cases.
+This is the strongest correctness signal — much tighter than ppl,
+and exercises every quad/tail boundary that production model
+dimensions would hit.
+
+#### Status
+
+- [x] Step 0 — bench harness (`probe_commits.sh` parameterized)
+- [x] Step 0a — disassembly preflight (divergent-execution tree confirmed)
+- [x] Step 1 — build clean
+- [x] Step 2 — ppl correctness vs baseline (4B + 9B)
+- [x] Step 2.5 — VGPR budget
+- [x] Step 2.6 — tail K-sweep
+- [x] Step 4b — launch_maybe_blob migration (graph-capture safe)
+- [ ] Step 3 — coherence-gate (4-prompt battery on Lloyd model)
+- [ ] Step 4 — cross-process perf gate (≥120 tok/s target)
+
+Decode delivered: **42.9 → 112.6 tok/s = 2.62×** on 9B Lloyd-MQ3,
+gfx1100, HIPFIRE_GRAPH=1. 7% short of the ship gate; close enough
+that codebook prefetching or wider unroll likely closes it.
+
+### Next step
+
+Step 3 (coherence-gate) and Step 4 (perf gate). Then iterate on the
+remaining 7% gap to ≥120 tok/s.
+

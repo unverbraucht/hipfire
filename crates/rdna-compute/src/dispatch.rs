@@ -2037,16 +2037,29 @@ impl Gpu {
     /// multiple of 256. Same launch shape as gemv_hfq2g256 — header is the
     /// only layout difference.
     pub fn gemv_mq2g256_lloyd(&mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel("gemv_mq2g256_lloyd", kernels::GEMV_MQ2G256_LLOYD_SRC, "gemv_mq2g256_lloyd")?;
-        let func = &self.functions["gemv_mq2g256_lloyd"];
-        let mut a_ptr = a_raw.buf.as_ptr(); let mut x_ptr = x.buf.as_ptr(); let mut y_ptr = y.buf.as_ptr();
-        let mut m_val = m as i32; let mut k_val = k as i32;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
         let mut params: Vec<*mut c_void> = vec![
-            &mut a_ptr as *mut _ as *mut c_void, &mut x_ptr as *mut _ as *mut c_void,
-            &mut y_ptr as *mut _ as *mut c_void, &mut m_val as *mut _ as *mut c_void,
-            &mut k_val as *mut _ as *mut c_void,
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
         ];
-        unsafe { self.hip.launch_kernel(func, [m as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+        self.launch_maybe_blob(
+            "gemv_mq2g256_lloyd", [m as u32, 1, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr);
+                b.push_i32(m_val); b.push_i32(k_val);
+                b
+            },
+        )
     }
 
     /// MQ2-Lloyd GEMV with engine-side x rotation (matches `gemv_mq2g256_with_rotate`).
@@ -2054,23 +2067,39 @@ impl Gpu {
         &mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
         x_rot: &GpuTensor, m: usize, k: usize,
     ) -> HipResult<()> {
+        // bind_thread: skip — delegates to rotate_x_mq + gemv_mq2g256_lloyd, both of which bind.
         self.rotate_x_mq(x, x_rot, k)?;
         self.gemv_mq2g256_lloyd(a_raw, x_rot, y, m, k)
     }
 
     /// MQ3-Lloyd GEMV (3-bit + per-block 8-entry fp16 codebook). K must be a
-    /// multiple of 256.
+    /// multiple of 256. gfx1100/1101/1102 use the K4-unrolled + LDS-codebook
+    /// variant; other archs fall back to the baseline switch-dispatch path.
     pub fn gemv_mq3g256_lloyd(&mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) -> HipResult<()> {
-        self.ensure_kernel("gemv_mq3g256_lloyd", kernels::GEMV_MQ3G256_LLOYD_SRC, "gemv_mq3g256_lloyd")?;
-        let func = &self.functions["gemv_mq3g256_lloyd"];
-        let mut a_ptr = a_raw.buf.as_ptr(); let mut x_ptr = x.buf.as_ptr(); let mut y_ptr = y.buf.as_ptr();
-        let mut m_val = m as i32; let mut k_val = k as i32;
+        self.bind_thread()?;
+        let (src, module) = kernels::gemv_mq3g256_lloyd_for_arch(&self.arch);
+        self.ensure_kernel(module, src, "gemv_mq3g256_lloyd")?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
         let mut params: Vec<*mut c_void> = vec![
-            &mut a_ptr as *mut _ as *mut c_void, &mut x_ptr as *mut _ as *mut c_void,
-            &mut y_ptr as *mut _ as *mut c_void, &mut m_val as *mut _ as *mut c_void,
-            &mut k_val as *mut _ as *mut c_void,
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
         ];
-        unsafe { self.hip.launch_kernel(func, [m as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+        self.launch_maybe_blob(
+            "gemv_mq3g256_lloyd", [m as u32, 1, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr);
+                b.push_i32(m_val); b.push_i32(k_val);
+                b
+            },
+        )
     }
 
     /// MQ3-Lloyd GEMV with engine-side x rotation.
@@ -2078,6 +2107,7 @@ impl Gpu {
         &mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
         x_rot: &GpuTensor, m: usize, k: usize,
     ) -> HipResult<()> {
+        // bind_thread: skip — delegates to rotate_x_mq + gemv_mq3g256_lloyd, both of which bind.
         self.rotate_x_mq(x, x_rot, k)?;
         self.gemv_mq3g256_lloyd(a_raw, x_rot, y, m, k)
     }
