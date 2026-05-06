@@ -76,6 +76,61 @@ still the deployed targets). It does mean every "shipped on gfx906"
 claim in the body of this doc deserves a build-verification step
 before being relied on for prioritization.
 
+### v3.2 errata (2026-05-06): MQ8 runtime dispatch is not wired for per-layer use
+
+After v3.1 fixed the kernel build, an end-to-end bench on
+`qwen3.5-9b.mq8` produced 45.4 tok/s with deterministic per-token
+timing — but the inference is **invalid**. See
+`docs/perf-checkpoints/2026-05-06-mq8-runtime-dispatch-audit.md` for
+the full discovery sequence.
+
+**Root cause:** the per-layer prefill batched dispatch in
+`crates/hipfire-arch-qwen35/src/qwen35.rs` excludes `MQ8G256` from
+all 14 `is_mq` matchers (lines 3946, 4118, 4147, 4194, 4243, 4508,
+4538, 4576, 4651, …). MQ8 weights silently fall through to
+`gemm_qkvza_hfq4g256` etc., which read at HFQ4-format byte stride
+(136 B/group) when MQ8 is 258 B/group. Prefill produces corrupted
+DeltaNet state and KV cache; gen consumes that corrupted state.
+
+**Why it stayed undetected:** MQ8 was originally shipped (commit
+`246501a`, 2026-04-08) "targeting dp4a on gfx1100" and only ever
+wired into the lm_head tied-embedding path (`bf0ba43`, 2026-04-13:
+explicit comment *"Not a current path"*). No production model has
+ever shipped MQ8 per-layer weights. `coherence-gate.sh` has no mq8
+entry. The gfx906 build failure (fixed in `ee0fac6`) masked the
+deeper issue.
+
+**Implications for plan §3.2 / §5:**
+
+- **§3.2 Phase A item 4 ("batched GEMM") is a correctness
+  prerequisite, not an optimization.** The `gemm_*_mq8g256_*`
+  kernels don't exist AND the runtime dispatch sites that would
+  call them are absent (14 sites in the arch crate).
+- **The "MQ8 first" priority ranking is no longer defensible.**
+  The "smaller scope" argument survives in nominal terms but the
+  gap is wider than counted: implementing MQ8 batched means
+  writing 4–7 new kernels (qkvza / qkv / gate_up / residual /
+  MoE-indexed × wave64) AND wiring 14 dispatch sites. MQ6 Phase A
+  is comparatively better-defined: the wave32 path through bare
+  `gemm_qkvza_hfq6g256` works end-to-end today.
+- **§5.1 priority list is reordered in v3.2:** MQ6 Phase A
+  becomes priority 1; MQ8 Phase A becomes priority 4 (deferred
+  until a production model ships raw MQ8 per-layer weights, OR a
+  measured advantage over MQ6 motivates the full wiring work).
+- **Audit-method gap:** §5.5 build-tested kernel sources but did
+  not test runtime dispatch wiring. §5.4 (Priority 0.5 audit) is
+  expanded to include grepping arch crates for `is_mq` /
+  dtype-matchers and confirming every quant format the loader
+  produces is handled at every per-layer call site.
+
+**MQ8 scope after v3.2:** restricted to "lm_head-tier optimization,
+not primary weight format." The `weight_gemv` MQ8G256 dispatch in
+`crates/hipfire-runtime/src/llama.rs:601, 646, 680, 733` works
+correctly and serves the lm_head tied-embedding path used by
+production mq4-format models. That path benefits from `ee0fac6` on
+gfx906; no further MQ8 work is in scope without a deployed
+per-layer MQ8 model.
+
 This document is **analysis-only**. It maps what's missing for MQ6
 and MQ8 to reach the same kernel-coverage level we have for HFQ4
 post-PR-158, separately considering AR-only and DFlash workloads.
@@ -614,72 +669,87 @@ work too:
 ### 5.0 Priority 0: baseline measurement (~½ session, prerequisite)
 
 **Before any kernel work**, run the canonical AR decode + DFlash
-benches on existing mq4 / mq6 / mq8 / mq3 paths on gfx906 with
-3-run deterministic medians per AGENTS.md prompt-md5 / binary-md5
+benches on existing mq4 / mq6 / mq3 paths on gfx906 with 5-run
+deterministic medians per AGENTS.md prompt-md5 / binary-md5
 requirements:
 
 - Qwen 9B mq4 AR decode tok/s (sanity baseline against PR #158
   numbers)
 - Qwen 9B mq6 AR decode tok/s (target for §3.1 wave64 work)
-- Qwen 9B mq8 AR decode tok/s (target for §3.2 dp4a-extension work;
-  this is the reference dp4a kernel today)
 - Qwen 9B mq3 AR decode tok/s (per AGENTS.md §A: production on
   gfx11/12, runs via fallback on gfx906)
-- DFlash 27B mq6 humaneval-0 tok/s (if a 27B mq6 model is built;
-  produced via `hipfire-quantize --format mq6`)
+- DFlash 27B mq6 humaneval-0 tok/s (27B mq6 quantized 2026-05-06
+  via `hipfire-quantize --format mq6` from Qwen3.6-27B bf16)
 
-**Quantize prerequisites** (before bench): the canonical mq8 / mq6 9B
-and 27B targets are not on disk; produce locally via:
+**Note (v3.2):** mq8 is excluded from Priority 0. The per-layer
+runtime dispatch isn't wired (see v3.2 errata header). A bench
+would produce GPU-time numbers but the inference is invalid;
+re-add mq8 only if the per-layer wiring is restored.
+
+**Quantize prerequisites** (before bench): the canonical mq6 9B
+and 27B targets are produced locally via:
 
 ```
-hipfire-quantize --format mq8 <hf16-source>  # ~1-2 min for 9B
-hipfire-quantize --format mq6 <hf16-source>  # ~4-8 min for 27B
+hipfire-quantize --format mq6 <hf16-source>  # ~1-2 min for 9B,
+                                             # ~5-8 min for 27B
 ```
+
+(The 9B mq6 already ships in the registry; 27B mq6 is the new
+artifact, produced from Qwen3.6-27B bf16 since architectural
+config is identical to Qwen3.5-27B.)
 
 Record absolute tok/s + the comparison matrix. Write up at
-`docs/perf-checkpoints/2026-05-06-mq6-mq8-baselines.md`. **All lift
+`docs/perf-checkpoints/2026-05-06-mq6-baselines.md`. **All lift
 estimates below are placeholders pending Priority 0.**
 
-### 5.1 Priority list (post-Priority-0, demand-conditional)
+### 5.1 Priority list (revised v3.2 — MQ6 leads, MQ8 demoted)
 
-HFQ8 is dropped from the priority list per the v3 scope reframe (no
-quantize-tool support, no shipped models, MQ8 is the deployed int8
-target). MQ6 / MQ8 are the only int-quant kernel-coverage targets.
+HFQ8 is dropped per v3 (no quantize-tool support). MQ8 is demoted
+per v3.2 (per-layer runtime dispatch not wired; would need 4-7
+new kernels + 14 dispatch sites; no deployed per-layer model).
 
 | Priority | Phase | Cost | Expected lift | Risk | Demand gate |
 |---:|---|---:|---|---|---|
-| 1 | MQ8 Phase A (wave64 GEMV + residual + fused + batched + MoE, all dp4a) | ~2.5 sessions | TBD by P0 | low — int8 weights are dword-aligned; B=1 dp4a kernel already in tree as reference | needed if mq8 deployment becomes meaningful on gfx906 |
-| 2 | MQ6 Phase A (wave64 GEMV + residual + fused + batched + MoE, FP-only) | ~3 sessions | TBD by P0 | low — mirror of HFQ4 wave64 work | needed if mq6 has measured production demand |
-| 3 | MQ6 Phase B (dp4a port for fused GEMVs, AR optimization) | ~1 session | TBD; PMC-gated | medium — needs PMC validation | only if Phase A's MQ6 kernels show ALU headroom |
-| 4 | MQ6 Phase C (MMQ batched, DFlash verify) | **5 sessions** | TBD; up to +90% on Qwen 27B mq6 DFlash *if anyone uses that combo* | high — full LDS bank-conflict diagnostic + mmq_screen plumbing | only if 27B mq6 + DFlash becomes a real workload |
+| 1 | **MQ6 Phase A** (wave64 GEMV + residual + fused + batched + MoE, FP-only) | ~3 sessions | TBD by P0 | low — mirror of HFQ4 wave64 work; wave32 path works end-to-end today | needed if mq6 has measured production demand |
+| 2 | MQ6 Phase B (dp4a port for fused GEMVs, AR optimization) | ~1 session | TBD; PMC-gated | medium — needs PMC validation | only if Phase A's MQ6 kernels show ALU headroom |
+| 3 | MQ6 Phase C (MMQ batched, DFlash verify) | **5 sessions** | TBD; up to +90% on Qwen 27B mq6 DFlash *if anyone uses that combo* | high — full LDS bank-conflict diagnostic + mmq_screen plumbing | only if 27B mq6 + DFlash becomes a real workload |
+| 4 | MQ8 Phase A (per-layer wiring + 4-7 new batched-GEMM kernels + 14 dispatch sites) | **~5-6 sessions** (revised up from ~2.5 by v3.2) | unmeasured — requires correct inference baseline first | high — both kernels and runtime dispatch must be added; coherence-gate and quality validation needed for each new kernel | **deferred until a production model ships raw MQ8 per-layer weights, OR measured advantage over MQ6 motivates the work** |
 | 5 | (MQ3) — separate plan, gated on demand | — | — | — | likely higher demand than mq6/mq8 per AGENTS.md §A |
 
-**Decision rule:** do priorities 1 and 2 *only if* Priority 0 shows a
-real workload using these quants on gfx906. Otherwise defer the
-entire plan. The lessons from PR #158's diagnostic-first methodology
-+ the closed dot8 PRD's negative result both point toward "don't
-build speculative kernel optimizations."
+**Decision rule:** do priority 1 *only if* Priority 0 shows a real
+workload using mq6 on gfx906. Otherwise defer. The lessons from PR
+#158's diagnostic-first methodology + the closed dot8 PRD's negative
+result both point toward "don't build speculative kernel
+optimizations."
 
-**Why MQ8 was provisionally priority 1 over MQ6 (weakened by v3.1 errata):**
-- ~~The dp4a-on-int8 inner loop is already shipped in
-  `gemv_mq8g256.hip`; Phase A items are mechanical mirrors with the
-  same proven inner loop.~~ **Reframed by v3.1 errata.** The kernel
-  was unbuildable on gfx906 until commit `ee0fac6` (2026-05-06) and
-  the post-fix B=1 path has only single-process bench validation
-  (45.4 tok/s on Qwen 9B mq8), not coherence-gate. Treat as
-  freshly-validated.
-- No MMQ-streaming port required (Phase A item 4 covers batched
-  directly with register-tile dp4a). **Still applies.**
-- Smaller total scope (~2.5 sessions vs MQ6's ~3 + optional ~1 + ~5
-  sessions for full coverage). **Still applies.**
+**Why MQ6 leads in v3.2:**
+- Wave32 path (`gemm_qkvza_hfq6g256`, `gemv_hfq6g256`,
+  `fused_rmsnorm_mq_rotate`) works end-to-end on gfx906 today —
+  audited in §5.5 plus exercised by the in-flight Priority 0
+  baseline. No correctness prerequisite, just optimization.
+- Phase A is a mechanical wave32→wave64 port mirroring PR #158's
+  HFQ4 work. Pattern is proven.
+- MQ6 has a single deployable on-disk model registry pattern
+  (`qwen3.5-9b.mq6` ships, 27B mq6 just quantized 2026-05-06).
+- The plan body §3.1 already documents Phase A/B/C in detail.
 
-**Net:** MQ8 priority-1 vs MQ6 priority-2 ranking is *softened* but
-not inverted. The "smaller scope + no MMQ" arguments survive; the
-"battle-tested inner loop" argument doesn't. Re-evaluate after
-Priority 0 baselines if the freshly-fixed B=1 kernel shows
-unexpected behavior in the bench-cold harness's 5-run-fresh-process
-median (e.g. wider spread than mq4 / mq6 paths would indicate
-something subtle is still off).
+**Why MQ8 is now priority 4 (effectively deferred indefinitely):**
+
+- v3.2 errata: per-layer runtime dispatch is not wired (14 sites in
+  the arch crate exclude MQ8G256). Phase A item 4 isn't an
+  optimization — it's a correctness prerequisite. Without it, MQ8
+  inference for any non-lm_head workload is invalid.
+- Kernel surface to write: `gemm_qkvza_mq8g256_wave64_dp4a.hip`,
+  `gemm_qkv_mq8g256_wave64_dp4a.hip`,
+  `gemm_gate_up_mq8g256_wave64_dp4a.hip`,
+  `gemv_mq8g256_residual_wave64.hip`, plus MoE-indexed variants.
+  Each needs coherence-gate + correctness validation.
+- Runtime wiring: 14 dispatch sites in `qwen35.rs` need MQ8G256
+  added to their matchers, plus rotation-aware activation prep
+  (the rotated path is more involved than HFQ4's plain rmsnorm).
+- No deployed per-layer MQ8 model exists. The lm_head path (which
+  IS wired) is served by the existing B=1 GEMV and benefits from
+  `ee0fac6` already.
 
 ### 5.2 Coherence-gate cost (per glm5 3.4)
 
@@ -693,26 +763,51 @@ This work is **gfx906-only**. gfx11 / gfx12 (RDNA3 / RDNA4) WMMA
 paths are unaffected. `gemv_hfq6g256.gfx1201.hip` and other RDNA-
 specific HFQ6 kernels need no changes.
 
-### 5.4 Audit-other-MQ-kernels-on-gfx906 (~½ session, added by v3.1 errata)
+### 5.4 Build + runtime-dispatch audit (~1 session, expanded by v3.2 errata)
 
-The `sudot4` bug in `gemv_mq8g256.hip` sat undetected because no
-gfx906 build or bench had exercised the mq8 path before 2026-05-06.
-Other MQ / HFQ kernels may have similar latent gfx906-only build
-failures from RDNA3+-only intrinsics. Cheap to audit:
+The v3.1 audit (§5.5) caught the `sudot4` build failure but missed
+the more critical runtime-dispatch gap (v3.2 errata): every
+`is_mq` matcher in the arch crate excluded `MQ8G256`, so MQ8
+weights were silently corrupted via stride-mismatched HFQ4 reads.
+Build-test alone isn't sufficient.
+
+**Two-part audit, mandatory before any MQ-related Phase A work:**
+
+**Part 1 — kernel build verification (already done in §5.5):**
 
 1. `grep -rn '__builtin_amdgcn_\(sudot\|wmma\|s_wait_event\|v_dot.*bf16\|v_dot.*f16\)' kernels/src/`
 2. For each match, check the kernel's dispatch path: is it ever
    instantiated on gfx906 today? If yes, build-test it via the
-   runtime's JIT path (not just by reading the source).
-3. Also worth: build-test every kernel listed in `kernels::*_SRC`
-   constants on gfx906 to catch any other dot8/wmma/RDNA3+-only
-   reliance.
+   runtime's JIT path.
+3. Build-test every kernel listed in `kernels::*_SRC` constants on
+   gfx906 via `hipcc --genco --offload-arch=gfx906`.
 
-**Why before any Phase A:** every "shipped on gfx906" claim in §3.1
-and §3.2 is load-bearing for the priority list. If any other path
-is also unbuildable, the priority order changes again. Treat this
-as Priority 0.5 — between the baseline measurement and any kernel
-work.
+**Part 2 — runtime-dispatch verification (new in v3.2):**
+
+For each `DType::*G256` variant the loader can produce
+(`crates/hipfire-runtime/src/hfq.rs:417`), verify wiring at every
+per-layer call site:
+
+1. `grep -rn 'is_mq = matches!\|is_6bit = matches!\|is_mq3 = matches!\|is_mq8 = matches!' crates/hipfire-arch-*/src/`
+2. For each matcher, confirm every loader-producible quant format
+   appears in at least one branch. Missing format → silent
+   fall-through → corrupted inference.
+3. For each per-layer GEMM/GEMV call, confirm the matcher arms
+   route to a dtype-correct kernel (e.g. `gemm_qkvza_hfq6g256`
+   handles HFQ6 stride; an MQ6/MQ4/MQ8 weight in the `else` arm
+   would mis-read).
+4. Cross-check `coherence-gate.sh` test matrix at
+   `scripts/coherence-gate.sh:84-103` covers each loader-producible
+   format end-to-end. Missing entries → no automated detection of
+   future dispatch gaps.
+
+**Why both parts before any Phase A:** every "shipped on gfx906"
+claim in §3.1 and §3.2 is load-bearing for the priority list. The
+v3.2 audit raised MQ8 effort estimate from ~2.5 sessions to ~5-6
+sessions because the runtime-dispatch gap was uncounted. Treat
+this as Priority 0.5 — between the baseline measurement and any
+kernel work — and run **both parts** for any quant format being
+considered for production deployment.
 
 ### 5.5 Audit results (2026-05-06)
 
