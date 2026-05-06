@@ -48,6 +48,13 @@ pub const GEMV_HFQ8G256_SRC: &str = include_str!("../../../kernels/src/gemv_hfq8
 pub const GEMV_HFQ6G256_SRC: &str = include_str!("../../../kernels/src/gemv_hfq6g256.hip");
 pub const GEMV_HFQ6G256_RESIDUAL_SRC: &str = include_str!("../../../kernels/src/gemv_hfq6g256_residual.hip");
 
+/// Wave64-native HFQ6-G256 residual GEMV. Mirror of the HFQ4 sibling
+/// (`gemv_hfq4g256_residual_wave64.hip`) with 6-bit unpack from
+/// `gemv_hfq6g256_residual.hip`. Used for HFQ6/MQ6 `wo` and `w_down`
+/// projections on wave64-native arches (gfx906/908/94x). Plan §3.1.1
+/// item 2 (gfx906-mq6-mq8-port.md v3.2.1).
+pub const GEMV_HFQ6G256_RESIDUAL_WAVE64_SRC: &str = include_str!("../../../kernels/src/gemv_hfq6g256_residual_wave64.hip");
+
 
 /// HFQ3-G256: flat 3-bit with 256-weight groups.
 /// Block: [f32 scale][f32 zero][96B data] = 104 bytes per 256 weights (0.41 B/w).
