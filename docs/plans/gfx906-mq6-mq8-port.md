@@ -131,6 +131,93 @@ production mq4-format models. That path benefits from `ee0fac6` on
 gfx906; no further MQ8 work is in scope without a deployed
 per-layer MQ8 model.
 
+### v3.2.2 errata (2026-05-06): dp4a leads, wave64 is scaffolding; Phase A is decode-only
+
+Two corrections after the wave64 HFQ6 residual port shipped (`466f1a6`)
+and the bench result landed (`docs/perf-checkpoints/2026-05-06-wave64-hfq6-residual-experiment.md`):
+
+**Correction 1 — Lever attribution recalibrated against PR #158 data.**
+
+The original v3 framing implied wave64 ports were the dominant
+Phase A lever (1.5-2× lift was projected). Re-reading
+`docs/perf-checkpoints/2026-05-05-gfx906-decode-investigation.md`
+and the original wave64 port commit (`166451d`, MI300X) shows the
+attribution was wrong:
+
+| HFQ4 lever (PR #158 data) | 9B mq4 decode lift |
+|---|---:|
+| Pre-investigation (wave64 already shipped via `166451d`/`a293e15`) | 50.7 tok/s |
+| + ILP-prefetch on `gemv_residual` (`3ef127d`) | 54.4 (+7.3 %) |
+| + dp4a on `fused_gate_up` (`5a45260`) | 58.5 (+7.5 %) |
+| + dp4a on `fused_qkv` + `fused_qkvza` (HEAD) | 58.9 (+0.7 %) |
+| **Total** | **+16.2 %** |
+
+Wave64 alone for `gemv_residual` measured **+3.2 %** on MI300X
+(within noise per `166451d`). The +4.8 % figure that v3 anchored on
+was the *prefetch* lever applied on top of an already-wave64 kernel,
+not the wave64 port itself. Today's HFQ6 wave64 residual experiment
+on gfx906 confirms: 9B mq6 decode +2.9–3.3 % (matches HFQ4
+sibling).
+
+**The dominant lever for HFQ6/MQ6 on gfx906 is dp4a on the fused
+GEMVs**, not wave64 alone. Wave64 is a foundation — the dp4a kernels
+ship as wave64+dp4a hybrids (mirror `fused_gate_up_hfq4g256_wave64_dp4a.hip`).
+Phase A reordered accordingly:
+
+| Phase | Old (v3.2) | New (v3.2.2) |
+|---|---|---|
+| A.1 | Wave64 GEMV ports (5 kernels) | Wave64 residual GEMV (foundation) — single shipped kernel |
+| **A.2** | dp4a port (Phase B, "optional, PMC-gated") | **dp4a-on-fused-GEMV (3 kernels: gate_up, qkv, qkvza) — primary lever, expected +7-8 % decode** |
+| A.3 | MoE-indexed (5 → 10 kernels) | Same; ports the dp4a path through the MoE family |
+| A.4 | Wave64 batched GEMM (LM-head) | Same; lower priority |
+
+§3.1.2's "Phase B" framing is reclassified to **Phase A primary
+lever** in the v3.2.2 reordering. Plan §3.1.2 keeps the PMC-entry-gate
+recommendation (verify VALUBusy < 50% on the production hot kernel
+before committing) — that's still the right risk-mitigation for the
+~1-session port.
+
+**Correction 2 — Phase A is decode-only; prefill needs Phase C.**
+
+The implicit framing of v3 was that Phase A improves both prefill
+and decode. The wave64 HFQ6 residual experiment falsifies this: 9B
+mq6 prefill Δ was **0.0 %** (within 0.4 % spread), decode Δ was
++2.9–3.3 %. The mechanism is structural:
+
+- **Decode B=1** dispatches through `weight_gemv` →
+  `gemv_*_with_rotate` (or for HFQ6, `gemv_hfq6g256_residual` etc.).
+  These are the kernels Phase A touches.
+- **Prefill B>1** dispatches through `gemm_qkvza_hfq6g256` etc. (the
+  batched fused-GEMM family). These are *different kernels*, not
+  touched by Phase A's wave64/dp4a-fused work.
+
+The MQ-specific kernels in the tree (`gemv_mq*_with_rotate`,
+`mq*_rotate_quantize_x`) are GEMV-shape (decode); the rotation
+pre-pass (`fused_rmsnorm_rotate_mq_batched`, `fused_silu_mul_mq_rotate`)
+serves both prefill and decode but is one launch per layer, not per
+weight matrix. **MQ-quant-specific kernels are primarily a decode
+optimization.** Prefill-heavy workloads (long-context code/doc Q&A,
+document understanding) on mq6 need the batched-GEMM MMQ port —
+that's plan §3.1.3 Phase C, which is a separate ~5-session effort
+covering the `gemm_*_residual_mmq_gfx906_x{N}.hip` family for HFQ6.
+
+The §5.1 priority list now reflects this with explicit
+prefill-vs-decode columns (see §5.1 below).
+
+### Calibrated decode-lift expectations (gfx906, post-v3.2.2)
+
+| Lever | Expected 9B mq6 decode Δ | Evidence basis |
+|---|---:|---|
+| Wave64 residual GEMV | +3 % (today's experiment) | direct measurement |
+| Wave64 + ILP-prefetch on residual | +7 % (HFQ4 reference, untested for HFQ6) | extrapolated from PR #158 |
+| Wave64 + dp4a on fused gate_up | +7 % | HFQ4 reference |
+| Wave64 + dp4a on fused qkv + qkvza | +1 % | HFQ4 reference |
+| **Phase A complete (gfx906 mq6 decode)** | **+15-18 % cumulative** | mirror of HFQ4 +16.2 % |
+
+**Headline: full Phase A on HFQ6/MQ6 should deliver +15-18 % decode
+on gfx906, comparable to HFQ4's +16.2 %.** Phase A delivers ~0 % on
+prefill at B>1; that requires Phase C.
+
 This document is **analysis-only**. It maps what's missing for MQ6
 and MQ8 to reach the same kernel-coverage level we have for HFQ4
 post-PR-158, separately considering AR-only and DFlash workloads.
@@ -180,7 +267,7 @@ separately. v1 conflated them in a single "fused" column.
 
 | Lever | HFQ4 | HFQ6 | HFQ8 | Why |
 |---|:---:|:---:|:---:|---|
-| wave64 topology (1.5–2× over wave32 on wave64 native HW) | ✓ shipped | applicable | applicable | mechanical port; no quant dependence |
+| wave64 topology (~3 % decode, foundation only) | ✓ shipped | ✓ residual shipped 2026-05-06 (`466f1a6`) | applicable | mechanical port; no quant dependence; **single-lever lift modest per v3.2.2 errata** |
 | ILP-prefetch in residual GEMV | ✓ shipped | applicable | applicable | mechanical port; per-thread byte count differs (HFQ6=6, HFQ8=8) but pattern transfers |
 | dp4a (int8×int8 via `__builtin_amdgcn_sudot4`) | ✓ shipped | applicable (int8 unpack from 6-bit) | **shipped as MQ8**, see §3.2 | gfx906 has the instruction; works for any int8-dequantizable weight |
 | dot8 (`v_dot8_i32_i4`, int4×int4) | ✓ HFQ4 native | **NO — would require lossy 6→4 repack** | **NO — would require lossy 8→4 repack** | hardware is int4×int4 only, no mixed-precision; see §2.4 |
@@ -707,14 +794,23 @@ estimates below are placeholders pending Priority 0.**
 HFQ8 is dropped per v3 (no quantize-tool support). MQ8 is demoted
 per v3.2 (per-layer runtime dispatch not wired; would need 4-7
 new kernels + 14 dispatch sites; no deployed per-layer model).
+MQ6 sub-phases reordered per v3.2.2 (dp4a-on-fused-GEMVs is the
+dominant lever; wave64 alone delivers ~3 % per HFQ4 reference).
 
-| Priority | Phase | Cost | Expected lift | Risk | Demand gate |
-|---:|---|---:|---|---|---|
-| 1 | **MQ6 Phase A** (wave64 GEMV + residual + fused + batched + per-layer residual + MoE, FP-only) | ~3.5 sessions (v3.2.1) | TBD by P0 | low — mirror of HFQ4 wave64 work; wave32 path works end-to-end today | needed if mq6 has measured production demand |
-| 2 | MQ6 Phase B (dp4a port for fused GEMVs, AR optimization) | ~1 session | TBD; PMC-gated | medium — needs PMC validation | only if Phase A's MQ6 kernels show ALU headroom |
-| 3 | MQ6 Phase C (MMQ batched, DFlash verify) | **5 sessions** | TBD; up to +90% on Qwen 27B mq6 DFlash *if anyone uses that combo* | high — full LDS bank-conflict diagnostic + mmq_screen plumbing | only if 27B mq6 + DFlash becomes a real workload |
-| 4 | MQ8 Phase A (per-layer wiring + 4-7 new batched-GEMM kernels + 14 dispatch sites) | **~5-6 sessions** (revised up from ~2.5 by v3.2) | unmeasured — requires correct inference baseline first | high — both kernels and runtime dispatch must be added; coherence-gate and quality validation needed for each new kernel | **deferred until a production model ships raw MQ8 per-layer weights, OR measured advantage over MQ6 motivates the work** |
-| 5 | (MQ3) — separate plan, gated on demand | — | — | — | likely higher demand than mq6/mq8 per AGENTS.md §A |
+| Priority | Phase | Cost | Decode Δ | Prefill Δ | Risk | Demand gate |
+|---:|---|---:|---:|---:|---|---|
+| 1a | **MQ6 wave64 residual GEMV** (Phase A foundation, shipped 2026-05-06) | done (`466f1a6`) | **+3 %** measured | 0 % | low — mechanical mirror | shipped |
+| 1b | **MQ6 ILP-prefetch on residual** (mirror `gemv_hfq4g256_residual_wave64_prefetch.hip`) | ~½ session | est +5-7 % cumulative | 0 % | low | natural follow-up to 1a |
+| 1c | **MQ6 dp4a-on-fused-GEMVs** (gate_up + qkv + qkvza, three new wave64+dp4a kernels) | ~1 session | est +13-15 % cumulative (HFQ4 reference) | 0 % | medium — PMC-gated; verify VALUBusy < 50 % before commit | **highest-leverage decode lever** |
+| 1d | MQ6 MoE-indexed wave64+dp4a (10 kernels, A3B / MoE workload) | ~1 session | A3B-mq6 dependent | 0 % | low | only if MoE+MQ6 has demand |
+| 1e | MQ6 LM-head wave64 batched (`gemm_hfq6g256_wave64.hip`) | ~½ session | small (lm_head is ~8 % of decode) | small | low | natural completion of A |
+| 2 | MQ6 Phase C (MMQ batched, DFlash verify, prefill) | **5 sessions** | 0 % | up to +90 % | high — LDS bank-conflict + mmq_screen plumbing | only if 27B mq6 + DFlash or prefill-heavy workload becomes a real demand |
+| 3 | MQ8 Phase A (per-layer wiring + 4-7 new batched-GEMM kernels + 14 dispatch sites) | **~5-6 sessions** (per v3.2) | unmeasured | unmeasured | high — both kernels and runtime dispatch | **deferred until a production model ships raw MQ8 per-layer weights** |
+| 4 | (MQ3) — separate plan, gated on demand | — | — | — | — | likely higher demand than mq6/mq8 per AGENTS.md §A |
+
+**Phase A total (1a–1e):** ~3 sessions for the four remaining items;
+expected cumulative decode lift +15-18 % on 9B mq6 (mirror of HFQ4
++16.2 %). Prefill unaffected — Phase C is the prefill lever.
 
 **Decision rule:** do priority 1 *only if* Priority 0 shows a real
 workload using mq6 on gfx906. Otherwise defer. The lessons from PR
@@ -722,16 +818,24 @@ workload using mq6 on gfx906. Otherwise defer. The lessons from PR
 result both point toward "don't build speculative kernel
 optimizations."
 
-**Why MQ6 leads in v3.2:**
+**Why MQ6 leads in v3.2.2:**
 - Wave32 path (`gemm_qkvza_hfq6g256`, `gemv_hfq6g256`,
   `fused_rmsnorm_mq_rotate`) works end-to-end on gfx906 today —
-  audited in §5.5 plus exercised by the in-flight Priority 0
-  baseline. No correctness prerequisite, just optimization.
-- Phase A is a mechanical wave32→wave64 port mirroring PR #158's
-  HFQ4 work. Pattern is proven.
-- MQ6 has a single deployable on-disk model registry pattern
-  (`qwen3.5-9b.mq6` ships, 27B mq6 just quantized 2026-05-06).
-- The plan body §3.1 already documents Phase A/B/C in detail.
+  audited in §5.5 plus exercised by Priority 0 baseline (commit
+  `850848a`).
+- The dp4a-on-fused-GEMVs port is the dominant lever, expected
+  +7-8 % decode per HFQ4 reference. Wave64 ports underneath provide
+  the foundation (each ~+3 % alone, +15-18 % cumulative when
+  combined with dp4a).
+- MQ6 ships in 9 distinct production model artifacts in
+  `cli/registry.json` (Qwen3.5/3.6 base + Carnice + Qwopus
+  finetunes, 0.8B/4B/9B/27B sizes; `--both` shorthand produces
+  mq4+mq6 simultaneously). Per `docs/MODELS.md`, mq6 is the
+  curated quality tier above mq4.
+- The plan body §3.1 documents Phase A subitems (1a–1e) and Phase C
+  (MMQ batched). MQ6 priority-1 ranking is grounded in measured
+  bench data (today's wave64 +3 %), HFQ4 attribution (PR #158
+  +16.2 % cumulative), and deployment reality (registry breadth).
 
 **Why MQ8 is now priority 4 (effectively deferred indefinitely):**
 
