@@ -1,17 +1,37 @@
-# gfx906 HFQ6 + HFQ8 — kernel-coverage analysis
+# gfx906 MQ6 + MQ8 — kernel-coverage analysis
 
-**Status:** Draft v2 (2026-05-06, post-three-reviewer pass).
-Branch: `feat/gfx906-hfq6-hfq8-analysis`.
+**Status:** Draft v3 (2026-05-06, scope reframe to MQ6/MQ8).
+Branch: `feat/gfx906-hfq6-hfq8-analysis` (branch name carries v1
+history; not renamed).
 **Hardware:** AMD Instinct MI50 (gfx906, Vega 20)
 **Predecessor:** PR #158 (gfx906 HFQ4 dp4a + AR-decode optimizations,
 merged as `afb84bd`).
-**Reviews integrated:** `gfx906-hfq6-hfq8-port-plan-rev-{claude,gemini,glm5}.md`
+**Reviews integrated:** `gfx906-mq6-mq8-port-plan-rev-{claude,gemini,glm5}.md`
 (co-located in this directory). v1 had 5 blocking errors caught by
-adversarial review; v2 corrects the factual claims and reorders
-priorities by realistic implementation cost + measurement gates.
+adversarial review; v2 corrected the factual claims; v3 reframes
+the scope from raw HFQ6/HFQ8 (not deployed) to MQ6/MQ8 (deployed).
 
-This document is **analysis-only**. It maps what's missing for HFQ6
-and HFQ8 to reach the same kernel-coverage level we have for HFQ4
+### v3 scope reframe (2026-05-06)
+
+v1 and v2 used "HFQ6 / HFQ8" as the framing because that's the
+kernel-family naming. **The actually-deployed quant formats are
+MQ6 and MQ8** (FWHT-rotated variants). The on-disk model registry
+ships `qwen3.5-9b.mq6` (and zero `qwen3.5-9b.hf6`); the quantize
+tool emits `mq8` but has no `hf8` format at all. Rotation is
+essentially free at runtime — one small per-layer
+`mq8_rotate_quantize_x` / `fused_rmsnorm_rotate_mq` kernel call,
+already in the tree — and gives real quality benefit. **MQ8 is
+the correct int8 target for production gfx906 work; HFQ8 work is
+deprioritized indefinitely.**
+
+The per-quant kernel-coverage analysis below is unchanged: at the
+GEMV/GEMM layer, MQ6 uses the HFQ6-family kernels (and MQ8 uses the
+HFQ8-family kernels) with one extra activation-rotate kernel layered
+in front. The kernel surfaces "HFQ6 has wave32 GEMV" and "MQ6 has
+wave32 GEMV" describe the same kernels.
+
+This document is **analysis-only**. It maps what's missing for MQ6
+and MQ8 to reach the same kernel-coverage level we have for HFQ4
 post-PR-158, separately considering AR-only and DFlash workloads.
 Implementation is gated on baseline measurement (Priority 0) and
 demonstrated workload demand.
@@ -68,18 +88,23 @@ separately. v1 conflated them in a single "fused" column.
 The dot8 lever **does not apply** to HFQ6 or HFQ8 — see §2.4 for the
 full reasoning.
 
-### 1.3 Estimated effort to feature parity (revised v2)
+### 1.3 Estimated effort to feature parity (revised v3)
 
-| Surface | HFQ6 | HFQ8 | Gemini-revised |
+Coverage scope is **MQ6** and **MQ8** — the deployed FWHT-rotated
+variants. The kernel-surface analysis below is identical to "HFQ6
+GEMV/GEMM" and "HFQ8 GEMV/GEMM" because the FWHT rotation is one
+separate per-layer kernel, not part of the GEMV/GEMM inner loop.
+
+| Surface | MQ6 | MQ8 | Notes |
 |---|---:|---:|---|
-| wave64 GEMV (AR decode B=1) | ~½ session | ~½ session | HFQ8 trivial (aligned); HFQ6 needs split-load handling |
-| wave64 residual GEMV + ILP-prefetch | ~½ session | ~½ session | HFQ8 first |
-| Single-token fused GEMVs (gate_up / qkv / qkvza) | ~1 session | ~1 session | new GEMV-level surface |
-| Wave64 batched GEMM | ~1 session | ~1 session | HFQ8 has no batched at all |
-| MoE-indexed kernels (5 files per quant) | ~1 session | ~1 session | A3B / MoE workload coverage |
-| **AR-only complete coverage** | **~3 sessions** | **~2.5 sessions** | both gemini- and glm5-validated |
-| dp4a port for fused GEMVs (HFQ6 only — HFQ8 already done as MQ8) | ~1 session | n/a (use MQ8) | gemini PMC-gate before commit |
-| MMQ-equivalent dp4a path (DFlash verify) | **5 sessions** (was 2-3 in v1) | **not viable** (no dot8 lever; dp4a-batched ≅ MQ8) | gemini + glm5 + PR-158-history-aligned |
+| wave64 GEMV (AR decode B=1) | ~½ session | ~¼ session | MQ8 dword-aligned and trivially ports; MQ6 needs split-load handling |
+| wave64 residual GEMV + ILP-prefetch | ~½ session | ~½ session | mechanical mirror of HFQ4 work |
+| Single-token fused GEMVs (gate_up / qkv / qkvza) | ~1 session | ~1 session | new GEMV-level surface for both quants |
+| Wave64 batched GEMM (dp4a) | ~1 session | ~½ session | MQ6 needs MMQ-streaming Phase C; MQ8 covered by direct register-tile dp4a |
+| MoE-indexed kernels (5 files per quant) | ~1 session | ~½ session | A3B / MoE workload coverage |
+| **AR-only complete coverage** | **~3 sessions** | **~2.5 sessions** | MQ8 lighter because B=1 dp4a kernel already shipped |
+| dp4a port for fused GEMVs (MQ6 only — MQ8 is dp4a from day one) | ~1 session | n/a | PMC-gated before commit |
+| MMQ-equivalent dp4a path (DFlash verify) | **5 sessions** | **not needed** (Phase A item 4 covers it) | MQ6 needs full MMQ port; MQ8 batched is structurally simpler |
 
 **v2 caveat: every lift estimate above is gated on baseline measurement
 (Priority 0).** v1's `+30-50% AR decode` claim was unbacked by gfx906
@@ -390,12 +415,10 @@ unmeasured.
 **Defer:** record as Phase B/C optimization candidates. Don't commit
 to using them without measurement.
 
-### 3.2 HFQ8 — most of the win is shipping as MQ8
+### 3.2 MQ8 — extend dp4a-on-int8 from B=1 reference to wave64 / batched / MoE
 
-**Critical correction from v1:** v1 said "dp4a-on-HFQ8 has no useful
-lift." This was wrong. The codebase ships **MQ8** (FWHT-rotated
-HFQ8) using exactly the dp4a-on-int8-weights pattern. From
-`kernels/src/gemv_mq8g256.hip`:
+**Reference kernel ships today:** `kernels/src/gemv_mq8g256.hip` is
+the int8-weight × Q8_1-activation dp4a GEMV at B=1. Inner loop:
 
 ```c
 // MagnumQuant MQ8 GEMV: FWHT-rotated symmetric INT8 with dp4a.
@@ -404,103 +427,113 @@ HFQ8) using exactly the dp4a-on-int8-weights pattern. From
 // Weight format per group (258 bytes for 256 elements):
 //   [0:2]   f16 scale
 //   [2:258] int8[256] quantized FWHT-rotated weights
+int dot = __builtin_amdgcn_sudot4(true, wp0, true, xp0, 0,   false);
+dot     = __builtin_amdgcn_sudot4(true, wp1, true, xp1, dot, false);
 ```
 
-The `__builtin_amdgcn_sudot4(true, wp, true, xp, ...)` call (both
-booleans `true` → both operands signed int8) delivers the 4× ALU
-throughput PR #158 also exploited for HFQ4. **The lever exists for
-HFQ8; it just ships under the MQ8 name.**
+The `(true, w, true, x, ...)` flags say both operands are signed int8;
+this delivers the 4× ALU throughput PR #158 exploited for HFQ4. **The
+gap on gfx906 is everything around the inner loop**: no wave64 variant,
+no residual+ILP-prefetch variant, no fused single-token GEMVs, no
+batched GEMM, no MoE-indexed kernels.
 
 #### 3.2.1 On-disk format and runtime status
 
-**HFQ8 weights:** unsigned `q ∈ [0, 255]`, 8 weights = 8 bytes per
-thread (dword-aligned). Group is 264 bytes (8-byte header + 256
-unsigned bytes).
+**MQ8 weights:** symmetric signed `q ∈ [-127, 127]`, fp16 scale only,
+256 weights per 258-byte group. **FWHT-rotated at quantize time**;
+matching activation rotation happens once per layer via the existing
+`mq8_rotate_quantize_x` / `fused_rmsnorm_rotate_mq` kernels (already in
+the tree at `crates/hipfire-runtime/src/dispatch.rs:2495`). The
+rotation is **one small per-layer kernel**, not a per-GEMV cost; the
+GEMV inner loop is identical to a hypothetical un-rotated int8-weight
+GEMV.
 
-Dequant formula: `acc += (sc * q + zp) * x_k` directly. **No signed
-shift, no `+128` offset** — q is unsigned, treated as `q ∈ [0, 255]`
-in the FP path.
+Quantize-tool support: `--format mq8` in `crates/hipfire-quantize/src/main.rs`
+(function `quantize_mq8g256` at line 540). No `hf8` format exists in
+the tool; raw HFQ8 work is deprioritized indefinitely (see header v3
+reframe).
 
-**HFQ8 runs end-to-end on gfx906 at B=1 today** via:
-
-| Kernel | Path | Status |
-|---|---|---|
-| `gemv_hfq8g256` | linear-algebra B=1 | ✓ wave32 FP |
-| `kv_cache_write_hfq8` | KV cache write | ✓ |
-| `attention_hfq8_kv` | attention with HFQ8 KV cache | ✓ |
-
-The plan's framing of "HFQ8 is barely functional" was wrong. The
-work is **throughput optimization at B>1**, not "make HFQ8
-functional."
+**MQ8 runs end-to-end on gfx906 at B=1 today** via `gemv_mq8g256` plus
+the activation-rotate kernel called once per layer.
 
 #### 3.2.2 Coverage gap on gfx906
 
-| Path | HFQ8 today | Gap |
+| Path | MQ8 today | Gap |
 |---|---|---|
-| Plain GEMV (B=1) | wave32 (`gemv_hfq8g256.hip`) | needs wave64 variant |
-| Residual GEMV (B=1) | none | needs both wave32 and wave64 |
-| Single-token fused GEMV (B=1) | none | needs wave64 |
-| **Batched GEMM (B>1)** | **none** | needs wave64 + dp4a |
-| MoE-indexed | none | needs 5 HFQ8 kernels |
+| Plain GEMV (B=1) | ✓ dp4a (`gemv_mq8g256.hip`) | needs wave64 variant for occupancy parity with HFQ4 |
+| Residual GEMV (B=1) | none | needs wave64 + ILP-prefetch |
+| Single-token fused GEMV (B=1: gate_up / qkv / qkvza) | none | needs wave64 + dp4a (mirror of HFQ4 fused family) |
+| **Batched GEMM (B>1)** | **none** | needs wave64 + dp4a (mirror of `gemm_hfq4g256_wave64_dp4a`) |
+| MoE-indexed | none | needs 5 MQ8 kernels (down + gate_up, indexed + batched) |
 
-#### 3.2.3 Lever map for HFQ8
+#### 3.2.3 Lever map for MQ8
 
 | Lever | Status | Notes |
 |---|---|---|
-| wave64 GEMV (1.5–2× over wave32) | not shipped for HFQ8 | mechanical port; HFQ8 is 8-byte-aligned (dword-friendly), strictly easier than HFQ6 |
+| wave64 GEMV (1.5–2× over wave32) | not shipped for MQ8 | mechanical port; int8 weights are 8-byte/thread, dword-aligned, strictly easier than HFQ6 |
 | ILP-prefetch in residual | not applicable yet | needs residual variant first; then mechanical |
-| dp4a on int8 weights × Q8_1 activations | **shipped as MQ8** | use MQ8 if FWHT-rotated weights are acceptable; mirror to HFQ8 if raw int8 weights needed |
-| dp4a-MMQ batched (Q8_1 × int8 weights) | not shipped | feasible (mirror of MQ8 at B>1) but ~½ session of work |
-| dot8 (`v_dot8_i32_i4`) | NOT applicable (would require lossy 8→4 weight repack) | see §2.4 |
+| dp4a on int8 weights × Q8_1 activations | ✓ shipped at B=1 | extend to wave64 / fused / batched / MoE |
+| dp4a-batched (Q8_1 × int8 weights at B>1) | not shipped | direct extension of the B=1 kernel: same inner loop, batched accumulators, no LDS-streaming MMQ required |
+| dot8 (`v_dot8_i32_i4`) | NOT applicable (would require lossy 8→4 repack) | see §2.4 |
 | LM-head dp4a port | not shipped | mechanical mirror of `gemm_hfq4g256_wave64_dp4a` |
 
-#### 3.2.4 Phase A: wave64 + batched GEMM (~2.5 sessions)
+#### 3.2.4 Phase A: wave64 + batched GEMM + MoE (~2.5 sessions)
 
-Five small ports:
+Five small ports, all dp4a-on-int8 (no FP variant needed since the
+B=1 dp4a kernel is the reference):
 
-1. `gemv_hfq8g256_wave64.hip` — wave64 mirror of the existing
-   wave32. Trivial because 8-byte alignment plays nicely with dword
-   loads. ~¼ session.
-2. `gemv_hfq8g256_residual.hip` + `gemv_hfq8g256_residual_wave64.hip`
-   — new residual surface (doesn't exist today). ~½ session.
-3. `gemm_hfq8g256_wave64.hip` — batched GEMM (mirror of
-   `gemm_hfq4g256_wave64.hip`). FP path. ~½ session.
-4. `gemm_hfq8g256_wave64_dp4a.hip` — dp4a variant of (3). Mirror
-   the MQ8 inner loop on un-rotated weights. ~½ session.
-5. MoE-indexed: 5 files. ~½ session.
+1. `gemv_mq8g256_wave64.hip` — wave64 mirror of `gemv_mq8g256`. Trivial
+   because 8-byte alignment plays nicely with dword loads. ~¼ session.
+2. `gemv_mq8g256_residual_wave64.hip` + ILP-prefetch variant. New
+   residual surface (doesn't exist today). ~½ session.
+3. `fused_gate_up_mq8g256_wave64_dp4a.hip`, `fused_qkv_*`,
+   `fused_qkvza_*` — three single-token fused GEMVs at B=1. Mirror
+   of the HFQ4 fused-dp4a family. ~1 session.
+4. `gemm_mq8g256_wave64_dp4a.hip` — batched GEMM (B>1) for prefill /
+   DFlash verify / LM-head. The activations are already int8 and small
+   enough to fit in registers per-batch; **no LDS-streaming MMQ
+   required** (this is the structural difference from HFQ6 Phase C).
+   ~½ session.
+5. MoE-indexed: 5 kernels mirroring the HFQ4 family. ~½ session.
 
-#### 3.2.5 No HFQ8 MMQ port
+**Activation rotation:** the dispatch layer already routes through
+`mq8_rotate_quantize_x` / `fused_rmsnorm_rotate_mq` to produce rotated
+fp16 input, then through `quantize_q8_1_mmq_ds4` to produce Q8_1
+activations. The new wave64 / batched / MoE kernels consume the same
+Q8_1 scratch — no new wiring at the runtime layer.
 
-Q8_1 × int8 weights is structurally the same as MQ8 at B=1. Adapting
-the MQ8 kernel for batched B>1 is simpler than a new MMQ port — it's
-just batched dp4a, no LDS streaming required (the activations are
-already int8 and small enough that they fit in registers per-batch).
-**Expected work: covered by Phase A item 4 above.** No separate
-"Phase C" for HFQ8.
+#### 3.2.5 No MQ8 MMQ-streaming port
 
-#### 3.2.6 HFQ8 + DFlash
+Q8_1 × int8 weights at B>1 is structurally simpler than HFQ4-MMQ:
+weights are already int8, no nibble unpack, no per-mmq_x LDS-stride
+sweep. Phase A item 4 covers the batched case directly with batched
+dp4a accumulators. **No separate "Phase C" for MQ8.** This is the
+structural payoff of doing MQ8 instead of HFQ6 work first.
 
-DFlash verify-pass on a hypothetical 27B hf8 target would currently
-have **no batched GEMM kernel to dispatch to**. After Phase A item 3
-+ 4, the dp4a-batched path covers it. The verify-pass behaves like
-MQ8 verify (which works today via the existing batch=1 kernel called
-N times — slow, but functional).
+#### 3.2.6 MQ8 + DFlash
 
-**Production-relevance check:** HFQ8 is rare. Most 8-bit production
-deployments use MQ8 (rotated) or Q8_0 (stock llama.cpp). The HFQ8
-work matters only if a specific user shipped raw HFQ8 weights without
-the FWHT rotation.
+DFlash verify-pass on Qwen 9B mq8 currently dispatches to a B=1 kernel
+called N times for the verify batch — functional but slow. After Phase
+A item 4, the dp4a-batched path covers it directly. Expected lift: TBD
+by Priority 0; direction is positive since the verify pass is
+batched-GEMM-dominated.
 
-### 3.3 HFQ3 / MQ3 — out of scope but flagged
+**Production-relevance check:** MQ8 is the deployed int8 format. The
+quantize tool emits it; mq8 models are produced from local hf16/bf16
+sources via `hipfire-quantize --format mq8`. Workload-demand is
+conditional on whether mq8 deployment becomes meaningful for gfx906
+users vs the existing mq4/mq6 paths.
+
+### 3.3 MQ3 — out of scope but flagged
 
 Per AGENTS.md §A: MQ3 is production on gfx11/gfx12, and on gfx906
 "MQ3 weights still load and run via per-token GEMV fallback —
 correct, just slower." MQ3 has *more* documented production demand
-than mq6/hf8 on gfx906.
+than mq6/mq8 on gfx906.
 
-**The plan's recommended priority list (§5) considers MQ3 alongside
-HFQ6/HFQ8 in the demand check.** A separate HFQ3-specific plan
-would mirror this document but is not in scope here.
+**The priority list (§5) considers MQ3 alongside MQ6/MQ8 in the
+demand check.** A separate MQ3-specific plan would mirror this
+document but is not in scope here.
 
 ---
 
@@ -510,17 +543,17 @@ The closed `gfx906-dot8-port.md` PRD (on the `feat/gfx906-dot8-port`
 branch — not in master) established that **int4 activations are not
 viable for transformer inference on these models**. Q4_1 NRMSE 18×
 Q8_1; geometric floor at ~9-12% worst-block even with asymmetric
-quant + smaller groups. That conclusion is load-bearing for
-HFQ6/HFQ8 work too:
+quant + smaller groups. That conclusion is load-bearing for MQ6 / MQ8
+work too:
 
-- The activation format for any HFQ6/HFQ8 dp4a variant must be
+- The activation format for any MQ6 / MQ8 dp4a variant must be
   **Q8_1** (the existing format), not Q4_1. (Weight quant choice is
   independent.)
-- Any future HFQ6/HFQ8 MMQ port must inherit PR #158's `mmq_screen`
-  + `mmq_screen_threshold` mechanism for outlier-row rejection.
+- Any future MQ6 MMQ port (§3.1.3 Phase C) must inherit PR #158's
+  `mmq_screen` + `mmq_screen_threshold` mechanism for outlier-row
+  rejection.
 
-**The dot8 lever explicitly does not apply to HFQ6 or HFQ8** — see
-§2.4.
+**The dot8 lever explicitly does not apply to MQ6 or MQ8** — see §2.4.
 
 ---
 
@@ -529,35 +562,60 @@ HFQ6/HFQ8 work too:
 ### 5.0 Priority 0: baseline measurement (~½ session, prerequisite)
 
 **Before any kernel work**, run the canonical AR decode + DFlash
-benches on existing mq6 / hf8 / mq3 / mq8 paths on gfx906 with
+benches on existing mq4 / mq6 / mq8 / mq3 paths on gfx906 with
 3-run deterministic medians per AGENTS.md prompt-md5 / binary-md5
 requirements:
 
-- Qwen 9B mq6 AR decode tok/s
-- Qwen 9B mq3 AR decode tok/s
 - Qwen 9B mq4 AR decode tok/s (sanity baseline against PR #158
   numbers)
-- Qwen 9B mq8 AR decode tok/s (the dp4a reference for HFQ8 work)
-- DFlash 27B mq6 humaneval-0 tok/s (if model exists)
+- Qwen 9B mq6 AR decode tok/s (target for §3.1 wave64 work)
+- Qwen 9B mq8 AR decode tok/s (target for §3.2 dp4a-extension work;
+  this is the reference dp4a kernel today)
+- Qwen 9B mq3 AR decode tok/s (per AGENTS.md §A: production on
+  gfx11/12, runs via fallback on gfx906)
+- DFlash 27B mq6 humaneval-0 tok/s (if a 27B mq6 model is built;
+  produced via `hipfire-quantize --format mq6`)
 
-Record absolute tok/s + the comparison matrix. **All lift
+**Quantize prerequisites** (before bench): the canonical mq8 / mq6 9B
+and 27B targets are not on disk; produce locally via:
+
+```
+hipfire-quantize --format mq8 <hf16-source>  # ~1-2 min for 9B
+hipfire-quantize --format mq6 <hf16-source>  # ~4-8 min for 27B
+```
+
+Record absolute tok/s + the comparison matrix. Write up at
+`docs/perf-checkpoints/2026-05-06-mq6-mq8-baselines.md`. **All lift
 estimates below are placeholders pending Priority 0.**
 
 ### 5.1 Priority list (post-Priority-0, demand-conditional)
 
+HFQ8 is dropped from the priority list per the v3 scope reframe (no
+quantize-tool support, no shipped models, MQ8 is the deployed int8
+target). MQ6 / MQ8 are the only int-quant kernel-coverage targets.
+
 | Priority | Phase | Cost | Expected lift | Risk | Demand gate |
 |---:|---|---:|---|---|---|
-| 1 | HFQ8 Phase A (wave64 + batched GEMM + dp4a + MoE) | ~2.5 sessions | TBD by P0 | low (HFQ8 is dword-aligned; MQ8 is the reference) | needed if any production deployment uses raw HFQ8 (vs MQ8) |
-| 2 | HFQ6 Phase A (wave64 GEMV + residual + fused + batched + MoE, FP-only) | ~3 sessions | TBD by P0 | low — mirror of HFQ4 wave64 work | needed if mq6 has measured production demand |
-| 3 | HFQ6 Phase B (dp4a port for fused GEMVs, AR optimization) | ~1 session | TBD; PMC-gated | medium — needs PMC validation | only if Phase A's HFQ6 kernels show ALU headroom |
-| 4 | HFQ6 Phase C (MMQ batched, DFlash verify) | **5 sessions** | TBD; up to +90% on Qwen 27B mq6 DFlash *if anyone uses that combo* | high — full LDS bank-conflict diagnostic + mmq_screen plumbing | only if 27B mq6 + DFlash becomes a real workload |
-| 5 | (HFQ3) — separate plan, gated on demand vs HFQ6 | — | — | — | likely higher demand than HFQ6/HFQ8 per AGENTS.md |
+| 1 | MQ8 Phase A (wave64 GEMV + residual + fused + batched + MoE, all dp4a) | ~2.5 sessions | TBD by P0 | low — int8 weights are dword-aligned; B=1 dp4a kernel already in tree as reference | needed if mq8 deployment becomes meaningful on gfx906 |
+| 2 | MQ6 Phase A (wave64 GEMV + residual + fused + batched + MoE, FP-only) | ~3 sessions | TBD by P0 | low — mirror of HFQ4 wave64 work | needed if mq6 has measured production demand |
+| 3 | MQ6 Phase B (dp4a port for fused GEMVs, AR optimization) | ~1 session | TBD; PMC-gated | medium — needs PMC validation | only if Phase A's MQ6 kernels show ALU headroom |
+| 4 | MQ6 Phase C (MMQ batched, DFlash verify) | **5 sessions** | TBD; up to +90% on Qwen 27B mq6 DFlash *if anyone uses that combo* | high — full LDS bank-conflict diagnostic + mmq_screen plumbing | only if 27B mq6 + DFlash becomes a real workload |
+| 5 | (MQ3) — separate plan, gated on demand | — | — | — | likely higher demand than mq6/mq8 per AGENTS.md §A |
 
 **Decision rule:** do priorities 1 and 2 *only if* Priority 0 shows a
 real workload using these quants on gfx906. Otherwise defer the
 entire plan. The lessons from PR #158's diagnostic-first methodology
 + the closed dot8 PRD's negative result both point toward "don't
 build speculative kernel optimizations."
+
+**Why MQ8 is priority 1 over MQ6:**
+- The dp4a-on-int8 inner loop is already shipped in
+  `gemv_mq8g256.hip`; Phase A items are mechanical mirrors with the
+  same proven inner loop.
+- No MMQ-streaming port required (Phase A item 4 covers batched
+  directly with register-tile dp4a).
+- Smaller total scope (~2.5 sessions vs MQ6's ~3 + optional ~1 + ~5
+  sessions for full coverage).
 
 ### 5.2 Coherence-gate cost (per glm5 3.4)
 
@@ -575,9 +633,9 @@ specific HFQ6 kernels need no changes.
 
 ## 6. What's not blocked by this analysis
 
-- The HFQ4 production path (PR #158 work) is not affected.
-- The existing wave32 HFQ6 / HFQ8 paths remain functional throughout
-  (Phase A adds wave64 alongside; doesn't remove wave32).
+- The HFQ4 / MQ4 production path (PR #158 work) is not affected.
+- The existing wave32 MQ6 / B=1 dp4a MQ8 paths remain functional
+  throughout (Phase A adds wave64 alongside; doesn't remove wave32).
 - gfx11 / gfx12 WMMA paths unchanged.
 - mq6 / mq8 production deployments continue working at current
   performance unless / until Priority 0 + Phase A land.
@@ -604,10 +662,10 @@ specific HFQ6 kernels need no changes.
     dp4a-on-fused-GEMV pattern
   - `kernels/src/gemm_hfq4g256_residual_mmq_gfx906_body.cuh` — the
     MMQ kernel body to adapt for HFQ6 Phase C
-- Adversarial reviews (folded into v2):
-  - `docs/plans/gfx906-hfq6-hfq8-port-plan-rev-claude.md`
-  - `docs/plans/gfx906-hfq6-hfq8-port-plan-rev-gemini.md`
-  - `docs/plans/gfx906-hfq6-hfq8-port-plan-rev-glm5.md`
+- Adversarial reviews (folded into v2; renamed in v3 alongside this doc):
+  - `docs/plans/gfx906-mq6-mq8-port-plan-rev-claude.md`
+  - `docs/plans/gfx906-mq6-mq8-port-plan-rev-gemini.md`
+  - `docs/plans/gfx906-mq6-mq8-port-plan-rev-glm5.md`
 - AGENTS.md §A (MQ3 production status), §5 (perf-bench
   reproducibility requirements), CLAUDE.md (coherence-gate
   requirements per kernel change).
