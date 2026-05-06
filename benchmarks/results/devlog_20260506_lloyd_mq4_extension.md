@@ -705,6 +705,310 @@ alloc+free churn — but the headline tok/s number is unchanged.
 7% gap remains. Next levers: kernel-internal optimization (codebook
 prefetch, wider unroll) or fusion-across-GEMVs (QKV / gate+up).
 
+### Codebook prefetch experiment — DID NOT HELP, reverted
+
+Tried adding a codebook prefetch across the quad boundary in the
+gfx1100 kernel: each thread holds a `prefetched` register, loaded at
+quad q for use at quad q+1. Intent: hide the global-load latency for
+the codebook fp16 read behind the FMAs of the current quad.
+
+Static analysis: VGPR went 74 → 76 (+1 for the prefetch register;
+.s file rounds), 0 spills, LDS unchanged. Tail K-sweep parity test
+PASSED (max-abs ~3-4e-7, identical to pre-prefetch). 4B Lloyd-MQ3 ppl
+13.1804 (bit-identical).
+
+Bench (3 runs, GRAPH=1):  111.8 / 111.7 / 111.5 tok/s.
+Pre-prefetch baseline:     113.2 tok/s.
+Δ: −1.5% regression.
+
+Disassembly diagnosis: the compiler placed the prefetch in a
+fall-through block AFTER the FMA loop body, with `s_waitcnt vmcnt(0)`
+immediately following the load. That's the opposite of what we want
+— the load result is awaited synchronously before continuing,
+defeating the latency-hiding intent.
+
+```
+.LBB0_4:
+    s_add_i32 s12, s12, 1
+    ds_store_b32 v17, v20          ← cb_lds[tid] = prefetched
+    s_cmp_ge_i32 s12, s11
+    s_waitcnt lgkmcnt(0)
+    s_cbranch_scc1 .LBB0_3         ← back to body if more
+; %bb.5:                            ← fall-through (NOT taken to body)
+    ...
+    global_load_d16_b16 v1, v[1:2], off    ← prefetch issued HERE
+    s_waitcnt vmcnt(0)              ← waits synchronously
+    v_cvt_f32_f16_e32 v20, v1.l
+    s_branch .LBB0_3                ← then jumps to body
+```
+
+Why the compiler put the prefetch in the fall-through: the load is
+guarded by `if (q + 1 < quads)`, so it lives in a conditionally-
+executed basic block. LLVM's scheduler chose to place it after the
+loop body's branch decision rather than inline before the FMAs. The
+extra +1 VGPR worsens register pressure by a hair, and the prefetch
+runs synchronously in a path that gives no FMA-overlap benefit.
+
+To make prefetch actually overlap FMAs would require restructuring:
+- Manual 2x loop unroll (interleave prefetch[i+1] with FMA[i] at
+  source level), giving the compiler less scheduling freedom
+- HIP intrinsics (`__builtin_amdgcn_global_load_lds` for direct
+  global→LDS load on RDNA3 — eliminates the register intermediate
+  but is arch-specific)
+- Or just accept the compiler's decision
+
+Stashed (in stash@{0}) pending decision on whether to iterate with a
+different prefetch shape (manual unroll, intrinsics) or drop. The
+working tree currently matches HEAD = residual fusion + profile
+instrumentation, no prefetch.
+
+#### Iteration 2 — unconditional prefetch with clamped index
+
+Hypothesis: removing the `if (q+1 < quads)` guard would prevent the
+compiler from lifting the load into a fall-through basic block, and
+the prefetch would actually overlap with FMAs. Replaced with:
+
+```
+const int next_q = (q + 1 < quads) ? (q + 1) : (quads - 1);  // clamp
+const __half* next_cb_h = (const __half*)(row_ptr + (next_q << 2) * 112 + (tid >> 3) * 112);
+prefetched = __half2float(next_cb_h[tid & 7]);   // unconditional
+```
+
+Built clean. Tail K-sweep PASS. Bench (3 runs, GRAPH=1):
+**112.6 / 112.6 / 112.8 tok/s** (vs 113.2 baseline; within noise).
+VGPR: 74 → 79 (+5).
+
+Disassembly diagnosis (.LBB0_3 inner loop body, lines 65-78 of the
+.s file):
+
+```
+.LBB0_3:                                ; inner loop body
+    global_load_d16_b16 v1, v[18:19], off    ← prefetch issued
+    [9 instructions of address calc]
+    s_waitcnt vmcnt(0)                        ← waits ~9 instr later
+    v_cvt_f32_f16_e32 v1, v1.l
+    ds_store_b32 v26, v1                      ← LDS store
+    s_waitcnt lgkmcnt(0)
+    buffer_gl0_inv                            ← barrier
+    [load 8 index bytes, load 8 x[] b128, FMAs ...]
+```
+
+The compiler kept the unconditional load INLINE in the iteration
+body (no fall-through quirk this time) but inserted `s_waitcnt
+vmcnt(0)` only 9 instructions after the issue — far less than the
+200-300 cycle global memory latency. The hard data dependency
+through the LDS store (load → wait → convert → ds_store) prevents
+the compiler from delaying the wait past the FMAs.
+
+The cross-iteration overlap I encoded in source (load address set
+at end of iter N, used at top of iter N+1) was collapsed back into
+a per-iteration synchronous "load + wait + convert + LDS-store +
+barrier + FMAs" sequence. The +5 VGPR pressure comes from the
+address calc that's now eagerly computed at the bottom of each
+iteration to set up the next prefetch.
+
+**Conclusion: source-level prefetch is structurally insufficient on
+this kernel.** The LDS-store-then-barrier pattern forces the
+compiler to synchronize before the FMAs can use the codebook. To
+get true cross-iteration overlap requires either:
+
+- **Manual loop unroll 2x with explicit prefetch interleaving** —
+  source form gives the compiler less freedom to re-fuse the load
+  with the LDS store
+- **HIP `__builtin_amdgcn_global_load_lds` intrinsic** — async
+  global→LDS load that bypasses the register intermediate
+
+Reverted both kernels to HEAD (no prefetch). Stash dropped.
+
+#### Iteration 3 — `__builtin_amdgcn_global_load_lds` is NOT available on RDNA3
+
+Tested the intrinsic compile-time across AMD arch families:
+
+| Arch family               | Compiles |
+|---------------------------|---------|
+| CDNA (gfx906/908/90a/942/950) | ✓ |
+| RDNA1/2 (gfx1030)             | ✓ |
+| **RDNA3 (gfx1100/1150)**      | **✗** |
+| RDNA4 (gfx1200)               | ✗ |
+
+LLVM backend error: `Cannot select: intrinsic %llvm.amdgcn.global.load.lds`.
+The hardware feature is `vmem-to-lds-load-insts` (description: "global_load
+w/lds bit set, buffer_load w/lds bit set or global_load_lds"). It was
+present on CDNA1/2/3 and RDNA1/2 but **removed in RDNA3** and not restored
+in RDNA4. Our gfx1100 target cannot use this path.
+
+**The hardware-async-load lever is closed on this arch.** Manual loop
+unroll is the only remaining prefetch option, but it's a heavy lift on a
+kernel that's already at 47% of theoretical peak — within the typical
+50-60% ceiling for small-batch GEMV on RDNA3. The expected gain is
+bounded.
+
+### Step 4 — `weight_gemv_swiglu_residual` MQ3G256Lloyd arm (silu+mul+rotate fusion)
+
+Added the missing arm so Lloyd-MQ3 takes the same fused path as MQ3 / MQ4
+/ MQ6: `fused_silu_mul_rotate_mq` + `gemv_mq3g256_lloyd_residual` instead
+of the generic 3-launch (silu_mul + rotate + gemv_residual). One launch
+saved per FFN per token = 1600 launches saved per 50 tokens × ~9 µs/launch
+= ~14 ms = ~1.5% expected wall gain on the 1035 ms baseline.
+
+PPL=13.1804 (4B, bit-identical, correctness preserved). Bench (3 runs):
+**113.3 / 113.3 / 113.5 tok/s** vs 113.2 baseline = +0.2% wall.
+
+Same pattern as the residual fusion: serial-profile attribution
+overestimates wall savings for small kernels that were already
+pipelining-overlapping with the dominant GEMV in graph-capture mode.
+
+### Pattern observed across three fusion experiments
+
+| Optimization                 | Profile Δ  | Wall Δ |
+|------------------------------|-----------:|-------:|
+| Residual fusion              | −4.7%      | +0.5%  |
+| Codebook prefetch (2 shapes) | n/a        | −1.5% / 0% |
+| SwiGLU fusion arm            | ~−1.5%     | +0.2%  |
+
+**Lesson reinforced:** on this graph-capture-enabled decode loop,
+launch-count reduction is structurally not paying off in wall time.
+Async pipelining already hides those small kernels. The dominant
+GEMV (63% of decode at 420 GiB/s ≈ 47% of 7900 XTX's 960 GB/s peak)
+is the only meaningful lever — and it's already within the typical
+50-60% ceiling for small-batch GEMV on RDNA3.
+
+**Decision (2026-05-06 evening):** build the fused gate+up Lloyd-MQ3
+kernel for code-quality / symmetry with the MQ4 family (sets up the
+path for the future MQ4-Lloyd port), even though wall gain is
+expected to be ~0%. Then investigate kernel-internal levers (wider
+unroll K8, batched-shape changes) that COULD shift the GEMV-internal
+ceiling rather than chasing already-hidden launch overhead.
+
+### Step 5 — Fused Gate+Up MQ3-Lloyd kernel (delivers +1.5% wall, contradicts pattern)
+
+Shipped `kernels/src/fused_gate_up_mq3g256_lloyd.{,gfx1100.}hip` mirroring
+the MQ4 fused gate+up pattern (grid = gate_m + up_m, block routes via
+`gid < gate_m` to pick A_gate vs A_up). Wired through `kernels.rs`
+arch selector, `dispatch.rs::fused_gate_up_mq3g256_lloyd`, and 5 call
+sites in `qwen35.rs` that previously hard-coded MQ4-only fast path.
+
+Bench (3 runs, GRAPH=1, 9B Lloyd-MQ3):
+**114.8 / 115.0 / 115.1 tok/s** vs 113.3 post-swiglu baseline = **+1.5% wall**.
+
+PPL=13.1804 (4B, bit-identical, correctness preserved).
+
+**Why this fusion DID move the wall, contradicting the pattern from
+residual / swiglu / launch-prefetch experiments:**
+
+The earlier failed fusions eliminated SMALL kernels (~9 µs each) that
+were already pipelining-overlapping the dominant GEMV. Saving those
+launch overheads from serial profile time didn't shorten the
+critical path because they weren't ON the critical path.
+
+Fused gate+up is structurally different — it combines two LARGE
+kernels (~31 µs GEMV each) into one. The savings include:
+- One launch overhead instead of two (~9 µs × 1 saved)
+- Better memory subsystem behavior: A_gate + A_up cacheline streams
+  interleave in one kernel vs two sequential issue points
+- Reduced graph capture / launch-blob bookkeeping
+- The two GEMVs were ON the critical path (back-to-back, no
+  meaningful overlap with each other), so combining them DOES
+  shorten wall time
+
+**Refined lesson:** launch-count reduction via fusion pays off
+when the fused kernels are individually large enough to BE the
+critical path. Small ancillary kernels (silu_mul, add_inplace,
+rotate) are bandwidth-bound but small; they hide. Two large back-
+to-back GEMVs are sequential by data dependency only when they share
+no intermediate — but here gate and up consume the SAME x and write
+DIFFERENT y, so they're independent — and a combined kernel benefits
+from issuing both grids in one launch.
+
+Cumulative journey:
+- baseline (pre-Lloyd-rewrite):    42.9 tok/s
+- K4 + LDS gfx1100 kernel:        112.6 tok/s   (2.62× — the headline)
+- residual fusion arm:            113.2 tok/s   (+0.5%, noise)
+- swiglu_residual MQ3-Lloyd arm:  113.3 tok/s   (+0.1%, noise)
+- **fused gate+up Lloyd-MQ3:**    115.0 tok/s   **(+1.5%, real)**
+- **Total: 2.68× from baseline; 5 tok/s short of ≥120 ship gate.**
+
+### Status (updated)
+
+- [x] Step 0 / 0a / 1 / 2 / 2.5 / 2.6 / 3 / 4b — see prior status
+- [x] Decode profiling — Lloyd GEMV 63%, no register/LDS issues
+- [x] Residual fusion — correct, 0.5% wall (+0.1% delta)
+- [x] Codebook prefetch — 2 source shapes failed; intrinsic unavailable on RDNA3
+- [x] SwiGLU fusion arm (MQ3G256Lloyd) — correct, +0.1% wall
+- [x] **Fused Gate+Up MQ3-Lloyd kernel — correct, +1.5% wall**
+- [ ] Step 4 — cross-process perf gate (≥120 tok/s; currently 115.0)
+
+5% gap remaining. Next direction (per user request) is to investigate
+**option 3 — bigger structural changes**: wider unroll K8 (more ILP
+per iteration) or batched-shape changes (move the bench to prefill or
+a different harness shape that better matches the kernel's strengths).
+
+**Follow-up note for CDNA / RDNA1/2 maintainers:** the intrinsic's
+async-load semantics ARE available on those archs and could deliver
+the latency-hiding the source-level prefetch couldn't. If someone
+later wants to push Lloyd-MQ3 perf on gfx906/908/90a/942/950 (CDNA)
+or gfx1030 (RDNA2) — the path is:
+
+1. Add an arch-specific gfx9xx (and/or gfx1030) variant of
+   `gemv_mq3g256_lloyd.hip` that uses
+   `__builtin_amdgcn_global_load_lds` for the cooperative codebook
+   load (and possibly the next-quad prefetch).
+2. Wire through `gemv_mq3g256_lloyd_for_arch` in `kernels.rs`.
+3. The current dispatch + tail-K parity test apply unchanged.
+
+Quick recipe (untested but should compile per the arch matrix above):
+
+```c
+// LDS holds raw fp16 bytes; convert per lookup in the FMA loop
+__shared__ __half cb_lds_h[32];
+
+// Per-quad cooperative load — async global→LDS, no register hop
+__builtin_amdgcn_global_load_lds(
+    /*src*/ reinterpret_cast<const void*>(gp0 + (tid >> 3) * 112 + (tid & 7) * 2),
+    /*dst*/ reinterpret_cast<void*>(&cb_lds_h[tid]),
+    /*size*/ 2, /*offset*/ 0, /*aux*/ 0);
+__syncthreads();   // covers both LDS visibility and global_load completion
+
+// FMA path: ds_read_b16 + v_cvt_f32_f16 per lookup
+// (8-way bank conflict potential on fp16-packed LDS — measure before shipping)
+```
+
+Note the bank-conflict tradeoff: 8 fp16 entries span 4 banks (vs 8
+banks at fp32) — worst-case 8-way conflict on distinct-q reads. May
+be net-negative depending on workload. A double-buffered fp16-load +
+fp32-LDS staging variant is also worth trying on those archs.
+
+**Lesson: a prefetch source pattern only helps if the compiler
+schedules it to overlap with the dominant compute. On gfx1100/HIP-
+LLVM, conditional global loads near the loop boundary tend to get
+placed synchronously, not asynchronously. Future prefetch attempts
+should be unconditional + hoisted out of `if (q+1 < quads)` guards
+(use clamped indexing to make the load always valid memory).**
+
+### Status (updated)
+
+- [x] Step 0 — bench harness
+- [x] Step 0a — disassembly preflight
+- [x] Step 1 — build clean
+- [x] Step 2 — ppl correctness vs baseline
+- [x] Step 2.5 — VGPR budget
+- [x] Step 2.6 — tail K-sweep
+- [x] Step 3 — coherence-gate
+- [x] Step 4b — launch_maybe_blob migration
+- [x] Decode profiling — Lloyd GEMV is 63%, no register/LDS issues
+- [x] Residual fusion — correct, 0.5% wall (4.7% profile-attribution)
+- [x] Codebook prefetch (simple) — REGRESSED 1.5%, stashed (compiler
+      placed prefetch synchronously in fall-through block; would need
+      manual unroll or HIP intrinsics to actually overlap)
+- [ ] Step 4 — cross-process perf gate (≥120 tok/s; currently 113.2)
+
+7% gap remains. Remaining levers (each with risks):
+- Manual unrolled prefetch (high effort, moderate confidence)
+- HIP `global_load_lds` intrinsic (medium effort, arch-specific)
+- Fused QKV / gate+up GEMV for Lloyd-MQ3 (medium effort, mirrors
+  existing MQ4 pattern; reduces total launch count)
+- Wider unroll K8 (medium effort, +VGPR pressure risk)
+
 ### Files touched
 
 - `crates/hipfire-runtime/examples/bench_qwen35_mq4.rs` — added

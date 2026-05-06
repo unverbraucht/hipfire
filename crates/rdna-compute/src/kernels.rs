@@ -47,6 +47,10 @@ pub const GEMV_MQ3G256_LLOYD_GFX1100_SRC: &str = include_str!("../../../kernels/
 /// add_inplace_f32 launch on the residual path (~4.4% of decode time).
 pub const GEMV_MQ3G256_LLOYD_RESIDUAL_SRC: &str = include_str!("../../../kernels/src/gemv_mq3g256_lloyd_residual.hip");
 pub const GEMV_MQ3G256_LLOYD_RESIDUAL_GFX1100_SRC: &str = include_str!("../../../kernels/src/gemv_mq3g256_lloyd_residual.gfx1100.hip");
+/// MQ3G256Lloyd fused gate+up GEMV: two GEMVs in one launch (saves 1 launch
+/// per FFN). Mirrors fused_gate_up_hfq4g256.{,gfx1100.}hip.
+pub const FUSED_GATE_UP_MQ3G256_LLOYD_SRC: &str = include_str!("../../../kernels/src/fused_gate_up_mq3g256_lloyd.hip");
+pub const FUSED_GATE_UP_MQ3G256_LLOYD_GFX1100_SRC: &str = include_str!("../../../kernels/src/fused_gate_up_mq3g256_lloyd.gfx1100.hip");
 
 /// Returns the MQ3G256-Lloyd GEMV kernel source AND module name for the given
 /// arch. gfx1100/1101/1102 (RDNA3) gets the K4-unrolled + LDS-codebook variant
@@ -81,6 +85,21 @@ pub fn gemv_mq3g256_lloyd_residual_for_arch(arch: &str) -> (&'static str, &'stat
             (GEMV_MQ3G256_LLOYD_RESIDUAL_GFX1100_SRC, "gemv_mq3g256_lloyd_residual_rdna3")
         }
         _ => (GEMV_MQ3G256_LLOYD_RESIDUAL_SRC, "gemv_mq3g256_lloyd_residual"),
+    }
+}
+
+/// Arch dispatch for fused gate+up MQ3-Lloyd. Same arch matrix as the GEMV
+/// variants. Used by `qwen35.rs` FFN forward when both `w_gate` and `w_up`
+/// are MQ3G256Lloyd to collapse 2 GEMV launches into 1.
+pub fn fused_gate_up_mq3g256_lloyd_for_arch(arch: &str) -> (&'static str, &'static str) {
+    if std::env::var("HIPFIRE_LLOYD_FORCE_BASELINE").ok().as_deref() == Some("1") {
+        return (FUSED_GATE_UP_MQ3G256_LLOYD_SRC, "fused_gate_up_mq3g256_lloyd");
+    }
+    match arch {
+        "gfx1100" | "gfx1101" | "gfx1102" => {
+            (FUSED_GATE_UP_MQ3G256_LLOYD_GFX1100_SRC, "fused_gate_up_mq3g256_lloyd_rdna3")
+        }
+        _ => (FUSED_GATE_UP_MQ3G256_LLOYD_SRC, "fused_gate_up_mq3g256_lloyd"),
     }
 }
 

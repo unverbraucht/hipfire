@@ -2161,6 +2161,54 @@ impl Gpu {
         self.gemv_mq3g256_lloyd_residual(a_raw, x_rot, y, m, k)
     }
 
+    /// Fused Gate+Up MQ3-Lloyd: two GEMVs in one launch. Mirrors
+    /// `fused_gate_up_hfq4g256` for the Lloyd-MQ3 dtype. Caller is
+    /// responsible for pre-rotating x (FWHT) before invoking; the kernel
+    /// itself only does the GEMV. Both `a_gate` and `a_up` must be MQ3-Lloyd
+    /// matrices with the same K and codebook layout.
+    pub fn fused_gate_up_mq3g256_lloyd(
+        &mut self,
+        a_gate: &GpuTensor, a_up: &GpuTensor, x: &GpuTensor,
+        y_gate: &GpuTensor, y_up: &GpuTensor,
+        gate_m: usize, up_m: usize, k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let (src, module) = kernels::fused_gate_up_mq3g256_lloyd_for_arch(&self.arch);
+        self.ensure_kernel(module, src, "fused_gate_up_mq3g256_lloyd")?;
+        let ag = a_gate.buf.as_ptr();
+        let au = a_up.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let yg = y_gate.buf.as_ptr();
+        let yu = y_up.buf.as_ptr();
+        let gm = gate_m as i32;
+        let um = up_m as i32;
+        let kv = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &ag as *const _ as *mut c_void, &au as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void, &yg as *const _ as *mut c_void,
+            &yu as *const _ as *mut c_void, &gm as *const _ as *mut c_void,
+            &um as *const _ as *mut c_void, &kv as *const _ as *mut c_void,
+        ];
+        let total = (gate_m + up_m) as u32;
+        // Bandwidth: A_gate + A_up read, x read once, y_gate + y_up written.
+        let bytes = crate::profile::gemv_mq3g256_lloyd_bytes(gate_m, k)
+            + crate::profile::gemv_mq3g256_lloyd_bytes(up_m, k)
+            - k * 4;  // x is shared, don't double-count
+        let timer = crate::profile::begin_timer(&self.hip, "fused", "fused_gate_up_mq3g256_lloyd", bytes);
+        let result = self.launch_maybe_blob(
+            "fused_gate_up_mq3g256_lloyd", [total, 1, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ag); b.push_ptr(au); b.push_ptr(xp);
+                b.push_ptr(yg); b.push_ptr(yu);
+                b.push_i32(gm); b.push_i32(um); b.push_i32(kv);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// Lazily initialize MagnumQuant FWHT sign tables (256 floats each, seeds 42 and 1042).
     pub fn ensure_mq_signs(&mut self) -> HipResult<()> {
         self.bind_thread()?;

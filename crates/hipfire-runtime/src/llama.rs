@@ -903,6 +903,20 @@ pub fn weight_gemv_swiglu_residual(
             gpu.fused_silu_mul_rotate_mq(gate, up, &x_rot_alias, w_down.k)?;
             gpu.gemv_hfq3g256_residual(&w_down.buf, &x_rot_alias, x, w_down.m, w_down.k)
         }
+        DType::MQ3G256Lloyd => {
+            // Same fusion as MQ3 / MQ4 / MQ6: silu(gate)*up rotated into
+            // mq_x_rot, then the Lloyd-MQ3 residual GEMV does down +
+            // residual in one launch. Saves one silu_mul_f32 launch versus
+            // the generic three-step path (silu_mul + rotate + gemv_residual).
+            gpu.ensure_mq_signs()?;
+            let x_rot_alias = GpuTensor {
+                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                dtype: DType::F32,
+            };
+            gpu.fused_silu_mul_rotate_mq(gate, up, &x_rot_alias, w_down.k)?;
+            gpu.gemv_mq3g256_lloyd_residual(&w_down.buf, &x_rot_alias, x, w_down.m, w_down.k)
+        }
         DType::MQ6G256 => {
             // MQ6 down + residual fusion: same FWHT rotate + fused-residual
             // pattern as MQ3 / MQ4, dispatched against the HFQ6 kernel.
