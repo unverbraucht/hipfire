@@ -1013,6 +1013,65 @@ the top-line goal is "make Lloyd-MQ3 fast", future investment should
 go to batched prefill, not further decode tuning. But that's
 out-of-scope for the current ship gate (decode tok/s ≥120).
 
+### K8 unroll experiment — null result, reverted
+
+Tried K8 unroll (8 accumulators, 8 packed indices, 8 LDS-staged
+codebooks per outer iteration) on the gfx1100 kernel.
+
+Static analysis:
+- VGPR: 74 → **96 exactly** (right at the 16-way occupancy ceiling
+  on gfx1100's 1536-VGPR/SIMD file)
+- LDS: 128 → 256 B
+- Spills: 0 (no spill, but no headroom)
+
+Correctness: tail K-sweep parity PASS, max-abs ~3-4e-7 (same as K4).
+PPL=13.1804 (4B Lloyd-MQ3, bit-identical).
+
+Bench (3 runs, GRAPH=1, 9B Lloyd-MQ3):
+**115.3 / 115.4 / 115.4 tok/s** vs 115.0 K4 baseline = +0.35% (within
+session noise per CLAUDE.md ±10-15% drift).
+
+**Verdict: K8 doesn't move the needle.** The compiler was already
+extracting all the ILP it could from K4. The bottleneck is structural
+(LDS read latency vs MQ4's pure-VALU recon), not ILP-bound. With +VGPR
+pressure (74→96, exactly at the 16-way occupancy ceiling) and 2× LDS
+footprint (128→256 B), this is a resource regression for noise-level
+perf. **Reverted to K4.**
+
+This reinforces the calibration finding: the 9 pp BW-utilization gap
+to MQ4 is rooted in per-byte compute cost (LDS access for codebook
+lookup), not pipeline saturation. Adding more in-flight work doesn't
+help when the LDS read itself is the long pole.
+
+### Where this leaves the 5% gap
+
+After exhausting:
+- Launch-overhead reduction (residual fusion, swiglu fusion, fused gate+up)
+- Codebook prefetch (2 source shapes; intrinsic unavailable on RDNA3)
+- Wider unroll K8 (no ILP win)
+
+The conclusion is that **115.0 tok/s is the structural ceiling** for
+Lloyd-MQ3 decode on gfx1100 at this kernel design. Closing the
+remaining 5% to ≥120 would require:
+
+- **A different reconstruction strategy** that avoids LDS access —
+  e.g., register-resident codebook + branch-free `v_perm_b32`-style
+  vector LUT (requires the codebook to be representable as a constant
+  permutation, which Lloyd's data-driven codebooks are not).
+- **A larger-batch shape** — multi-token decode (B>1) reuses the
+  same x against the same weights, cutting the per-token weight
+  bandwidth requirement. Out of scope for single-token decode bench.
+- **A different data layout** — fp16-packed codebook in registers
+  with thread-broadcast across the 8 codebook slots — would need
+  a major redesign and may not fit in registers.
+
+None of these is short-effort. The honest read at this point: ship
+at 115 tok/s and reframe the gate. The 2.68× speedup from baseline,
+plus the 17 pp BW-utilization improvement (37% → 54%) from the
+original switch-dispatch kernel, is the headline win. The 5% to
+120 is in noise-adjacent territory where session drift (±10-15%
+per CLAUDE.md) approaches the gain target.
+
 **Follow-up note for CDNA / RDNA1/2 maintainers:** the intrinsic's
 async-load semantics ARE available on those archs and could deliver
 the latency-hiding the source-level prefetch couldn't. If someone
