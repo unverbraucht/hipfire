@@ -230,6 +230,14 @@ pub const GEMV_HFQ6G256_RESIDUAL_WAVE64_SRC: &str = include_str!("../../../kerne
 /// Default-on for gfx906 via `gemv_prefetch_enabled(arch)`.
 pub const GEMV_HFQ6G256_RESIDUAL_WAVE64_PREFETCH_SRC: &str = include_str!("../../../kernels/src/gemv_hfq6g256_residual_wave64_prefetch.hip");
 
+/// gfx906 wave64+dp4a fused single-token GEMVs for HFQ6/MQ6 — the
+/// Phase A.1c headline lever. Mirror of HFQ4 fused-dp4a family; uses
+/// sdot4 with HFQ6's 6-bit unsigned weights (no zp shift correction).
+/// Plan §3.1.1 item 3 / v3.2.2 §5.1 item 1c.
+pub const FUSED_GATE_UP_HFQ6G256_WAVE64_DP4A_SRC: &str = include_str!("../../../kernels/src/fused_gate_up_hfq6g256_wave64_dp4a.hip");
+pub const FUSED_QKV_HFQ6G256_WAVE64_DP4A_SRC: &str = include_str!("../../../kernels/src/fused_qkv_hfq6g256_wave64_dp4a.hip");
+pub const FUSED_QKVZA_HFQ6G256_WAVE64_DP4A_SRC: &str = include_str!("../../../kernels/src/fused_qkvza_hfq6g256_wave64_dp4a.hip");
+
 
 /// HFQ3-G256: flat 3-bit with 256-weight groups.
 /// Block: [f32 scale][f32 zero][96B data] = 104 bytes per 256 weights (0.41 B/w).
