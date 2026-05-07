@@ -69,6 +69,12 @@ pub const FUSED_GATE_UP_HFQ6G256_WAVE64_DP4A_SRC: &str = include_str!("../../../
 pub const FUSED_QKV_HFQ6G256_WAVE64_DP4A_SRC: &str = include_str!("../../../kernels/src/fused_qkv_hfq6g256_wave64_dp4a.hip");
 pub const FUSED_QKVZA_HFQ6G256_WAVE64_DP4A_SRC: &str = include_str!("../../../kernels/src/fused_qkvza_hfq6g256_wave64_dp4a.hip");
 
+/// Phase A.2 (plan v3.2.3 §5.1 item 2): wave64+dp4a batched residual
+/// GEMM for HFQ6/MQ6 prefill. Mirror of `gemm_hfq4g256_wave64_dp4a.hip`
+/// with HFQ6 6-bit unpack and `+=` residual write semantic. Used for
+/// per-layer wo + w_down at B>1.
+pub const GEMM_HFQ6G256_RESIDUAL_WAVE64_DP4A_SRC: &str = include_str!("../../../kernels/src/gemm_hfq6g256_residual_wave64_dp4a.hip");
+
 
 /// HFQ3-G256: flat 3-bit with 256-weight groups.
 /// Block: [f32 scale][f32 zero][96B data] = 104 bytes per 256 weights (0.41 B/w).
