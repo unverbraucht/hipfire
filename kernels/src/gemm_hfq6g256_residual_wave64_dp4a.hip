@@ -22,13 +22,13 @@
 // Topology mirrors gemm_hfq4g256_wave64_dp4a:
 //   block = [64, 1, 1]   = 2 warps, each handles 1 row (warp_id = row offset)
 //   grid  = [(M+1)/2, ceil(N/BATCH_TILE), 1]
-//   BATCH_TILE = 8 tokens per WG, accumulators acc[BATCH_TILE]
+//   BATCH_TILE = 16 tokens per WG, accumulators acc[BATCH_TILE]
 //
 // Output write semantic: `Y[...] += val` (residual fuse), unlike the
 // HFQ4 sibling's `Y[...] = val` (overwrite).
 
 #define QK8_1 32
-#define BATCH_TILE 8
+#define BATCH_TILE 16
 
 struct block_q8_1_mmq {
     half2 ds4[4];

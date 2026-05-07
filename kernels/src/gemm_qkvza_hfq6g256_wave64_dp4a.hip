@@ -18,8 +18,10 @@
 // batched-fused convention. Residual is only fused at the wo + w_down
 // sites which use gemm_hfq6g256_residual_wave64_dp4a (Phase A.2).
 
+// BATCH_TILE was 8 in Phase A.3; raised to 16 in B.1.1 for A-reload
+// amortization (same trick as gate_up at commit 2bee6e6).
 #define QK8_1 32
-#define BATCH_TILE 8
+#define BATCH_TILE 16
 
 struct block_q8_1_mmq {
     half2 ds4[4];

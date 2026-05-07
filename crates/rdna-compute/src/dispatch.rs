@@ -8162,7 +8162,7 @@ impl Gpu {
             &bs_val as *const _ as *mut c_void,
         ];
 
-        const BATCH_TILE: usize = 8;
+        const BATCH_TILE: usize = 16;
         let batch_tiles = (batch_size + BATCH_TILE - 1) / BATCH_TILE;
         let grid_x = ((m as u32) + 1) / 2;
 
@@ -8591,7 +8591,8 @@ impl Gpu {
             &bs_val as *const _ as *mut c_void,
         ];
 
-        const BATCH_TILE: usize = 8;
+        // BT raised 8→16 in B.1.1 (matches kernel + gate_up sibling at 2bee6e6).
+        const BATCH_TILE: usize = 16;
         let batch_tiles = (batch_size + BATCH_TILE - 1) / BATCH_TILE;
         let total_m = (qkv_m + z_m + beta_m + alpha_m) as u32;
         let grid_x = (total_m + 1) / 2;
@@ -9051,7 +9052,8 @@ impl Gpu {
             &bs_val as *const _ as *mut c_void,
         ];
 
-        const BATCH_TILE: usize = 8;
+        // BT raised 8→16 in B.1.1 (matches kernel + gate_up sibling at 2bee6e6).
+        const BATCH_TILE: usize = 16;
         let batch_tiles = (batch_size + BATCH_TILE - 1) / BATCH_TILE;
         let total_m = (q_m + k_m + v_m) as u32;
         let grid_x = (total_m + 1) / 2;

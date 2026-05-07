@@ -359,6 +359,78 @@ blocks with LDS-staged A would reduce that to 1×.
 whether LDS-staging A across waves moves the kernel toward the
 memory-throughput floor. Estimated effort: ~1 session.
 
+## Phase B.1.1: multi-wave attempt (NEGATIVE) + BT=16 sibling propagation
+
+Tested two multi-wave designs to reduce A-reload traffic:
+
+| Variant | Block size | tok/s pp128 | vs BT=16 single-wave |
+|---|---|---:|---:|
+| BT=16, 1 wave (baseline) | [64, 1, 1], 2 rows × 16 tokens | 153.7 | — |
+| ROWS_PER_BLOCK=4 | [128, 1, 1], 4 rows × 16 tokens | 147.0 | -4 % |
+| 2-subtile (same 2 rows, 32 tokens) | [128, 1, 1], 2 rows × 32 tokens | 142.0 | -8 % |
+
+**PMC for the 2-subtile variant:**
+- L2CacheHit 85 → **95 %** (cache sharing worked!)
+- VALUBusy 53 → **43 %** (occupancy hurt more than cache helped)
+
+**Root cause of regression:** 128-thread blocks halve VGPR-budget
+occupancy on gfx906 (10 blocks/SIMD vs 21 with 64-thread blocks).
+The cache-locality benefit is real but smaller than the SIMD-
+utilization loss. **The current 64-thread block is well-tuned for
+occupancy.** Multi-wave-with-LDS would need careful VGPR/LDS budget
+rebalancing — not a one-session win.
+
+Reverted to single-wave + BT=16 baseline.
+
+### BT=16 propagation to siblings (the actual win)
+
+Applied BT=8 → BT=16 to the other 3 HFQ6 dp4a kernels: `residual`,
+`qkvza`, `qkv`. All four kernels share the structurally identical
+inner loop, so the same A-reload-amortization argument applies.
+
+**Per-kernel ms/call (rocprof, 9b.mq6 pp128, gfx906):**
+
+| Kernel | BT=8 baseline | BT=16 all 4 | Δ per call |
+|---|---:|---:|---:|
+| gate_up | 10.99 ms | **9.15 ms** | -16.7 % |
+| residual | 3.45 ms | **3.19 ms** | -7.5 % |
+| qkvza | 5.49 ms | **4.70 ms** | -14.4 % |
+| qkv | 4.58 ms | **3.86 ms** | -15.8 % |
+
+**Wall-clock comparison (5 prefill runs each, JIT-warm, same session):**
+
+| State | Prefill pp128 | Decode g50 | Notes |
+|---|---:|---:|---|
+| Pre-Phase-B (BT=8 all 4) | ~165.8 | 42.5-42.7 | from rocprof timing |
+| HEAD (BT=16 gate_up only, commit `2bee6e6`) | 153.7 | 43.7 | |
+| **B.1.1 final (BT=16 all 4)** | **189.9** | **43.5** | spread 0.4 % across 5 runs |
+| Δ vs HEAD | +23.5 % | -0.5 % (noise) | |
+| Δ vs Pre-Phase-B | +14.5 % | -0.0 % | |
+
+**Methodology note (CLAUDE.md "Perf benchmarking" rule):** an early
+BT=16-all run reported 162 tok/s and a separate decode run showed
+20.9 tok/s — both turned out to be measurement noise (likely thermal
+throttling from rapid back-to-back rocprof runs without DPM stabilization).
+5-run JIT-warm benches with tight spread (0.4 %) are the reliable
+signal; never trust 1-run or 2-run numbers for kernel-A/B decisions.
+Decode noise was particularly misleading — looked like a 2× regression,
+turned out to be one-off thermal. Always re-bench after any "this
+broke" reaction.
+
+### Why no further tuning on Path 1
+
+The four dp4a kernels are now memory-throughput-bound at ~33 GB/s
+vs MI50 peak 1024 GB/s (3 %). The ALU is idle ~47 % of cycles
+waiting for memory. To move the floor we need either:
+- LDS-staged A across multiple waves (real rewrite, ~1 session;
+  also requires careful VGPR/LDS budget — multi-wave attempt above
+  failed without LDS)
+- MMQ-streaming small-tile port (Path 2, plan §3.1.3, ~5 sessions)
+
+Path 2 is the right next move per the v3.2.5 errata sequencing.
+Path 1's room is exhausted with BT=16 + single-wave 64-thread
+blocks.
+
 ## Cross-references
 
 - Plan: `docs/plans/gfx906-mq6-mq8-port.md` v3.2.3 (commit `d02dc95`)

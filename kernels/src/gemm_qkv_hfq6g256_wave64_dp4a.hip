@@ -9,8 +9,10 @@
 // instead of 4-way. Same math + lane-mapping. Plan §3.2.3 §5.1 item 3
 // (Phase A.3).
 
+// BATCH_TILE was 8 in Phase A.3; raised to 16 in B.1.1 for A-reload
+// amortization (same trick as gate_up at commit 2bee6e6).
 #define QK8_1 32
-#define BATCH_TILE 8
+#define BATCH_TILE 16
 
 struct block_q8_1_mmq {
     half2 ds4[4];
