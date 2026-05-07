@@ -8022,6 +8022,54 @@ impl Gpu {
         self.gemm_hfq4g256(a_raw, x, y, m, k, batch_size)
     }
 
+    /// HFQ6-G256 sister of `gemm_hfq4g256_batched_lmhead`. Phase A.4
+    /// (plan v3.2.3 §5.1 item 4). On gfx906 uses the dp4a residual GEMM
+    /// (Phase A.2) with a zero-init of Y, mirroring the HFQ4 WMMA pattern
+    /// at line 8019-8022. Lets the residual `+=` collapse to `=` semantics
+    /// without needing a separate non-residual kernel.
+    ///
+    /// Caller is responsible for FWHT-rotating x first when the weights
+    /// are MQ6 (FWHT-rotated at quant time).
+    pub fn gemm_hfq6g256_batched_lmhead(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        // gfx906: dp4a residual + zero-init Y for `=` semantics.
+        if batch_size > 1 && gemv_dp4a_enabled(&self.arch) {
+            match self.active_stream.as_ref() {
+                Some(stream) => self.hip.memset_async(&y.buf, 0, batch_size * m * 4, stream)?,
+                None => self.hip.memset(&y.buf, 0, batch_size * m * 4)?,
+            }
+            return self.gemm_hfq6g256_residual_wave64_dp4a(a_raw, x, y, m, k, batch_size);
+        }
+        // gfx11+: WMMA residual + zero-init.
+        let wmma_eligible = batch_size > 1
+            && self.arch.starts_with("gfx11")
+            && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0")
+            && !std::env::var("HIPFIRE_LM_HEAD_WMMA").map_or(false, |v| v == "0");
+        if wmma_eligible {
+            self.fp16_x_source_ptr = std::ptr::null_mut();
+            match self.active_stream.as_ref() {
+                Some(stream) => self.hip.memset_async(&y.buf, 0, batch_size * m * 4, stream)?,
+                None => self.hip.memset(&y.buf, 0, batch_size * m * 4)?,
+            }
+            return self.gemm_hfq6g256_residual_wmma(a_raw, x, y, m, k, batch_size);
+        }
+        // Fallback: use the residual dispatcher with zero-init Y. This
+        // routes to fp16-packed or scalar depending on arch.
+        match self.active_stream.as_ref() {
+            Some(stream) => self.hip.memset_async(&y.buf, 0, batch_size * m * 4, stream)?,
+            None => self.hip.memset(&y.buf, 0, batch_size * m * 4)?,
+        }
+        self.gemm_hfq6g256_residual(a_raw, x, y, m, k, batch_size)
+    }
+
     /// HFQ3-G256 sister of `gemm_hfq4g256_batched_lmhead`. Same FP16-X cache
     /// stomp + zero-init of Y, then `gemm_hfq3g256_residual_wmma` to compute
     /// y[b][row] = A[row] · x[b]. Used by `dflash::gemm_dispatch` for MQ3
