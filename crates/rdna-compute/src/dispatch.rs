@@ -3285,15 +3285,24 @@ impl Gpu {
 
         // Wave64-native fast path (gfx906/908/94x): 2 rows per block, halves
         // grid.x. Mirrors the HFQ4 sibling at line ~5378. Plan §3.1.1 item 2
-        // (gfx906-mq6-mq8-port.md v3.2.1). Byte-exact with the wave32 base
-        // since each warp's 32-lane reduction stays in-warp.
+        // (gfx906-mq6-mq8-port.md v3.2.1 + v3.2.2). Byte-exact with the
+        // wave32 base since each warp's 32-lane reduction stays in-warp.
+        // ILP-prefetch variant gates on gemv_prefetch_enabled(arch) — default
+        // on for gfx906 (Phase A.1b, mirror of HFQ4 +4.8% lever from `3ef127d`).
         if has_wave64_native(&self.arch) {
-            self.ensure_kernel(
-                "gemv_hfq6g256_residual_wave64",
-                kernels::GEMV_HFQ6G256_RESIDUAL_WAVE64_SRC,
-                "gemv_hfq6g256_residual_wave64",
-            )?;
-            let func = &self.functions["gemv_hfq6g256_residual_wave64"];
+            let (kname, ksrc): (&str, &str) = if gemv_prefetch_enabled(&self.arch) {
+                (
+                    "gemv_hfq6g256_residual_wave64_prefetch",
+                    kernels::GEMV_HFQ6G256_RESIDUAL_WAVE64_PREFETCH_SRC,
+                )
+            } else {
+                (
+                    "gemv_hfq6g256_residual_wave64",
+                    kernels::GEMV_HFQ6G256_RESIDUAL_WAVE64_SRC,
+                )
+            };
+            self.ensure_kernel(kname, ksrc, kname)?;
+            let func = &self.functions[kname];
             let grid = ((m as u32) + 1) / 2;
             return unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [64, 1, 1], 0, self.stream_ref(), &mut params) };
         }

@@ -224,6 +224,12 @@ pub const GEMV_HFQ6G256_RESIDUAL_SRC: &str = include_str!("../../../kernels/src/
 /// item 2 (gfx906-mq6-mq8-port.md v3.2.1).
 pub const GEMV_HFQ6G256_RESIDUAL_WAVE64_SRC: &str = include_str!("../../../kernels/src/gemv_hfq6g256_residual_wave64.hip");
 
+/// Wave64-native HFQ6-G256 residual GEMV with software-pipelined
+/// across-quad weight prefetch. Mirror of `gemv_hfq4g256_residual_wave64_prefetch.hip`.
+/// Plan §3.1.1 item 2 / v3.2.2 §5.1 item 1b (the ILP-prefetch lever).
+/// Default-on for gfx906 via `gemv_prefetch_enabled(arch)`.
+pub const GEMV_HFQ6G256_RESIDUAL_WAVE64_PREFETCH_SRC: &str = include_str!("../../../kernels/src/gemv_hfq6g256_residual_wave64_prefetch.hip");
+
 
 /// HFQ3-G256: flat 3-bit with 256-weight groups.
 /// Block: [f32 scale][f32 zero][96B data] = 104 bytes per 256 weights (0.41 B/w).
