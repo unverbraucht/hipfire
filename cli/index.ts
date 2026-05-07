@@ -864,9 +864,9 @@ async function runViaHttp(
   image: string | undefined,
   temp: number, maxTokens: number, repeatPenalty: number, topP: number,
 ): Promise<boolean> {
-  // VL flows go through the image-base64 path on the daemon which the HTTP
-  // wrapper now exposes via `image_base64` in genParams. Remove the guard
-  // so `hipfire run --image` can also proxy through a running serve daemon.
+  // VL requests proxy through the daemon's `image_base64` IPC field —
+  // `hipfire run --image` can hit a running serve instead of cold-spawning
+  // a fresh daemon per call.
 
   const body: any = {
     model, stream: true,
@@ -1355,10 +1355,16 @@ async function serve(port: number) {
       console.error(`[hipfire] idle for ${cfg.idle_timeout}s — unloading model (VRAM freed; next request will reload)`);
       await e.send({ type: "unload" });
       await e.recv();
+    } catch (err: any) {
+      console.error(`[hipfire] eviction failed: ${err?.message ?? err}`);
+    } finally {
+      // Reset capability state regardless of whether send/recv threw.
+      // Leaving these stale (e.g. modelHasVL=true after a broken-pipe
+      // eviction) makes the next request forward image_base64 to a
+      // daemon that has nothing loaded.
       current = null;
       currentMaxSeq = null;
       modelHasVL = false;
-      } catch (err: any) {      console.error(`[hipfire] eviction failed: ${err?.message ?? err}`);
     }
   }, Math.min(60_000, idleTimeoutMs)) : null;
   // Keep process alive irrespective of the interval; clean up on exit.
@@ -1482,7 +1488,12 @@ async function serve(port: number) {
                     if (mimeMatch) {
                       const raw = url.slice(url.indexOf(",") + 1);
                       images.push(raw);
-                    } else if (/^data:image\//.test(url)) {
+                    } else {
+                      // Anything else under `data:` is unsupported. Flag
+                      // both data:image/<other> (webp, gif, ...) AND
+                      // non-image data: URIs (data:application/pdf, ...)
+                      // so the request fails loudly instead of silently
+                      // dropping the part and proceeding as text-only.
                       unsupportedImage = true;
                     }
                   }
@@ -1535,9 +1546,18 @@ async function serve(port: number) {
 
         const nonSystem = messages.filter((m: any) => m.role !== "system" && m.role !== "developer");
         let requestImages: string[] = [];
-        let hasUnsupportedImage = false;
-        let hasMalformedImage = false;
         const convParts: string[] = [];
+        // Image-validation errors fire inline (per-message) so the
+        // returned 400 reflects the actual offending turn rather than
+        // an aggregate across the conversation. Helper unifies the
+        // safeRelease + Response.json shape.
+        const rejectImage = (message: string) => {
+          safeRelease();
+          return Response.json(
+            { error: { message, type: "invalid_request_error" } },
+            { status: 400 },
+          );
+        };
         for (let i = 0; i < nonSystem.length; i++) {
           const m = nonSystem[i];
           const role = m.role;
@@ -1551,24 +1571,36 @@ async function serve(port: number) {
               for (const tc of m.tool_calls) {
                 const fn = tc.function || tc;
                 let args = {};
-                try { args = JSON.parse(fn.arguments || "{}"); } catch {}
+                try {
+                  args = JSON.parse(fn.arguments || "{}");
+                } catch (err: any) {
+                  // Surface the parse failure so a malformed-args call
+                  // doesn't silently turn into a "tool was called with {}"
+                  // entry in the conversation. Keep the call in-stream
+                  // (using {}) so the model isn't left with a torn turn,
+                  // but make the divergence visible in serve logs.
+                  console.error(`[hipfire] tool_call: failed to parse arguments JSON for "${fn.name}" (${err?.message ?? err}) — substituting {}`);
+                }
                 text += `\n<tool_call>\n${JSON.stringify({ name: fn.name, arguments: args })}\n</tool_call>`;
               }
             }
           } else if (role === "user") {
             const content = extractContent(m.content);
+            if (content.malformedImage) {
+              return rejectImage("malformed image part — image_url.url is required");
+            }
+            if (content.unsupportedImage) {
+              return rejectImage("unsupported image format — supported: png, jpeg");
+            }
             if (content.images.length > 0) {
               if (i < nonSystem.length - 1) {
-                safeRelease();
-                return Response.json(
-                  { error: { message: "images in earlier user turns are not supported — image must be in the last user message", type: "invalid_request_error" } },
-                  { status: 400 },
-                );
+                return rejectImage("images in earlier user turns are not supported — image must be in the last user message");
+              }
+              if (content.images.length + requestImages.length > 1) {
+                return rejectImage("multiple images not supported — only one image per request");
               }
               requestImages.push(...content.images);
             }
-            if (content.unsupportedImage) hasUnsupportedImage = true;
-            if (content.malformedImage) hasMalformedImage = true;
             text = content.text;
           } else {
             text = extractText(m.content);
@@ -1588,30 +1620,6 @@ async function serve(port: number) {
           }
         }
         userPrompt = convParts.join("");
-
-        if (requestImages.length > 1) {
-          safeRelease();
-          return Response.json(
-            { error: { message: "multiple images not supported — only one image per request", type: "invalid_request_error" } },
-            { status: 400 },
-          );
-         }
-
-        if (hasUnsupportedImage) {
-          safeRelease();
-          return Response.json(
-            { error: { message: "unsupported image format — supported: png, jpeg", type: "invalid_request_error" } },
-            { status: 400 },
-          );
-        }
-
-        if (hasMalformedImage) {
-          safeRelease();
-          return Response.json(
-            { error: { message: "malformed image part — image_url.url is required", type: "invalid_request_error" } },
-            { status: 400 },
-          );
-        }
 
         const rawPath = findModel(body.model || "default");
         if (!rawPath) { safeRelease(); return Response.json({ error: "model not found" }, { status: 404 }); }

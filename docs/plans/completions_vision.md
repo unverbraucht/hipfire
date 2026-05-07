@@ -419,10 +419,11 @@ These are not required for the initial ship but should be tracked.
 
 `generate_vl()` (daemon.rs:2423) currently lacks `max_think_tokens`
 support. The text-only `generate()` has full thinking-mode handling:
-decoded-text scan via `rfind("💭")`, force-emit `💭\n` to close thinking
-with KV-write consistency, budget tracking, attractor-block setup.
-This logic is ~60 lines spread across 8 locations in `generate()` and
-is deeply coupled to the decode loop's architecture.
+decoded-text scan via `rfind("<think>")` / `rfind("</think>")`,
+force-emit `</think>\n` to close thinking with KV-write consistency,
+budget tracking, attractor-block setup. This logic is ~60 lines spread
+across 8 locations in `generate()` and is deeply coupled to the decode
+loop's architecture.
 
 Port strategy:
 
@@ -430,7 +431,7 @@ Port strategy:
    `prev_in_think`, with `update(&decoded_text) -> bool` and
    `should_force_close() -> bool` methods.
 2. **Port the force-close injection** (~35 lines) into `generate_vl()`.
-   This runs `💭\n` tokens through `forward_scratch` to maintain KV
+   This runs `</think>\n` tokens through `forward_scratch` to maintain KV
    cache consistency — `infer_vl.rs` has a simpler but **incorrect**
    implementation (no KV-write on force-close → hidden-state discontinuity).
    Use the daemon's approach as the reference.
@@ -448,6 +449,11 @@ content (replaying bug #74). As a cheap stopgap in Phase 1, hardcode
 `max_think_tokens = 256` in the `generate_vl` dispatch when the client
 doesn't specify one. This caps thinking without needing the full
 extraction.
+
+**Note (2026-05-07):** earlier revisions of this section described the
+markers as `💭` / `💭\n` for both open and close — that was wrong (the
+text path uses `<think>` / `</think>`). Implementation followed the
+buggy plan literally; both the code and this doc were corrected.
 
 #### 2.2 Multi-turn VL conversations
 
