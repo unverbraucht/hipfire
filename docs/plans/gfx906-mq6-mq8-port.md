@@ -204,19 +204,73 @@ covering the `gemm_*_residual_mmq_gfx906_x{N}.hip` family for HFQ6.
 The §5.1 priority list now reflects this with explicit
 prefill-vs-decode columns (see §5.1 below).
 
+### v3.2.3 errata (2026-05-07): Phase A decode shipped — measured +41-50 % vs +15-18 % calibrated target
+
+Phase A.1a/b/c shipped 2026-05-06 → 2026-05-07 across commits `466f1a6`,
+`692d792`, `ba246c4`. Cumulative decode lift on gfx906 mq6:
+
+| Stage | 9B pp32 | 9B pp128 | 27B pp32 | 27B pp128 |
+|---|---:|---:|---:|---:|
+| wave32 (`850848a`) | 31.1 | 30.3 | 10.2 | 10.1 |
+| + A.1a wave64 | 32.0 | 31.3 | 10.6 | 10.5 |
+| + A.1b prefetch | 32.3 | 31.7 | 10.9 | 10.7 |
+| **+ A.1c dp4a-fused** | **44.0** | **42.8** | **15.3** | **15.0** |
+| **Cumulative Δ** | **+41.5 %** | **+41.3 %** | **+50.0 %** | **+48.5 %** |
+
+**~2.5-3× better than the v3.2.2 calibrated +15-18 % target.** Full
+analysis in `docs/perf-checkpoints/2026-05-07-phase-a-cumulative-mq6.md`.
+
+**Why the calibration underestimated:** v3.2.2 anchored on PR #158's
++16.2 % HFQ4 attribution, but PR #158's measurements ran on a
+baseline that **already had wave64 in place** (`166451d` predates
+the +16.2 % bench). HFQ4's `5a45260` measured +7.5 % from gate_up
+dp4a only because the wave64-vs-wave32 win was already baked in.
+HFQ6 had **zero** gfx906 GEMV optimization pre-Phase-A, so today's
+A.1c captured three layered wins simultaneously: wave32→wave64
+lane utilization, scalar-call→fused-call dispatch overhead, and
+dp4a vs scalar FP ALU throughput.
+
+**27B sees more lift than 9B (+50 % vs +41 %)** — projection family
+is a larger fraction of decode time at scale.
+
+**mq6 decode is now bandwidth-bound at ~31 % of HBM2 peak**, matching
+the post-PR-158 mq4 baseline. Phase A is genuinely complete on the
+decode side; further GEMV-level levers won't deliver meaningful lift
+without bandwidth-reduction approaches (smaller quants, KV
+optimization, speculative decode).
+
+### v3.2.3 errata (2026-05-07): prefill is now the dominant remaining gap
+
+Phase A delivered ~0 % on prefill (as v3.2.2 predicted: prefill goes
+through batched GEMM, not GEMV). But the gap relative to mq4 is
+striking now that decode is closed:
+
+| Workload | mq4 9B pp128 | mq6 9B pp128 | Gap |
+|---|---:|---:|---:|
+| Decode | 59 tok/s | 42.8 tok/s | 1.4× (matches BW-bound 1.47× ratio) |
+| **Prefill** | **594 tok/s** | **46.8 tok/s** | **12.7×** |
+
+mq6 prefill is **8.6× slower than its bandwidth-bound floor** would
+predict. The gap is kernel-architecture: mq4 prefill takes the
+PR #158 dp4a-MMQ path (`gemm_hfq4g256_residual_mmq_gfx906_x{N}` family,
++5×); mq6 prefill falls through to wave32 scalar `gemm_qkvza_hfq6g256`
+with no gfx906 optimization ever. **This is the natural Phase B target
+for v3.2.3.**
+
 ### Calibrated decode-lift expectations (gfx906, post-v3.2.2)
 
-| Lever | Expected 9B mq6 decode Δ | Evidence basis |
-|---|---:|---|
-| Wave64 residual GEMV | +3 % (today's experiment) | direct measurement |
-| Wave64 + ILP-prefetch on residual | +7 % (HFQ4 reference, untested for HFQ6) | extrapolated from PR #158 |
-| Wave64 + dp4a on fused gate_up | +7 % | HFQ4 reference |
-| Wave64 + dp4a on fused qkv + qkvza | +1 % | HFQ4 reference |
-| **Phase A complete (gfx906 mq6 decode)** | **+15-18 % cumulative** | mirror of HFQ4 +16.2 % |
+| Lever | Expected 9B mq6 decode Δ | Measured (post-v3.2.3) |
+|---|---:|---:|
+| Wave64 residual GEMV | +3 % (calibrated) | **+2.9 % (measured ✓)** |
+| Wave64 + ILP-prefetch on residual | +5-7 % (calibrated) | **+0.9-1.3 % (measured: smaller than HFQ4 sibling, likely because HFQ6 unpack already amortized some load latency)** |
+| Wave64 + dp4a on fused GEMVs trio | +7 % (calibrated, HFQ4 reference) | **+35-40 % (measured: 5× the calibrated value — HFQ6 had no prior dp4a optimization)** |
+| **Phase A complete (gfx906 mq6 decode)** | **+15-18 % cumulative** (v3.2.2) | **+41-50 % measured (v3.2.3)** |
 
-**Headline: full Phase A on HFQ6/MQ6 should deliver +15-18 % decode
-on gfx906, comparable to HFQ4's +16.2 %.** Phase A delivers ~0 % on
-prefill at B>1; that requires Phase C.
+**v3.2.3 takeaway: the HFQ4 reference attribution was a lower bound,
+not an upper bound, when applied to a quant that hadn't been through
+the same optimization journey.** Future plan calibrations for new
+quant ports should treat HFQ4-derived numbers as estimates of the
+*last incremental* lever's effect, not the *full* lever-stack effect.
 
 This document is **analysis-only**. It maps what's missing for MQ6
 and MQ8 to reach the same kernel-coverage level we have for HFQ4
@@ -789,28 +843,32 @@ Record absolute tok/s + the comparison matrix. Write up at
 `docs/perf-checkpoints/2026-05-06-mq6-baselines.md`. **All lift
 estimates below are placeholders pending Priority 0.**
 
-### 5.1 Priority list (revised v3.2 — MQ6 leads, MQ8 demoted)
+### 5.1 Priority list (revised v3.2.3 — Phase A decode complete, prefill is the new headline)
 
-HFQ8 is dropped per v3 (no quantize-tool support). MQ8 is demoted
-per v3.2 (per-layer runtime dispatch not wired; would need 4-7
-new kernels + 14 dispatch sites; no deployed per-layer model).
-MQ6 sub-phases reordered per v3.2.2 (dp4a-on-fused-GEMVs is the
-dominant lever; wave64 alone delivers ~3 % per HFQ4 reference).
+HFQ8 dropped per v3. MQ8 demoted per v3.2. MQ6 sub-phases reordered
+per v3.2.2 (dp4a-fused leads). v3.2.3 marks Phase A decode work as
+shipped with measured +41-50 % cumulative (vs +15-18 % calibrated
+target — see v3.2.3 errata for why) and reframes the priority list
+around the now-dominant prefill gap.
 
-| Priority | Phase | Cost | Decode Δ | Prefill Δ | Risk | Demand gate |
+| Priority | Phase | Cost | Decode Δ | Prefill Δ | Risk | Status |
 |---:|---|---:|---:|---:|---|---|
-| 1a | **MQ6 wave64 residual GEMV** (Phase A foundation, shipped 2026-05-06) | done (`466f1a6`) | **+3 %** measured | 0 % | low — mechanical mirror | shipped |
-| 1b | **MQ6 ILP-prefetch on residual** (mirror `gemv_hfq4g256_residual_wave64_prefetch.hip`) | ~½ session | est +5-7 % cumulative | 0 % | low | natural follow-up to 1a |
-| 1c | **MQ6 dp4a-on-fused-GEMVs** (gate_up + qkv + qkvza, three new wave64+dp4a kernels) | ~1 session | est +13-15 % cumulative (HFQ4 reference) | 0 % | medium — PMC-gated; verify VALUBusy < 50 % before commit | **highest-leverage decode lever** |
-| 1d | MQ6 MoE-indexed wave64+dp4a (10 kernels, A3B / MoE workload) | ~1 session | A3B-mq6 dependent | 0 % | low | only if MoE+MQ6 has demand |
-| 1e | MQ6 LM-head wave64 batched (`gemm_hfq6g256_wave64.hip`) | ~½ session | small (lm_head is ~8 % of decode) | small | low | natural completion of A |
-| 2 | MQ6 Phase C (MMQ batched, DFlash verify, prefill) | **5 sessions** | 0 % | up to +90 % | high — LDS bank-conflict + mmq_screen plumbing | only if 27B mq6 + DFlash or prefill-heavy workload becomes a real demand |
-| 3 | MQ8 Phase A (per-layer wiring + 4-7 new batched-GEMM kernels + 14 dispatch sites) | **~5-6 sessions** (per v3.2) | unmeasured | unmeasured | high — both kernels and runtime dispatch | **deferred until a production model ships raw MQ8 per-layer weights** |
-| 4 | (MQ3) — separate plan, gated on demand | — | — | — | — | likely higher demand than mq6/mq8 per AGENTS.md §A |
+| 1a | MQ6 wave64 residual GEMV | done (`466f1a6`) | **+2.9 % (9B), +3.9 % (27B) ✓ measured** | 0 % | low | **shipped 2026-05-06** |
+| 1b | MQ6 ILP-prefetch on residual | done (`692d792`) | **+0.9 % (9B), +2.8 % (27B) ✓ measured** | 0 % | low | **shipped 2026-05-06** |
+| 1c | MQ6 dp4a-on-fused-GEMVs trio | done (`ba246c4`) | **+36.2 % (9B), +40.4 % (27B) ✓ measured** | 0 % | low (gated on `gemv_dp4a_enabled`) | **shipped 2026-05-07** |
+| **1a+1b+1c cumulative** | (Phase A decode complete) | done | **+41.5 % (9B), +50.0 % (27B) ✓ measured** | 0 % | — | **shipped — see `2026-05-07-phase-a-cumulative-mq6.md`** |
+| **2** | **MQ6 dp4a-on-batched-residual** (`gemm_hfq6g256_residual_wave64_dp4a.hip`, prefill wo + w_down at B>1) | ~1 session | 0 % | est +20-30 % (subset of prefill) | low — mirrors A.1c structure at GEMM shape | **next: Phase A.2** |
+| 3 | MQ6 wave64 batched non-residual GEMM (`gemm_qkvza_hfq6g256_wave64.hip` etc.) | ~1 session | 0 % | est +5-10 % | low | natural completion of batched-fused family |
+| 4 | MQ6 LM-head wave64 batched (`gemm_hfq6g256_wave64.hip`) | ~½ session | small (lm_head is ~8 % of decode) | small | low | low priority |
+| 5 | MQ6 MoE-indexed wave64+dp4a (10 kernels, A3B / MoE workload) | ~1 session | A3B-mq6 dependent | A3B-mq6 dependent | low | only if MoE+MQ6 has demand |
+| 6 | MQ6 Phase C (MMQ batched, dp4a streaming) | **5 sessions** | 0 % | up to +5× (mirror of PR #158 HFQ4 result) | high — full LDS bank-conflict diagnostic + mmq_screen plumbing | the heavy lever if prefill-heavy mq6 production demand emerges |
+| 7 | MQ8 Phase A (per-layer wiring + 4-7 new batched-GEMM kernels + 14 dispatch sites) | **~5-6 sessions** (per v3.2) | unmeasured | unmeasured | high | **deferred until a production model ships raw MQ8 per-layer weights** |
+| 8 | (MQ3) — separate plan, gated on demand | — | — | — | — | likely higher demand than mq6/mq8 per AGENTS.md §A |
 
-**Phase A total (1a–1e):** ~3 sessions for the four remaining items;
-expected cumulative decode lift +15-18 % on 9B mq6 (mirror of HFQ4
-+16.2 %). Prefill unaffected — Phase C is the prefill lever.
+**Phase A decode is complete.** The remaining surface is prefill +
+LM-head + MoE. Prefill is now the dominant gap (mq6 13× behind mq4).
+Phase A.2 (dp4a-batched-residual, ~1 session) is the cheap intermediate
+prefill lever; Phase C (MMQ-batched, ~5 sessions) is the heavy lever.
 
 **Decision rule:** do priority 1 *only if* Priority 0 shows a real
 workload using mq6 on gfx906. Otherwise defer. The lessons from PR
