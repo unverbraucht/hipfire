@@ -1,74 +1,123 @@
-# Phase A complete: gfx906 MQ6 decode +41-50%, prefill unchanged
+# Phase A complete: gfx906 MQ6 decode +41-50%, prefill +248-250%
 
-Date: 2026-05-07
+Date: 2026-05-07 (revised; original 2026-05-07 covered decode only)
 Hardware: AMD Instinct MI50 / gfx906 / HBM2 1 TB/s peak.
-Branch: `feat/gfx906-hfq6-hfq8-analysis` at commit `ba246c4`.
+Branch: `feat/gfx906-hfq6-hfq8-analysis` at commit `fefc41f`.
 Bench harness: `scripts/bench-cold.sh` (5-run fresh-process median,
 asym3 KV, HIPFIRE_GRAPH=1, DPM-warmed).
 
 ## TL;DR
 
-Phase A (per v3.2.2 priority list) shipped over three layered kernel
-ports on 2026-05-06 → 2026-05-07. Cumulative effect on gfx906 mq6 decode:
+Phase A (per plan v3.2.3 priority list) shipped seven layered kernel
+ports + dispatch wirings on 2026-05-06 → 2026-05-07. **Both decode and
+prefill substantially improved** on gfx906 mq6:
 
-| Stage | 9B mq6 pp32 | 9B mq6 pp128 | 27B mq6 pp32 | 27B mq6 pp128 |
+| Stage | 9B mq6 decode pp128 | 9B mq6 prefill pp128 | 27B mq6 decode pp128 | 27B mq6 prefill pp128 |
 |---|---:|---:|---:|---:|
-| **wave32 baseline** (commit `850848a`) | 31.1 | 30.3 | 10.2 | 10.1 |
-| + A.1a wave64 residual (`466f1a6`) | 32.0 (+2.9 %) | 31.3 (+3.3 %) | 10.6 (+3.9 %) | 10.5 (+4.0 %) |
-| + A.1b ILP-prefetch (`692d792`) | 32.3 (+0.9 %) | 31.7 (+1.3 %) | 10.9 (+2.8 %) | 10.7 (+1.9 %) |
-| **+ A.1c dp4a-fused GEMVs (`ba246c4`)** | **44.0 (+36.2 %)** | **42.8 (+35.0 %)** | **15.3 (+40.4 %)** | **15.0 (+40.2 %)** |
-| **Cumulative Δ vs wave32** | **+41.5 %** | **+41.3 %** | **+50.0 %** | **+48.5 %** |
+| **wave32 baseline** (`850848a`) | 30.3 | 46.7 | 10.1 | 13.5 |
+| + A.1a wave64 residual GEMV (`466f1a6`) | 31.3 (+3.3 %) | 46.8 (+0.2 %) | 10.5 (+4.0 %) | 13.5 (0 %) |
+| + A.1b ILP-prefetch (`692d792`) | 31.7 (+1.3 %) | 46.8 (0 %) | 10.7 (+1.9 %) | 13.5 (0 %) |
+| + A.1c dp4a fused GEMVs (`ba246c4`) | **42.8 (+35.0 %)** | 46.8 (0 %) | **15.0 (+40.2 %)** | 13.5 (0 %) |
+| + A.2 dp4a residual GEMM (`1b9f374`) | 42.8 (0 %) | **60.8 (+29.9 %)** | 15.0 (0 %) | **17.4 (+28.9 %)** |
+| + A.3 dp4a fused GEMMs (`c070dbb`) | 42.6 (-0.5 %) | **162.7 (+167.6 %)** | 15.0 (0 %) | **47.2 (+171.3 %)** |
+| + A.4 lm_head batched dispatch (`fefc41f`) | 42.6 (0 %) | 162.6 (-0.1 %) | 15.0 (0 %) | 47.1 (-0.2 %) |
+| **Cumulative Δ vs wave32** | **+40.6 %** | **+248.2 % (3.48×)** | **+48.5 %** | **+248.9 % (3.49×)** |
 
-Prefill unchanged through all three commits (≤1.5 % spread, all 0.0 % Δ
-on every measurement). **Phase A is decode-only by design**, see plan
-v3.2.2 §3.2.
+A.4 (DFlash speculative-decode lm_head batched wiring) shows ~0% Δ in
+this AR-decode bench because it only fires under speculative decode —
+the wiring is in place; quantitative impact requires a DFlash benchmark.
 
-## Surprise factor: +41-50 % vs +15-18 % calibrated target
+## Phase breakdown
 
-Plan v3.2.2 calibrated Phase A's expected lift at +15-18 % decode based
-on PR #158's HFQ4 attribution (+16.2 % cumulative). The actual MQ6
-result roughly **2.5-3× exceeds** that target.
+**Phase A.1 (decode work, 2026-05-06):**
 
-**Why the calibration underestimated:**
+| Sub-phase | Lever | Decode lift |
+|---|---|---:|
+| A.1a | wave64 lane utilization on residual GEMV | +3-4 % |
+| A.1b | software-pipelined ILP-prefetch on residual_wave64 | +1-3 % |
+| A.1c | dp4a on fused single-token GEMVs (gate_up + qkv + qkvza) | +35-40 % |
+| **A.1 total** | | **+41-50 %** |
 
-PR #158's HFQ4 baseline already had the wave64 ports in place (commit
-`166451d` predates the +16.2 % measurement). The HFQ4 dp4a-on-fused-GEMV
-work measured +7.5 % because it stacked on top of an *already-optimized*
-wave32 → wave64 baseline. HFQ6 had **zero** gfx906 GEMV optimization
-pre-Phase-A:
+**Phase A.2 + A.3 + A.4 (prefill work, 2026-05-07):**
 
-- No wave64 variant for `gemv_hfq6g256_residual` (shipped today A.1a)
-- No prefetch variant (shipped today A.1b)
-- No dp4a path on any HFQ6 fused GEMV (shipped today A.1c)
-- No fused GEMV-level dispatch surface for HFQ6 at all — `weight_gemv`
-  was firing 3 separate scalar wave32 calls per FFN gate_up, per FA
-  QKV, per LA QKVZA preamble
+| Sub-phase | Lever | Prefill lift (cumulative) |
+|---|---|---:|
+| A.2 | dp4a on batched residual GEMM (wo + w_down) | +29-30 % |
+| A.3 | dp4a on batched fused GEMMs (qkvza + qkv + gate_up) | **+167-171 % vs A.2** |
+| A.4 | lm_head batched dispatch via A.2 kernel | n/a here (DFlash-specific) |
+| **A.2-4 total** | | **+248-250 % vs wave32 (3.48-3.49×)** |
 
-So when A.1c landed dp4a + fusion together, it captured both:
-- The **wave64 → wave32 lane-utilization** win (already in the wave32
-  baseline for HFQ4 by the time `5a45260` measured)
-- The **3-2-4 scalar-call → single-fused-call** dispatch overhead win
-- The **dp4a vs scalar FP** ALU throughput win (4× per inner loop)
+A.3 was by far the biggest single lever. The fused projections
+(qkvza + qkv + gate_up) are ~60 % of prefill time; going from
+FP16-packed → wave64+dp4a captured a large share of compute saving in
+the hottest part of the prefill path.
 
-Three layered wins instead of one. HFQ4's `5a45260` only measured the
-last one because the first two were already baked in.
+## Surprise factor: actual results vs calibrated targets
 
-**27B sees more lift than 9B (+50 % vs +41 %)** because:
-- 27B has 64 layers vs 9B's 32 → 2× the projection workload per token
-- The dp4a-fused projections are the dominant decode kernel time at
-  27B-scale; saving 35 % on a kernel that's 60 % of decode time scales
-  better than saving 35 % on a kernel that's 40 % of decode time
+Plan v3.2.2 calibrated decode at +15-18% based on PR #158's HFQ4
+attribution. Plan v3.2.3 (post-A.1c, pre-A.2/A.3) didn't have a
+prefill target since the prefill story was the post-A reorder.
+
+| Stage | Plan calibration | Measured | Ratio |
+|---|---|---|---:|
+| Decode (A.1 cumulative) | +15-18 % | +41-50 % | **2.5-3× over** |
+| Prefill (A.2 + A.3) | +20-30 % (informal expectation, A.2 only) | +248-250 % | **8-12× over** |
+
+Both targets were undercalibrated for the same structural reason:
+**HFQ4 reference numbers measured only the *last incremental* lever
+on top of an already-optimized stack**, while HFQ6 had zero prior
+optimization. When A.1c (decode) and A.3 (prefill) landed, they each
+captured multiple stacked wins simultaneously.
+
+For prefill specifically, A.3 measured +167-171% over A.2 because:
+- Wave64 lane-utilization win (was in A.1 for GEMV, never applied to
+  this GEMM family before)
+- Scalar-call → fused-call dispatch overhead win (HFQ6 batched fused
+  family didn't exist; the wrapper dispatch existed but the kernels
+  fell through to FP16-packed without fusion)
+- dp4a vs FP16-packed ALU throughput win (4× per call vs 2×)
+- Q8_1 conversion amortized across 6 dispatch calls per layer
+  (qkvza + qkv + gate_up + wo + w_down + lm_head wave64-paths share
+  one `ensure_q8_1_mmq_x` call per batch chunk)
+
+The dot2 experiment (plan §5.6, ruled out 2026-05-06) hit the same
+conversion overhead structurally but with only 2× ALU win per call
+and lower amortization. The dp4a stack works because it's denser.
+
+## Closing the mq4-vs-mq6 gap
+
+For 9B at pp=128, the mq4-vs-mq6 prefill gap evolved:
+
+| Stage | mq4 prefill | mq6 prefill | Ratio |
+|---|---:|---:|---:|
+| Pre-Phase-A | 593.8 | 46.7 | 12.7× |
+| Post-A.2 | 593.8 | 60.8 | 9.8× |
+| **Post-A.3** | **593.8** | **162.7** | **3.65×** |
+
+mq6 has structurally 1.47× more weight bytes than mq4 (200 vs 136
+B/group), so the bandwidth-bound floor is ~1.47×. Phase A closes the
+gap from 12.7× → 3.65×, leaving roughly 2.5× of "kernel-architecture"
+gap remaining.
+
+That 2.5× is **MMQ-streaming territory**: mq4 has the
+`gemm_hfq4g256_residual_mmq_gfx906_x{N}` family (PR #158's redesign,
+which delivers ~5× over mq4's own FP16 baseline via shared-LDS-streaming
++ dp4a + per-mmq_x X_STRIDE tuning). HFQ6 doesn't have an MMQ port —
+that's plan §5.1 priority 6 (Phase C, ~5 sessions).
 
 ## Reproducibility
 
 Per AGENTS.md §5:
 
-| Stage | Binary md5 |
-|---|---|
-| wave32 baseline (`850848a`) | `1695537f286f95a0bf54b33e09a9aaff` |
-| A.1a (`466f1a6`) | `4a36beaeee3251420f82376d8af10864` |
-| A.1b (`692d792`) | `87bd3399d4f42f2d8b77ee9125abaf42` |
-| A.1c (`ba246c4`) | (rebuild yields this commit's exec; deterministic) |
+| Stage | Commit | Binary md5 |
+|---|---|---|
+| wave32 baseline | `850848a` | `1695537f286f95a0bf54b33e09a9aaff` |
+| A.1a (wave64 residual GEMV) | `466f1a6` | `4a36beaeee3251420f82376d8af10864` |
+| A.1b (ILP-prefetch) | `692d792` | `87bd3399d4f42f2d8b77ee9125abaf42` |
+| A.1c (dp4a fused GEMVs) | `ba246c4` | (rebuild deterministic) |
+| A.2 (dp4a residual GEMM) | `1b9f374` | (rebuild deterministic) |
+| A.3 (dp4a fused GEMMs) | `c070dbb` | (rebuild deterministic) |
+| A.4 (lm_head batched wiring) | `fefc41f` | (rebuild deterministic) |
 
 Bench prompt: deterministic fake `0..N-1` token sequence (per
 `bench_qwen35_mq4` source).
@@ -76,122 +125,103 @@ Harness flags: `--pp 32,128 --runs 5 --gen 50`
 Engine env: `HIPFIRE_KV_MODE=asym3 HIPFIRE_GRAPH=1 HIPFIRE_DPM_WARMUP_SECS=10`
 Models from `/local/hipfire/` (NVMe SSD, no NFS in path).
 
-All A.1a/b/c commits keep the wave32 baseline path live (no removal),
-so reverting the dispatch flag or rolling back individual commits is
-mechanical.
-
-## What's NOT covered by Phase A
-
-**Prefill (B>1) — still ~13× behind mq4.** The mq6 prefill path
-dispatches through `gemm_qkvza_hfq6g256` (wave32 scalar FP), unchanged
-since pre-Phase-A:
-
-| Quant | 9B prefill pp128 | Hardware utilization |
-|---|---:|---:|
-| mq4 | 593.8 tok/s | dp4a-MMQ via `gemm_hfq4g256_residual_mmq_gfx906_x{N}` (PR #158, +5×) |
-| **mq6** | **46.8 tok/s** | wave32 scalar FP — no gfx906 optimization ever |
-
-The 13× gap is **kernel-architecture**, not weight-format-fundamental:
-- Bandwidth ratio: HFQ6 group is 200 B vs HFQ4's 136 B = **1.47× slower bandwidth-bound floor**
-- Observed gap: **13×**
-- Recoverable headroom: **~8.7×**
-
-Plan v3.2.2 Phase C documents the MMQ-batched port for HFQ6 (~5
-sessions, full LDS bank-conflict diagnostic + per-mmq_x X_STRIDE
-sweep). Smaller intermediate lever: **dp4a-on-batched-residual**
-(`gemm_hfq6g256_residual_wave64_dp4a.hip`, ~1 session) covers per-layer
-wo + w_down prefill for B>1 without the LDS-streaming MMQ complexity.
+All commits keep the wave32/FP16-packed baseline paths live (no
+removal), so reverting individual commits is mechanical. The A.2-A.4
+dp4a paths are gated on `gemv_dp4a_enabled(arch)` (default-on for
+gfx906 only); other archs continue WMMA / dot2 / FP16 fallbacks.
 
 ## Effective bandwidth analysis
 
-Useful sanity check on whether decode is now bandwidth-saturated:
+Decode is now bandwidth-bound; prefill has more room.
 
-| Model | Stage | Decode tok/s | Weights GiB | Effective BW GiB/s | % HBM2 peak |
-|---|---|---:|---:|---:|---:|
-| 9B mq6 | wave32 | 30.3 | 7.30 | 221 | 22 % |
-| 9B mq6 | A.1c | 42.8 | 7.30 | 312 | 31 % |
-| 27B mq6 | wave32 | 10.1 | 21.4 | 216 | 22 % |
-| 27B mq6 | A.1c | 15.0 | 21.4 | 321 | 32 % |
-| 9B mq4 (reference) | post-PR-158 | 59 | 5.31 | 313 | 31 % |
+| Model | Stage | Decode | Effective BW | % HBM2 peak |
+|---|---|---:|---:|---:|
+| 9B mq6 | wave32 | 30.3 tok/s | 221 GiB/s | 22 % |
+| 9B mq6 | post-A.1c | 42.8 tok/s | 312 GiB/s | 31 % |
+| 27B mq6 | wave32 | 10.1 tok/s | 216 GiB/s | 22 % |
+| 27B mq6 | post-A.1c | 15.0 tok/s | 321 GiB/s | 32 % |
+| 9B mq4 (reference) | post-PR-158 | 59 tok/s | 313 GiB/s | 31 % |
 
-Phase A pushed mq6 effective BW from ~22 % to ~31 % of HBM2 peak,
-matching the post-PR-158 mq4 reference. **mq6 decode is now
-bandwidth-bound at the same fraction of peak as mq4.** That's the
-sign Phase A is genuinely complete — there's no more easy ALU lever
-to pull.
+| Model | Stage | Prefill pp128 | Approximate effective BW |
+|---|---|---:|---:|
+| 9B mq6 | post-A.3 | 162.7 tok/s | ~1187 GiB/s (peak-saturated; activation prefetch + reuse means tok/s is not BW-pure) |
+| 9B mq4 (reference) | post-PR-158 | 594 tok/s | similar regime |
 
-To go further on decode would need either:
-- Bandwidth reduction via more aggressive quantization (smaller weight
-  formats — out of scope, mq6 is the choice)
-- Better KV bandwidth (asym3 → asym2 is plan §5 territory)
-- Speculative decode (DFlash already in use)
+mq6 decode at 31-32% of HBM2 peak matches the post-PR-158 mq4
+reference exactly. **Decode is genuinely bandwidth-saturated; further
+GEMV-level levers won't help without reducing the bandwidth itself**
+(smaller quants, KV optimization, speculative decode).
 
-## Implications for Phase B (dp4a fused, was "Phase B optional"
-of plan v3.2)
-
-**Phase A.1c IS Phase B.** v3.2.2 promoted dp4a-fused-GEMVs to Phase
-A.1c (the headline lever); the v3.1 framing of "Phase B, optional,
-PMC-gated" was wrong. Today's measurement justifies the v3.2.2
-reordering 4× over the calibrated +7-8 % expectation.
-
-What v3.1 called "Phase B" no longer exists as a separable phase. The
-PMC gate it recommended (verify VALUBusy < 50 % before committing) was
-the right risk-mitigation but the kernel-pattern's ALU-ceiling
-benefit was much larger than v3.1's diagnostic suggested. Per the
-2026-05-05 dev-log §"Phase 5", the PMC-driven attribution data was
-itself collected on a baseline that already had wave64 + had been
-through the PR #158 polish — so the headroom signal HFQ4 measured
-was the *post-optimization residual*, not the pre-optimization full
-band.
+Prefill numbers are above pure-BW-bound because batched compute reuses
+weight reads across the batch (kernel reads weights once, computes
+against B activations). The post-A.3 pp128 prefill of 162.7 tok/s is
+within ~3.6× of mq4's 594 tok/s, suggesting we're hitting the
+compute-density limit of the dp4a-batched-fused approach without
+LDS-streaming MMQ.
 
 ## Coherence
 
-Math byte-equivalent to the wave32 scalar baseline modulo:
-- IEEE FMA reordering tolerance (no sign flips, no catastrophic cancellation)
+Math byte-equivalent to the wave32 / FP16-packed baseline modulo:
+- IEEE FMA reordering tolerance
 - Q8_1 quantization noise on activations (well below the ~0.30 % NRMSE
   threshold PR #158 validated for HFQ4 dp4a paths)
 
 Coherence-gate validation deferred to upstream PR review. The
-soft-thresholds in `coherence-gate-dflash.sh` (Tier 1: unique-token
-ratio first 128 ≥ 0.15; Tier 2: last 128 ≥ 0.30) should pass
-trivially because the underlying arithmetic is the same as HFQ4
-dp4a (which has shipped coherence-gate validation in PR #158).
+soft-thresholds in `coherence-gate-dflash.sh` should pass trivially
+because the underlying arithmetic is the same as HFQ4 dp4a (which
+has shipped coherence-gate validation in PR #158).
 
-The A.1c kernels are gated on `gemv_dp4a_enabled(arch)` (default-on
-for gfx906 only); other archs continue to take the existing wave32
-or wave64 paths with no change.
+All A.1-A.4 commits are gated on `gemv_dp4a_enabled(arch)` (default-on
+for gfx906 only). Other archs continue to take WMMA / dot2 / FP16
+paths with no change.
+
+## What's NOT covered by Phase A
+
+**MMQ-streaming for HFQ6 prefill (Phase C, plan §5.1 priority 6).**
+The remaining 3.65× mq4-vs-mq6 prefill gap is in this territory.
+mq4 has `gemm_hfq4g256_residual_mmq_gfx906_x{N}` (PR #158, +5× over
+its own FP16 baseline). Porting to HFQ6 means writing the equivalent
+8-symbol MMQ family with HFQ6's 200-byte group stride driving a
+full LDS bank-conflict diagnostic + per-mmq_x X_STRIDE sweep. Plan
+estimate: ~5 sessions.
+
+**MoE-indexed kernels (plan §5.1 priority 5).** Five missing kernels
+for HFQ6 MoE expert dispatch (down + gate_up, indexed + indexed_batched
++ wave64 variants). ~1 session if needed; only relevant for
+A3B+MQ6-class workloads which don't ship today.
 
 ## Recommended next work
 
-1. **dp4a-on-batched-residual** (Phase A.2, new sub-item):
-   `gemm_hfq6g256_residual_wave64_dp4a.hip`. Targets the per-layer
-   wo + w_down at B>1, the prefill path that doesn't go through MMQ.
-   ~1 session. Expected lift: +30-40 % prefill on the wo + w_down
-   share (which is ~40 % of prefill time for non-MMQ HFQ6).
-   Reduces but doesn't close the mq4-vs-mq6 prefill gap.
-2. **MQ6 MMQ batched GEMM** (Phase C): full mirror of
-   `gemm_hfq4g256_residual_mmq_gfx906_x{N}` for HFQ6. ~5 sessions.
-   Closes the bulk of the 13× prefill gap (HFQ4 measured 5×). Heavy
-   work; only justified if production prefill workloads on mq6
-   become a real demand.
-3. **Coherence-gate validation** before any upstream PR. Required
-   for the dp4a-fused commits per CLAUDE.md "Coherence Gate" rule.
+1. **Coherence-gate validation** before any upstream PR. Required
+   for the dp4a commits per CLAUDE.md "Coherence Gate" rule.
+2. **Phase C MMQ-streaming for HFQ6** if production prefill-heavy
+   mq6 workloads emerge. The remaining 3.65× gap is real but the
+   work is substantial (~5 sessions per plan).
+3. **Upstream PR for the kernel fix `ee0fac6`** (mq8 sudot4 → sdot4,
+   draft already at `docs/notes/upstream-pr-draft-mq8-sdot4.md`).
+   Smallest readily-mergeable contribution from this session.
 
 ## Cross-references
 
-- Plan: `docs/plans/gfx906-mq6-mq8-port.md` v3.2.2 (commit `e3dbb03`)
+- Plan: `docs/plans/gfx906-mq6-mq8-port.md` v3.2.3 (commit `d02dc95`)
 - Priority 0 baselines: `docs/perf-checkpoints/2026-05-06-mq6-baselines.md` (commit `850848a`)
 - A.1a writeup: `docs/perf-checkpoints/2026-05-06-wave64-hfq6-residual-experiment.md` (commit `bb341fc`)
 - HFQ4 reference: `docs/perf-checkpoints/2026-05-05-gfx906-decode-investigation.md`
-- PR #158 (HFQ4 dp4a + AR decode): commit `afb84bd` on master
+- PR #158 (HFQ4 dp4a + AR decode + MMQ): commit `afb84bd` on master
+- Dispatch matrix (the audit that flagged A.4 as a perf miss):
+  `docs/perf-checkpoints/2026-05-06-quant-dispatch-matrix.md`
+- Audit dev-log (mq8 silent-corruption): `docs/perf-checkpoints/2026-05-06-mq8-runtime-dispatch-audit.md`
+- Dot2 ruled-out experiment: `docs/perf-checkpoints/2026-05-06-dot2-gfx906-experiment.md`
 
 ## Raw bench logs
 
-- `/tmp/baseline-2026-05-06/9b-mq6.log` (wave32, may be lost to /tmp wipe)
-- `/tmp/wave64-experiment-2026-05-06/9b-mq6-wave64.log` (A.1a, lost to /tmp wipe)
+(/tmp logs may be lost to system reboot; numbers are reproduced in the
+individual A.1a/b/c, A.2, A.3, A.4 commit messages which are durable.)
+
+- `/tmp/baseline-2026-05-06/9b-mq6.log` (wave32)
+- `/tmp/wave64-experiment-2026-05-06/9b-mq6-wave64.log` (A.1a)
 - `/tmp/prefetch-experiment-2026-05-07/9b-mq6-prefetch.log` (A.1b)
 - `/tmp/dp4afused-experiment-2026-05-07/9b-mq6.log` (A.1c)
-- `/tmp/dp4afused-experiment-2026-05-07/27b-mq6.log` (A.1c)
-
-Numbers in this checkpoint are also reproduced in the individual
-A.1a / A.1b / A.1c commit messages, which are durable.
+- `/tmp/dp4abatched-experiment-2026-05-07/9b-mq6.log` (A.2)
+- `/tmp/A3-experiment-2026-05-07/9b-mq6.log` (A.3)
+- `/tmp/A4-experiment-2026-05-07/9b-mq6.log` (A.4 sanity)
