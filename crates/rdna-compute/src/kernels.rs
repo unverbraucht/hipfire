@@ -75,6 +75,15 @@ pub const FUSED_QKVZA_HFQ6G256_WAVE64_DP4A_SRC: &str = include_str!("../../../ke
 /// per-layer wo + w_down at B>1.
 pub const GEMM_HFQ6G256_RESIDUAL_WAVE64_DP4A_SRC: &str = include_str!("../../../kernels/src/gemm_hfq6g256_residual_wave64_dp4a.hip");
 
+/// Phase A.3 (plan v3.2.3 §5.1 item 3): wave64+dp4a batched fused
+/// GEMMs for HFQ6/MQ6 prefill. Sibling of A.2 with multi-output row
+/// routing (qkvza 4-way, qkv 3-way, gate_up 2-way). Overwrite output
+/// semantics — caller fuses residual at the wo + w_down sites via
+/// gemm_hfq6g256_residual_wave64_dp4a (Phase A.2).
+pub const GEMM_QKVZA_HFQ6G256_WAVE64_DP4A_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq6g256_wave64_dp4a.hip");
+pub const GEMM_QKV_HFQ6G256_WAVE64_DP4A_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq6g256_wave64_dp4a.hip");
+pub const GEMM_GATE_UP_HFQ6G256_WAVE64_DP4A_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq6g256_wave64_dp4a.hip");
+
 
 /// HFQ3-G256: flat 3-bit with 256-weight groups.
 /// Block: [f32 scale][f32 zero][96B data] = 104 bytes per 256 weights (0.41 B/w).
