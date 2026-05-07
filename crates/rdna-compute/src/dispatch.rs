@@ -8515,10 +8515,67 @@ impl Gpu {
     // HFQ6-G256 GEMM variants (residual, fused)
     // ========================================================================
 
+    /// gfx906 wave64+dp4a batched residual GEMM for HFQ6/MQ6.
+    /// Phase A.2 (plan v3.2.3 §5.1 item 2). Pre-quantizes x to Q8_1 and
+    /// dispatches the dp4a kernel; output is residual `+=` semantics.
+    ///
+    /// Math identity: same as the fused-GEMV dp4a kernels (plan §2.2
+    /// Option A — HFQ6 unsigned weights, no zp shift correction).
+    pub fn gemm_hfq6g256_residual_wave64_dp4a(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        let xq_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+
+        self.ensure_kernel(
+            "gemm_hfq6g256_residual_wave64_dp4a",
+            kernels::GEMM_HFQ6G256_RESIDUAL_WAVE64_DP4A_SRC,
+            "gemm_hfq6g256_residual_wave64_dp4a",
+        )?;
+
+        let a_ptr = a_raw.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let bs_val = batch_size as i32;
+        let mut xq = xq_ptr;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &mut xq as *mut _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &bs_val as *const _ as *mut c_void,
+        ];
+
+        const BATCH_TILE: usize = 8;
+        let batch_tiles = (batch_size + BATCH_TILE - 1) / BATCH_TILE;
+        let grid_x = ((m as u32) + 1) / 2;
+
+        self.launch_maybe_blob(
+            "gemm_hfq6g256_residual_wave64_dp4a",
+            [grid_x, batch_tiles as u32, 1],
+            [64, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr); b.push_ptr(xq); b.push_ptr(y_ptr);
+                b.push_i32(m_val); b.push_i32(k_val); b.push_i32(bs_val);
+                b
+            },
+        )
+    }
+
     /// Batched HFQ6-G256 GEMM with fused residual add:
     ///   for b in 0..batch_size: y[b][row] += A[row] · x[b]
     ///
-    /// Auto-selects: gfx11 -> WMMA, else -> FP16 packed, fallback -> FP32 scalar.
+    /// Auto-selects: gfx11 -> WMMA, gfx906 -> dp4a (Phase A.2),
+    /// else -> FP16 packed, fallback -> FP32 scalar.
     pub fn gemm_hfq6g256_residual(
         &mut self,
         a_raw: &GpuTensor,
@@ -8534,6 +8591,12 @@ impl Gpu {
             // WMMA on gfx11+ (RDNA3): 16x16 tiled
             if self.arch.starts_with("gfx11") {
                 return self.gemm_hfq6g256_residual_wmma(a_raw, x, y, m, k, batch_size);
+            }
+            // gfx906: dp4a + wave64 batched residual (Phase A.2, plan v3.2.3
+            // §5.1 item 2). Pre-quantize x to Q8_1 and dispatch the dp4a
+            // kernel. Mirror of the HFQ4 sibling pattern at gemm_hfq4g256_wave64_dp4a.
+            if gemv_dp4a_enabled(&self.arch) {
+                return self.gemm_hfq6g256_residual_wave64_dp4a(a_raw, x, y, m, k, batch_size);
             }
             // FP16 packed on all other RDNA
             return self.gemm_hfq6g256_residual_fp16(a_raw, x, y, m, k, batch_size);
