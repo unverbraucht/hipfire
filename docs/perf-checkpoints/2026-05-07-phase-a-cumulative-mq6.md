@@ -318,6 +318,47 @@ to HFQ6 dispatchers is still useful for the production daemon
 profile dump (`HIPFIRE_PROFILE=1`) but doesn't gate Phase B.1.
 Plan v3.2.4 item 5 stays a non-blocking follow-up.
 
+## Phase B.1: gemm_gate_up_hfq6g256_wave64_dp4a — BATCH_TILE sweep
+
+First Path 1 experiment: BATCH_TILE was 8, halving A reloads by
+doubling the per-block batch slice gives bigger blocks but more
+register pressure. Swept BT ∈ {8, 16, 32}.
+
+| BT | gate_up ms/call | pp128 tok/s | Δ vs BT=8 |
+|---:|---:|---:|---:|
+| **8** (baseline) | 10.99 | 165.8 | — |
+| **16** | **9.19** | **180.0** | **−16% per call, +9% wall** |
+| 32 | 22.11 | 113.3 | regression — register spill |
+
+Decode (g50 mq6 9B): 43.7 tok/s with BT=16 vs 42.5-42.7 baseline,
+no regression. The BT cap is mostly relevant at prefill (B=128) —
+decode runs `local_bs = 1` and only writes `acc[0]`.
+
+**PMC counters at BT=16 (rocprof):**
+
+- arch_vgpr 48, sgpr 32, lds 0
+- VALUBusy 52.8 %
+- MemUnitBusy 87.8 %
+- MemUnitStalled 2.0 %
+- L2CacheHit 85.5 %
+
+**Diagnosis: memory-throughput-bound, not stall-bound.** L2 catches
+85 % of loads; the kernel issues memory ops as fast as the memory
+units can serve them. ALU is idle ~47 % of cycles waiting for
+memory. Effective bandwidth ≈ 33 GB/s vs MI50 peak 1024 GB/s —
+~3 % of peak. Compute floor is ~70 µs (dp4a at peak); we're at
+9.2 ms, so 130× over compute floor.
+
+**Root cause:** single-wave-per-block design means each output row's
+A data is read by exactly one block, no inter-block A-sharing. With
+8 batch tiles per row (BT=16, B=128), each row's 3.2 KB of A bytes
+is reloaded 8× across batch tiles (best-case via L2). Multi-wave
+blocks with LDS-staged A would reduce that to 1×.
+
+**Next: 2-waves-per-block kernel rewrite** (kernel B.1.1) to test
+whether LDS-staging A across waves moves the kernel toward the
+memory-throughput floor. Estimated effort: ~1 session.
+
 ## Cross-references
 
 - Plan: `docs/plans/gfx906-mq6-mq8-port.md` v3.2.3 (commit `d02dc95`)

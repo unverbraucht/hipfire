@@ -9,7 +9,7 @@
 // Same math + lane-mapping. Plan §3.2.3 §5.1 item 3 (Phase A.3).
 
 #define QK8_1 32
-#define BATCH_TILE 8
+#define BATCH_TILE 16
 
 struct block_q8_1_mmq {
     half2 ds4[4];

@@ -9469,7 +9469,7 @@ impl Gpu {
             &bs_val as *const _ as *mut c_void,
         ];
 
-        const BATCH_TILE: usize = 8;
+        const BATCH_TILE: usize = 16;
         let batch_tiles = (batch_size + BATCH_TILE - 1) / BATCH_TILE;
         let total_m = (gate_m + up_m) as u32;
         let grid_x = (total_m + 1) / 2;
