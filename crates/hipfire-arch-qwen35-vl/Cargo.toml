@@ -24,4 +24,3 @@ serde_json = "1"
 # input pipeline lives in this crate (`crate::image`). Same default-feature
 # gating as runtime had pre-PR-9.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
-base64 = "0.22"

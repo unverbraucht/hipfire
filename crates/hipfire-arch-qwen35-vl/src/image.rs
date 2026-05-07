@@ -3,10 +3,10 @@
 
 use std::path::Path;
 
-/// Maximum total pixel count before decoding (decompression bomb guard).
-/// ~4K × 4K = 16M, but we use 4M — well above `smart_resize`'s
-/// `max_pixels` target of ~1M, but prevents multi-gigabyte allocations from
-/// maliciously crafted images.
+/// Maximum total pixel count, checked from format-header dimensions BEFORE
+/// the pixel buffer is allocated (decompression bomb guard). 4M pixels is
+/// well above `smart_resize`'s `max_pixels` target of ~1M but caps the
+/// pre-decode memory request from a malicious 50000×50000 PNG.
 const MAX_DIMENSION_PIXELS: usize = 4_000_000;
 
 /// Smart resize matching HuggingFace Qwen2_5_VLImageProcessor.
@@ -106,28 +106,43 @@ pub fn load_and_preprocess(
 
 /// Load an image from raw bytes (PNG or JPEG), smart-resize, normalize.
 /// Returns `Result` so callers can surface decode errors.
+///
+/// Reads dimensions from the format header BEFORE decoding pixels so a
+/// decompression-bomb image (e.g. 50000×50000 PNG that compresses to ~50 KB
+/// but expands to multi-GB raw) is rejected before allocation. Format
+/// rejection (non-PNG/JPEG) is via `ImageError::Unsupported` rather than
+/// substring matching so the error surface is stable across `image` crate
+/// versions.
 pub fn load_and_preprocess_from_bytes(
     data: &[u8],
     patch_size: usize,
     spatial_merge_size: usize,
 ) -> Result<(Vec<f32>, usize, usize), String> {
-    let img = image::load_from_memory(data).map_err(|e| {
-        let err_str = e.to_string().to_lowercase();
-        if err_str.contains("unsupported") || err_str.contains("format") || err_str.contains("not an image") {
-            format!("unsupported image format — supported: png, jpeg")
-        } else {
-            format!("failed to decode image: {e}")
-        }
-    })?;
+    let reader = image::ImageReader::new(std::io::Cursor::new(data))
+        .with_guessed_format()
+        .map_err(|e| format!("failed to read image: {e}"))?;
 
-    let (orig_w, orig_h) = (img.width() as usize, img.height() as usize);
+    let (orig_w, orig_h) = reader
+        .into_dimensions()
+        .map_err(map_image_err)?;
+    let (orig_w, orig_h) = (orig_w as usize, orig_h as usize);
     if orig_w * orig_h > MAX_DIMENSION_PIXELS {
         return Err(format!(
             "image dimensions ({orig_w}x{orig_h}) exceed maximum ({MAX_DIMENSION_PIXELS} pixels)"
         ));
     }
 
+    let img = image::load_from_memory(data).map_err(map_image_err)?;
     Ok(preprocess_dynamic_image(img, patch_size, spatial_merge_size))
+}
+
+fn map_image_err(e: image::ImageError) -> String {
+    match e {
+        image::ImageError::Unsupported(_) => {
+            "unsupported image format — supported: png, jpeg".to_string()
+        }
+        other => format!("failed to decode image: {other}"),
+    }
 }
 
 /// Extract non-overlapping patches from a CHW image.

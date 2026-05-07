@@ -3,7 +3,7 @@
 //! No GPU needed — exercises the pure image decode + resize + normalize path
 //! using synthetic images constructed in memory via the `image` crate.
 
-use engine::image::{load_and_preprocess_from_bytes, smart_resize};
+use hipfire_arch_qwen35_vl::image::{load_and_preprocess_from_bytes, smart_resize};
 use image::{ImageBuffer, Rgb};
 
 fn solid_png_bytes(r: u8, g: u8, b: u8, w: u32, h: u32) -> Vec<u8> {
@@ -50,15 +50,25 @@ fn valid_jpeg_round_trips() {
 
 #[test]
 fn output_matches_load_and_preprocess_for_same_input() {
+    // Use a unique tempdir per test invocation so parallel runs (and CI
+    // workers sharing /tmp) can't collide on the fixture file.
     let bytes = solid_png_bytes(10, 200, 50, 32, 32);
     let (from_bytes, h1, w1) = load_and_preprocess_from_bytes(&bytes, 16, 2).unwrap();
 
-    let dir = std::env::temp_dir().join("hipfire-img-test-equiv");
+    let dir = std::env::temp_dir().join(format!(
+        "hipfire-img-test-equiv-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("equiv.png");
     let img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_pixel(32, 32, Rgb([10, 200, 50]));
     img.save(&path).unwrap();
-    let (from_path, h2, w2) = engine::image::load_and_preprocess(&path, 16, 2);
+    let (from_path, h2, w2) = hipfire_arch_qwen35_vl::image::load_and_preprocess(&path, 16, 2);
+    let _ = std::fs::remove_dir_all(&dir);
 
     assert_eq!((h1, w1), (h2, w2), "dimensions should match between from-bytes and from-path");
     assert_eq!(from_bytes.len(), from_path.len(), "output length should match");
@@ -74,19 +84,29 @@ fn output_matches_load_and_preprocess_for_same_input() {
 
 #[test]
 fn channel_order_preserved_from_bytes() {
-    let bytes = solid_png_bytes(255, 0, 0, 32, 32);
+    // Use distinct values per channel so the test actually verifies
+    // channel ordering — pure red (255, 0, 0) is identical under RGB
+    // and BGR and would silently pass either way.
+    //
+    // Implementation outputs CHW as [R, B, G] (NOT canonical R, G, B):
+    // a workaround for the HF patch_embed weight export — see
+    // `preprocess_dynamic_image` in src/image.rs for the rationale.
+    let bytes = solid_png_bytes(10, 100, 200, 32, 32);
     let (out, h, w) = load_and_preprocess_from_bytes(&bytes, 16, 2).unwrap();
     assert!(
-        (channel_at(&out, h, w, 0, 0, 0) - norm(255)).abs() < 1e-4,
-        "R channel should carry 255"
+        (channel_at(&out, h, w, 0, 0, 0) - norm(10)).abs() < 1e-4,
+        "channel 0 should carry R=10 (got {:.4})",
+        channel_at(&out, h, w, 0, 0, 0),
     );
     assert!(
-        (channel_at(&out, h, w, 1, 0, 0) - norm(0)).abs() < 1e-4,
-        "channel 1 (B slot) should be 0 for pure red"
+        (channel_at(&out, h, w, 1, 0, 0) - norm(200)).abs() < 1e-4,
+        "channel 1 should carry B=200 (got {:.4}) — note R,B,G layout",
+        channel_at(&out, h, w, 1, 0, 0),
     );
     assert!(
-        (channel_at(&out, h, w, 2, 0, 0) - norm(0)).abs() < 1e-4,
-        "channel 2 (G slot) should be 0 for pure red"
+        (channel_at(&out, h, w, 2, 0, 0) - norm(100)).abs() < 1e-4,
+        "channel 2 should carry G=100 (got {:.4}) — note R,B,G layout",
+        channel_at(&out, h, w, 2, 0, 0),
     );
 }
 
@@ -129,6 +149,16 @@ fn dimension_bomb_just_under_limit_passes() {
     let bytes = solid_png_bytes(0, 0, 0, 1999, 1999);
     let result = load_and_preprocess_from_bytes(&bytes, 16, 2);
     assert!(result.is_ok(), "1999x1999 (3.996M) should be under 4M ceiling: {result:?}");
+}
+
+#[test]
+fn dimension_bomb_exact_boundary_passes() {
+    // Exactly at the 4M limit — `>` not `>=`, so 2000×2000 = 4_000_000
+    // should pass (the inclusive upper bound). Locks the boundary
+    // behaviour against future drift.
+    let bytes = solid_png_bytes(0, 0, 0, 2000, 2000);
+    let result = load_and_preprocess_from_bytes(&bytes, 16, 2);
+    assert!(result.is_ok(), "2000x2000 (4M, exactly at limit) should pass: {result:?}");
 }
 
 #[test]
