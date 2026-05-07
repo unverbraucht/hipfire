@@ -257,6 +257,13 @@ PR #158 dp4a-MMQ path (`gemm_hfq4g256_residual_mmq_gfx906_x{N}` family,
 with no gfx906 optimization ever. **This is the natural Phase B target
 for v3.2.3.**
 
+**[CORRECTED in v3.2.5]** This errata's numbers and architectural
+diagnosis are both stale. The 46.8 tok/s figure was measured before
+Phase A.3 (`94643cb`) wired the dp4a fused GEMMs into the prefill
+path; the "falls through to wave32 scalar" claim was true at v3.2.3
+write-time but has not been true since A.3. Re-baseline and revised
+Phase B framing in **v3.2.5 errata** below.
+
 ### v3.2.4 errata (2026-05-07): Phase A review follow-ups (non-blocking, deferred)
 
 Three-way review (self / glm5 / gemini) of `feat/gfx906-mq6-phase-a-dp4a`
@@ -312,6 +319,70 @@ Don't ship a kernel without observability.
 (audit before adding new dispatch sites). Item 4 follows Phase B once
 the prefill MMQ kernel is in place — MoE fused gate_up reuses the same
 Q8_1 quantize amortization as the AR path.
+
+### v3.2.5 errata (2026-05-07): Phase B scoping — gap is 3.6×, not 12.7×
+
+Re-baselined mq4 vs mq6 prefill on current HEAD (post-A.3). The
+v3.2.3 errata's 12.7× gap quote was pre-Phase-A.3; A.3 already closed
+most of it.
+
+| 9B pp128 | mq4 | mq6 | Gap |
+|---|---:|---:|---:|
+| Prefill (median, JIT-warm) | 598.6 tok/s | 164.9 tok/s | **3.6×** |
+
+**rocprof per-kernel breakdown (mq6 pp128, gfx906):**
+
+| Kernel | % time | Avg ns/call |
+|---|---:|---:|
+| `gemm_gate_up_hfq6g256_wave64_dp4a` | **45.5 %** | 10.99 ms |
+| `gemm_hfq6g256_residual_wave64_dp4a` | 28.5 % | 3.45 ms |
+| `gemm_qkvza_hfq6g256_wave64_dp4a` | 17.0 % | 5.49 ms |
+| `gemm_qkv_hfq6g256_wave64_dp4a` | 4.7 % | 4.58 ms |
+| **Top 4 (Phase A.3 dp4a)** | **95.7 %** | |
+
+**Architectural finding:** mq4 prefill on gfx906 dispatches **no
+gate_up / qkv / qkvza kernels at all**. Every prefill matmul goes
+through the `gemm_hfq4g256_residual_mmq_gfx906_x{N}` family — 8 size
+variants × {set, add} = 16 kernels sharing a body header. Each of
+the 9 projections per layer (q / k / v / z / α / β / gate / up /
+down) becomes one residual-shaped MMQ call (`set` for first
+projection of a fused group, `add` for subsequent ones accumulating
+into Y). This is the PR #158 win — small-tile dp4a-MMQ streaming,
+not big fused kernels. mq6 today still uses big fused kernels at
+prefill and pays for the LDS-tile / occupancy mismatch.
+
+**Two paths for Phase B:**
+
+- **Path 1 (~2-3 sessions): optimize the 4 dp4a fused GEMMs in
+  place.** LDS-tile redesign starting on `gemm_gate_up_*` (45.5 %
+  alone), prefetch tuning, x_stride sweep. Stays within the
+  Phase A.3 dispatch architecture. Expected lift: 1.5-2 ×.
+- **Path 2 (~5 sessions): port the MMQ-streaming family to HFQ6.**
+  Build `gemm_hfq6g256_residual_mmq_gfx906_x{N}` family + retarget
+  dispatchers. This is what mq4 uses for its 60 % win. Expected
+  lift: 3-4 × (parity with mq4).
+
+**Sequencing decision:** start with Path 1 kernel #1
+(`gemm_gate_up_hfq6g256_wave64_dp4a`). Cheapest first improvement,
+validates whether the dp4a-fused path has LDS / prefetch headroom.
+If gate_up yields only +5-10 % after a session of LDS-tuning,
+that's evidence the dp4a kernels are near their ceiling and we
+should pivot to Path 2.
+
+**Phase B.0 (instrumentation) demoted to non-blocker:** rocprof +
+`--stats` provides kernel-name-level breakdown without touching
+dispatch.rs. Adding `begin_timer` to HFQ6 dispatchers is still
+useful for the production daemon profile dump
+(`HIPFIRE_PROFILE=1`) but doesn't gate Phase B.1. Plan v3.2.4
+item 5 stays a non-blocking follow-up.
+
+**How to apply:** for any future "what's the bottleneck?" question
+in this codebase, **rocprof on a representative bench is the first
+move, not adding `begin_timer`.** rocprof catches everything
+(including kernels we forgot to instrument); `begin_timer` only
+catches what we remembered. Use the latter for in-process
+correlation against application-level metrics, not for kernel-level
+bottleneck identification.
 
 ### Calibrated decode-lift expectations (gfx906, post-v3.2.2)
 

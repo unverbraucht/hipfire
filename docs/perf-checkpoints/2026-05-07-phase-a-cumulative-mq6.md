@@ -243,6 +243,81 @@ Rust fns, and `scripts/audit-dispatch-coverage.sh`. Observability /
 defensive hardening, not correctness — batched into the pre-Phase-B
 audit pass.
 
+## Phase B scoping (rocprof, 2026-05-07)
+
+Re-baselined mq4 vs mq6 prefill on current HEAD before scoping Phase B.
+The dev-log's stale 12.7× gap was pre-Phase-A.3 — A.3 already closed
+most of it.
+
+**Real numbers (gfx906 / MI50, 9B model, pp128, JIT-warm):**
+
+| Quant | Prefill (median) | Source |
+|---|---:|---|
+| mq4 | 598.6 tok/s | `/tmp/mq4-prefill-baseline.log` |
+| mq6 | 164.9 tok/s | `/tmp/mq6-prefill-baseline.log` |
+| **Gap** | **3.6×** | (was 12.7× pre-A.3) |
+
+**rocprof per-kernel ranking (mq6 pp128, 1625 contexts, 1543 ms wall):**
+
+| Rank | Kernel | % time | Calls | Avg ns/call |
+|---|---|---:|---:|---:|
+| 1 | `gemm_gate_up_hfq6g256_wave64_dp4a` | **45.5 %** | 64 | 10.99 ms |
+| 2 | `gemm_hfq6g256_residual_wave64_dp4a` | **28.5 %** | 128 | 3.45 ms |
+| 3 | `gemm_qkvza_hfq6g256_wave64_dp4a` | **17.0 %** | 48 | 5.49 ms |
+| 4 | `gemm_qkv_hfq6g256_wave64_dp4a` | 4.7 % | 16 | 4.58 ms |
+| | **Top 4 (Phase A.3 dp4a)** | **95.7 %** | | |
+
+**rocprof per-kernel ranking (mq4 pp128, 3242 contexts):**
+
+| Rank | Kernel | % time | Calls |
+|---|---|---:|---:|
+| 1 | `gemm_hfq4g256_residual_mmq_gfx906_full_set_x64` | 38.0 % | 272 |
+| 2 | `gemm_hfq4g256_residual_mmq_gfx906_full_add_x64` | 22.1 % | 128 |
+| 3 | `gemm_hfq4g256_residual_fp16_wave64` | 19.7 % | 200 |
+| 4 | `gemm_hfq4g256_residual_mmq_gfx906_full_add_x16` | 7.8 % | 200 |
+| | **Top 4 (MMQ-streaming family)** | **87.6 %** | |
+
+**Architectural insight: mq4 prefill dispatches NO `gemm_gate_up` /
+`gemm_qkv` / `gemm_qkvza` kernels.** All prefill GEMMs go through the
+`gemm_hfq4g256_residual_mmq_gfx906_x{N}` family — 8 size variants ×
+{set, add} = 16 specialized kernels sharing a common body header
+(`kernels/src/gemm_hfq4g256_residual_mmq_gfx906_body.cuh`). Each
+projection (q / k / v / z / α / β / gate / up / down) becomes one
+residual-shaped MMQ call with `set` for the first projection of a
+fused group and `add` for subsequent projections accumulating into Y.
+This is the PR #158 win — small-tile dp4a-MMQ streaming, not big
+fused kernels.
+
+For comparison: mq6 dispatches **256 calls of large-block dp4a fused
+kernels** (avg 5–11 ms) where mq4 dispatches **800 calls of small
+MMQ tiles** (avg 1 ms). Same total work, very different scheduling.
+
+**Two paths for Phase B:**
+
+- **Path 1: optimize the 4 existing dp4a fused GEMMs in place**
+  (~2-3 sessions). LDS-tile redesign on `gemm_gate_up_*` first
+  (45.5 % alone), prefetch tuning, x_stride sweep. Stays within
+  the Phase A.3 dispatch architecture. Expected lift: 1.5–2 ×.
+- **Path 2: port the MMQ-streaming family to HFQ6** (plan §3.1.3,
+  ~5 sessions). Build `gemm_hfq6g256_residual_mmq_gfx906_x{N}`
+  family + retarget dispatchers. This is what mq4 uses for its
+  60 % kernel-time win. Expected lift: 3–4 × (parity with mq4).
+
+**Plan: start with Path 1 kernel #1.** Cheapest first improvement,
+validates whether the dp4a-fused path has LDS / prefetch headroom,
+and informs whether Path 2's bigger investment is justified. If
+gate_up only yields +5–10 % after a session of LDS-tuning, that's
+evidence the dp4a kernels are near their ceiling and we should skip
+to Path 2.
+
+**Phase B.0 (instrumentation) demoted to non-blocker:** the original
+plan v3.2.4 framing assumed in-process `begin_timer` was needed to
+localize the bottleneck. rocprof + `--stats` does this at the
+kernel-name level without touching dispatch.rs. Adding `begin_timer`
+to HFQ6 dispatchers is still useful for the production daemon
+profile dump (`HIPFIRE_PROFILE=1`) but doesn't gate Phase B.1.
+Plan v3.2.4 item 5 stays a non-blocking follow-up.
+
 ## Cross-references
 
 - Plan: `docs/plans/gfx906-mq6-mq8-port.md` v3.2.3 (commit `d02dc95`)
@@ -267,3 +342,5 @@ individual A.1a/b/c, A.2, A.3, A.4 commit messages which are durable.)
 - `/tmp/dp4abatched-experiment-2026-05-07/9b-mq6.log` (A.2)
 - `/tmp/A3-experiment-2026-05-07/9b-mq6.log` (A.3)
 - `/tmp/A4-experiment-2026-05-07/9b-mq6.log` (A.4 sanity)
+- `/tmp/mq4-prefill-baseline.log` + `/tmp/mq6-prefill-baseline.log` (Phase B re-baseline)
+- `/tmp/mq4-rocprof.stats.csv` + `/tmp/mq6-rocprof.stats.csv` (Phase B kernel ranking)
