@@ -257,6 +257,62 @@ PR #158 dp4a-MMQ path (`gemm_hfq4g256_residual_mmq_gfx906_x{N}` family,
 with no gfx906 optimization ever. **This is the natural Phase B target
 for v3.2.3.**
 
+### v3.2.4 errata (2026-05-07): Phase A review follow-ups (non-blocking, deferred)
+
+Three-way review (self / glm5 / gemini) of `feat/gfx906-mq6-phase-a-dp4a`
+caught three blocking gaps and three non-blocking polish items. The
+blockers shipped in commit `5768fe4` on PR #187 (capture-mode guards on
+5 HFQ6 dp4a sites, DDTree HFQ6/MQ6 dispatch arms, stale comment on
+`gemv_dp4a_enabled`). The non-blockers are tracked here as Phase A
+follow-ups.
+
+**Why deferred:** all three are observability / defensive hardening,
+not correctness. None affect tok/s, coherence, or model output. They
+are batched into a single dispatch-coverage cleanup pass to be run
+before Phase B (prefill MMQ), where adding new fused dp4a paths makes
+the audit script + profiler updates pay for themselves.
+
+**How to apply:** when a new dp4a fused GEMV/GEMM ships, add its byte
+counts to `profile.rs`, its timer to `dispatch.rs`, and its assert at
+the Rust entrypoint — at the same time as the dispatch-arm wire-up.
+Don't ship a kernel without observability.
+
+#### Phase A follow-up items (deferred to pre-Phase-B cleanup)
+
+4. **Multi-GPU + MoE LA fused dp4a coverage** — gemini noted no MoE
+   dp4a path for HFQ6/MQ6, only single-GPU AR fused. Confirmed by
+   inspection: §3.1 Phase A does not enumerate MoE-indexed kernels
+   for the new dp4a path; the MoE fused gate_up/down on HFQ6 still
+   takes the wave32 FP fallback. Estimated effort: ~1 session
+   (mechanical port from HFQ4 MoE patterns once Phase B lands).
+
+5. **profile.rs + dispatch timers for HFQ6 dp4a path** — gemini 2.2 +
+   2.3. Add `hfq6g256_weight_bytes` (200 B/group × N groups) helper
+   to `crates/rdna-compute/src/profile.rs`. Wire `begin_timer` /
+   `end_timer` on the 7 new HFQ6 dispatchers (qkv / qkvza / gate_up
+   / residual / batched_lmhead × {fn body, dp4a branch}). Without
+   this, the new kernels are invisible to the bandwidth profiler.
+   Estimated effort: ~½ session.
+
+6. **Defensive assert on gemv_dp4a_enabled at Rust entry** — glm5
+   finding 6/13. Add `assert!(gemv_dp4a_enabled(&self.arch))` at the
+   top of every `*_dp4a` Rust function. Today the dispatcher gates
+   the call, but a future caller could forget — the assert turns a
+   silent wave32-mismatch into a loud panic. Mirrors the wave64
+   guard pattern. Estimated effort: ~10 lines, ~5 min.
+
+13. **`scripts/audit-dispatch-coverage.sh`** — claimed in PR #187
+    body but not added. Should sweep every dispatch site and check
+    that {wave64, dp4a, capture-mode-guard} match the canonical HFQ4
+    pattern. Either add the script in this cleanup pass or remove
+    the claim from the PR body. Estimated effort: ~½ session for the
+    script + integration into pre-commit hook chain.
+
+**Sequencing:** items 5 + 6 + 13 fold into the Phase B prep pass
+(audit before adding new dispatch sites). Item 4 follows Phase B once
+the prefill MMQ kernel is in place — MoE fused gate_up reuses the same
+Q8_1 quantize amortization as the AR path.
+
 ### Calibrated decode-lift expectations (gfx906, post-v3.2.2)
 
 | Lever | Expected 9B mq6 decode Δ | Measured (post-v3.2.3) |

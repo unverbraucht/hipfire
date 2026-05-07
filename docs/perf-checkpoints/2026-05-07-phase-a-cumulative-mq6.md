@@ -201,6 +201,48 @@ A3B+MQ6-class workloads which don't ship today.
    draft already at `docs/notes/upstream-pr-draft-mq8-sdot4.md`).
    Smallest readily-mergeable contribution from this session.
 
+## Post-ship: review fixes (commit `5768fe4`, 2026-05-07)
+
+After the Phase A.4 wire-up, ran a three-way critical review of
+`feat/gfx906-mq6-phase-a-dp4a` (self / glm5 / gemini). Three blocking
+findings landed in commit `5768fe4` on PR #187; three non-blocking
+follow-ups are deferred to the pre-Phase-B cleanup pass (plan v3.2.4
+errata, items 4 / 5 / 6 / 13).
+
+**Fixes shipped in `5768fe4`:**
+
+- **`capture_mode` guards on 5 HFQ6 dp4a dispatch sites** — silent
+  correctness bug under `HIPFIRE_GRAPH=1`. The HFQ6 dp4a path calls
+  `ensure_q8_1_mmq_x` which launches an internal quantize kernel that
+  the captured graph may not record, leaving x stale. Added
+  `&& !self.capture_mode` to match the HFQ4 sibling at
+  `dispatch.rs:7889`. Sites: residual / batched_lmhead / qkv / qkvza
+  / gate_up.
+- **DDTree dispatch arms for HFQ6G256 + MQ6G256** — slow-path
+  fallthrough. `crates/hipfire-arch-qwen35/src/speculative.rs`
+  `run_dflash_draft_for_logits` and `run_dflash_draft_for_topk_gpu`
+  had no arms for the new 6-bit dtypes; spec-decode on HFQ6/MQ6
+  models would have errored at runtime ("unsupported target.output
+  dtype"). Added MQ6 arm (with `rotate_x_mq_batched`) and HFQ6 arm
+  (no rotation), mirroring the MQ3/MQ4 pattern.
+- **Stale `gemv_dp4a_enabled` doc** — said "fused_qkv / fused_qkvza
+  ports are pending" but PR #167 (HFQ4) and PR #187 (HFQ6) have
+  shipped them. Updated to reflect that the lever now toggles every
+  fused dp4a path together.
+
+**Validation:** `cargo build --release -p rdna-compute -p
+hipfire-arch-qwen35` clean; sanity bench on rebased PR2 branch
+matched audit-branch numbers (pp128: 162.7 prefill / 42.5 decode
+tok/s, vs audit-branch 162.8 / 42.6) — rebase against
+post-#147/#181 master is byte-clean.
+
+**Deferred to plan v3.2.4 follow-ups (items 4-6 + 13):** profile.rs
+HFQ6 byte counts, `begin_timer` / `end_timer` on the 7 new
+dispatchers, defensive `assert!(gemv_dp4a_enabled(arch))` on dp4a
+Rust fns, and `scripts/audit-dispatch-coverage.sh`. Observability /
+defensive hardening, not correctness — batched into the pre-Phase-B
+audit pass.
+
 ## Cross-references
 
 - Plan: `docs/plans/gfx906-mq6-mq8-port.md` v3.2.3 (commit `d02dc95`)
