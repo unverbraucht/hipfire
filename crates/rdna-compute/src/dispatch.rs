@@ -43,8 +43,8 @@ fn gemv_rows_override() -> Option<u32> {
 /// prefetch win on gemv_residual. Coherence gate clean.
 ///
 /// Default-on for gfx906 only. Override with HIPFIRE_GEMV_DP4A={0,1}.
-/// fused_qkv / fused_qkvza ports are pending; same lever, same
-/// estimated +1-2 % per kernel.
+/// fused_qkv / fused_qkvza ports for HFQ4 (PR #167) and HFQ6 (PR #187)
+/// have shipped; this lever now toggles every fused dp4a path together.
 pub fn gemv_dp4a_enabled(arch: &str) -> bool {
     static CACHE: OnceLock<Option<bool>> = OnceLock::new();
     let override_ = *CACHE.get_or_init(|| {
@@ -8041,7 +8041,9 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         // gfx906: dp4a residual + zero-init Y for `=` semantics.
-        if batch_size > 1 && gemv_dp4a_enabled(&self.arch) {
+        // Skip in capture mode (the residual kernel calls ensure_q8_1_mmq_x
+        // which launches an internal quantize kernel — matches HFQ4 sibling).
+        if batch_size > 1 && gemv_dp4a_enabled(&self.arch) && !self.capture_mode {
             match self.active_stream.as_ref() {
                 Some(stream) => self.hip.memset_async(&y.buf, 0, batch_size * m * 4, stream)?,
                 None => self.hip.memset(&y.buf, 0, batch_size * m * 4)?,
@@ -8203,7 +8205,10 @@ impl Gpu {
             // gfx906: dp4a + wave64 batched residual (Phase A.2, plan v3.2.3
             // §5.1 item 2). Pre-quantize x to Q8_1 and dispatch the dp4a
             // kernel. Mirror of the HFQ4 sibling pattern at gemm_hfq4g256_wave64_dp4a.
-            if gemv_dp4a_enabled(&self.arch) {
+            // Skip in capture mode: ensure_q8_1_mmq_x launches an internal
+            // quantize kernel that the captured graph may not record (matches
+            // gemm_hfq4g256_dp4a's `&& !self.capture_mode` guard at line ~7889).
+            if gemv_dp4a_enabled(&self.arch) && !self.capture_mode {
                 return self.gemm_hfq6g256_residual_wave64_dp4a(a_raw, x, y, m, k, batch_size);
             }
             // FP16 packed on all other RDNA
@@ -8382,7 +8387,9 @@ impl Gpu {
             }
             // gfx906: wave64+dp4a batched fused (Phase A.3, plan v3.2.3 §5.1
             // item 3). Pre-quantize x to Q8_1 and dispatch the dp4a kernel.
-            if gemv_dp4a_enabled(&self.arch) {
+            // Skip in capture mode (Q8_1 quantize launch must be reachable
+            // from captured graph or pre-baked) — matches HFQ4 sibling pattern.
+            if gemv_dp4a_enabled(&self.arch) && !self.capture_mode {
                 return self.gemm_qkvza_hfq6g256_wave64_dp4a(a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m, alpha_m, k, batch_size);
             }
             // v_dot2_f32_f16 on archs that have it (gfx1011/1012/1030-1032).
@@ -8865,7 +8872,8 @@ impl Gpu {
                 return self.gemm_qkv_hfq6g256_wmma(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
             }
             // gfx906: wave64+dp4a batched fused (Phase A.3).
-            if gemv_dp4a_enabled(&self.arch) {
+            // Skip in capture mode (Q8_1 quantize) — matches HFQ4 sibling.
+            if gemv_dp4a_enabled(&self.arch) && !self.capture_mode {
                 return self.gemm_qkv_hfq6g256_wave64_dp4a(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
             }
             // v_dot2_f32_f16 on archs that have it (gfx1011/1012/1030-1032).
@@ -9305,7 +9313,8 @@ impl Gpu {
                 return self.gemm_gate_up_hfq6g256_wmma(a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size);
             }
             // gfx906: wave64+dp4a batched fused (Phase A.3).
-            if gemv_dp4a_enabled(&self.arch) {
+            // Skip in capture mode (Q8_1 quantize) — matches HFQ4 sibling.
+            if gemv_dp4a_enabled(&self.arch) && !self.capture_mode {
                 return self.gemm_gate_up_hfq6g256_wave64_dp4a(a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size);
             }
             // v_dot2_f32_f16 on archs that have it (gfx1011/1012/1030-1032).

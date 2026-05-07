@@ -3326,9 +3326,31 @@ fn run_dflash_draft_for_logits(
             let _ = gpu.free_tensor(rotated);
             r2
         }
+        rdna_compute::DType::HFQ6G256 => {
+            // Phase A.4: HFQ6 lm_head batched via gemm_hfq6g256_batched_lmhead
+            // (which zeros Y then dispatches the dp4a residual on gfx906 or
+            // WMMA / FP16 fallbacks elsewhere).
+            gpu.gemm_hfq6g256_batched_lmhead(
+                &w_out.buf, &hidden_rows, &logits_batch, w_out.m, w_out.k, batch,
+            )
+        }
+        rdna_compute::DType::MQ6G256 => {
+            let rotated = gpu.alloc_tensor(&[batch * h], rdna_compute::DType::F32)?;
+            let r1 = gpu.rotate_x_mq_batched(&hidden_rows, &rotated, h, batch);
+            if let Err(e) = r1 {
+                let _ = gpu.free_tensor(rotated);
+                let _ = gpu.free_tensor(logits_batch);
+                return Err(e);
+            }
+            let r2 = gpu.gemm_hfq6g256_batched_lmhead(
+                &w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch,
+            );
+            let _ = gpu.free_tensor(rotated);
+            r2
+        }
         _ => Err(hip_bridge::HipError::new(
             0,
-            "ddtree: unsupported target.output dtype (need Q8/HFQ4G256/MQ4G256/MQ3G256)",
+            "ddtree: unsupported target.output dtype (need Q8/HFQ4G256/MQ4G256/MQ3G256/HFQ6G256/MQ6G256)",
         )),
     };
     if let Err(e) = gemm_result {
@@ -3463,9 +3485,29 @@ fn run_dflash_draft_for_topk_gpu(
             let _ = gpu.free_tensor(rotated);
             r2
         }
+        rdna_compute::DType::HFQ6G256 => {
+            // Phase A.4: HFQ6 lm_head batched.
+            gpu.gemm_hfq6g256_batched_lmhead(
+                &w_out.buf, &hidden_rows, &logits_batch, w_out.m, w_out.k, batch,
+            )
+        }
+        rdna_compute::DType::MQ6G256 => {
+            let rotated = gpu.alloc_tensor(&[batch * h], rdna_compute::DType::F32)?;
+            let r1 = gpu.rotate_x_mq_batched(&hidden_rows, &rotated, h, batch);
+            if let Err(e) = r1 {
+                let _ = gpu.free_tensor(rotated);
+                let _ = gpu.free_tensor(logits_batch);
+                return Err(e);
+            }
+            let r2 = gpu.gemm_hfq6g256_batched_lmhead(
+                &w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch,
+            );
+            let _ = gpu.free_tensor(rotated);
+            r2
+        }
         _ => Err(hip_bridge::HipError::new(
             0,
-            "ddtree: unsupported target.output dtype (need Q8/HFQ4G256/MQ4G256/MQ3G256)",
+            "ddtree: unsupported target.output dtype (need Q8/HFQ4G256/MQ4G256/MQ3G256/HFQ6G256/MQ6G256)",
         )),
     };
     if let Err(e) = gemm_result {
