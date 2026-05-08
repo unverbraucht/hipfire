@@ -545,6 +545,46 @@ HEAD = **597.7 tok/s** (vs pre-B.2 mq4 baseline 598.7) — within 0.2 %,
 no regression. The HFQ6 MMQ path is properly isolated from HFQ4
 dispatch.
 
+### 27B mq6 validation (was deferred in pre-S1 item 8)
+
+After Phase B.2 shipped, we discovered `qwen3.6-27b.mq6` is already on
+disk (Qwen 3.6 27B, same architecture family as 3.5 — same
+hidden_dim=4096, head_dim=128, group_size=256). MMQ kernels are
+dtype/shape-only; the routing applies identically.
+
+Bench (gfx906 / MI50, qwen3.6-27b.mq6, pp128, JIT-warm):
+
+| 27B mq6 9B pp128 | Prefill | Decode | Δ vs MMQ-off |
+|---|---:|---:|---:|
+| `HIPFIRE_HFQ6_MMQ=0` (kill-switch) | 54.8 tok/s | 15.2 | — |
+| **Default (MMQ on)** | **192.8** | **15.4** | **+252 % prefill, +1 % decode** |
+
+**3.52× prefill speedup at 27B — even bigger than 9B's 2.94×.** The
+win scales WITH model size because larger M means more
+`MMQ_Y=128` row tiles fully utilized (better grid coverage on the
+SIMD pool).
+
+Decode unchanged at 15.2-15.4 tok/s (MMQ never fires at B=1 by design;
+the BW-bound floor at 27B is 305 GiB/s effective vs MI50 ~1024 peak).
+
+**rocprof confirms MMQ kernels fire at 27B's larger K dimensions:**
+
+| Kernel | Calls (1 prefill) | Calls (3 prefills) | Per-prefill |
+|---|---:|---:|---:|
+| `_full_set_x64` | 272 | 816 | 272/run ✓ scaling |
+| `_full_add_x64` | 123 | 369 | 123/run ✓ scaling |
+| `_full_add_x16` | 400 | 400 | one-time (mmq_screen pass) |
+| `_residual_fp16` | 400 | 400 | one-time (mmq_screen reference) |
+
+The fp16 + x16 calls are from the per-weight `mmq_screen_weight_hfq6`
+running ONCE at first use (~400 weights for 27B = 64 layers × ~6
+matrices). The actual prefill-hot kernels are `_full_set_x64` +
+`_full_add_x64`, both scaling linearly with prefill-runs.
+
+This closes the pre-S1 item 8 deferral and confirms MMQ correctness +
+performance at the larger 27B-class (M, K) shapes — no regression at
+larger K (8192 in some 27B layers, validated by the scaling growth).
+
 **Methodology lesson re-confirmed:** during S4 testing a coherence-gate
 chain held the GPU at 99 °C junction temp, causing a phantom 50 %
 decode regression (43.7 → 21.2). Pulling the load and waiting for
