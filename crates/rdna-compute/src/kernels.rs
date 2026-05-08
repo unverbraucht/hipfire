@@ -286,7 +286,9 @@ pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_X64_SRC: &str = include_str!("../../
 //   - HFQ6 group bytes: 200 (vs HFQ4's 136)
 //   - HFQ6 q is unsigned [0,63], no -8 shift → x_dm = (sc, zp) NOT (sc, zp+8sc)
 //   - 6-byte unpack per (int_a, int_b) pair (vs HFQ4's 4-byte uint per pair)
-// S1 ships x8 only; size sweep in S2.
+// Phase B.2 ships the full size sweep {x8, x16, x24, x32, x40, x48, x56, x64};
+// dispatcher selects per batch_size, each kernel includes _full_add and
+// _full_set variants for residual / set semantics.
 pub const GEMM_HFQ6G256_RESIDUAL_MMQ_GFX906_BODY_CUH: &str = include_str!("../../../kernels/src/gemm_hfq6g256_residual_mmq_gfx906_body.cuh");
 pub const GEMM_HFQ6G256_RESIDUAL_MMQ_GFX906_X8_SRC: &str = include_str!("../../../kernels/src/gemm_hfq6g256_residual_mmq_gfx906_x8.hip");
 pub const GEMM_HFQ6G256_RESIDUAL_MMQ_GFX906_X16_SRC: &str = include_str!("../../../kernels/src/gemm_hfq6g256_residual_mmq_gfx906_x16.hip");

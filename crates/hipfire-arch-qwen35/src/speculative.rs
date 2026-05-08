@@ -1105,6 +1105,34 @@ impl VerifyScratch {
         Ok(s)
     }
 
+    /// Validated view onto `self.rot` for a `b × w_out_k` rotation slot.
+    /// Panics with a descriptive message when the requested slice would
+    /// exceed the pre-allocated `rot` capacity (`max_n × hidden_k`).
+    ///
+    /// Centralizes the size check so callers don't repeat the assert at
+    /// every dispatch site, and so the panic message is uniform across
+    /// MQ4 / MQ3 / MQ6 lm_head paths.
+    ///
+    /// Pre-condition for the assert NOT firing: caller must size `max_n`
+    /// at `VerifyScratch::new` to cover the largest verify batch the
+    /// runtime will dispatch (e.g., `max(block_size, 1 + tree_budget)`),
+    /// AND `hidden_k` must equal `w_out.k` for the target's lm_head. The
+    /// constructors document this; `new`/`with_prefill` callers in
+    /// `examples/daemon.rs` derive `hidden_k` from the model config
+    /// directly so the structural invariant holds.
+    pub fn rot_for(&self, b: usize, w_out_k: usize) -> GpuTensor {
+        assert!(
+            b * w_out_k <= self.max_n * self.hidden_k,
+            "verify_scratch.rot undersized: b*w_out_k={} > max_n*hidden_k={} \
+             (b={}, w_out_k={}, max_n={}, hidden_k={}). \
+             Caller must size VerifyScratch::new with max_n >= max verify batch \
+             AND hidden_k == w_out.k for the target's lm_head.",
+            b * w_out_k, self.max_n * self.hidden_k,
+            b, w_out_k, self.max_n, self.hidden_k,
+        );
+        self.rot.sub_offset(0, b * w_out_k)
+    }
+
     pub fn free_gpu(self, gpu: &mut Gpu) {
         let _ = gpu.free_tensor(self.final_hidden);
         let _ = gpu.free_tensor(self.logits);
@@ -2116,20 +2144,14 @@ fn verify_dflash_block_inner(
                 )?;
             }
             rdna_compute::DType::MQ4G256 => {
-                assert!(b * w_out.k <= verify_scratch.max_n * verify_scratch.hidden_k,
-                    "verify_scratch.rot undersized: b*k={} > max_n*hidden_k={}",
-                    b * w_out.k, verify_scratch.max_n * verify_scratch.hidden_k);
-                let rot = verify_scratch.rot.sub_offset(0, b * w_out.k);
+                let rot = verify_scratch.rot_for(b, w_out.k);
                 gpu.rotate_x_mq_batched(&final_hidden, &rot, w_out.k, b)?;
                 gpu.gemm_hfq4g256_batched_lmhead(
                     &w_out.buf, &rot, &logits_batch, w_out.m, w_out.k, b,
                 )?;
             }
             rdna_compute::DType::MQ3G256 => {
-                assert!(b * w_out.k <= verify_scratch.max_n * verify_scratch.hidden_k,
-                    "verify_scratch.rot undersized for MQ3 lm_head: b*k={} > max_n*hidden_k={}",
-                    b * w_out.k, verify_scratch.max_n * verify_scratch.hidden_k);
-                let rot = verify_scratch.rot.sub_offset(0, b * w_out.k);
+                let rot = verify_scratch.rot_for(b, w_out.k);
                 gpu.rotate_x_mq_batched(&final_hidden, &rot, w_out.k, b)?;
                 gpu.gemm_hfq3g256_batched_lmhead(
                     &w_out.buf, &rot, &logits_batch, w_out.m, w_out.k, b,
@@ -2143,10 +2165,7 @@ fn verify_dflash_block_inner(
             }
             rdna_compute::DType::MQ6G256 => {
                 // Phase A.4: rotate-then-batched lm_head for MQ6.
-                assert!(b * w_out.k <= verify_scratch.max_n * verify_scratch.hidden_k,
-                    "verify_scratch.rot undersized for MQ6 lm_head: b*k={} > max_n*hidden_k={}",
-                    b * w_out.k, verify_scratch.max_n * verify_scratch.hidden_k);
-                let rot = verify_scratch.rot.sub_offset(0, b * w_out.k);
+                let rot = verify_scratch.rot_for(b, w_out.k);
                 gpu.rotate_x_mq_batched(&final_hidden, &rot, w_out.k, b)?;
                 gpu.gemm_hfq6g256_batched_lmhead(
                     &w_out.buf, &rot, &logits_batch, w_out.m, w_out.k, b,

@@ -66,7 +66,7 @@ fn gemv_rows_override() -> Option<u32> {
 /// Future: as more batch sizes are benched, refine this map. Conservative
 /// today (only confirmed-winning sizes route to MMQ).
 fn hfq6_mmq_winning_size(batch_size: usize) -> bool {
-    if std::env::var("HIPFIRE_HFQ6_MMQ").ok().as_deref() == Some("0") {
+    if hfq6_mmq_env_disabled() {
         return false;
     }
     batch_size == 16 || batch_size >= 32
@@ -84,15 +84,73 @@ fn hfq6_mmq_winning_size(batch_size: usize) -> bool {
 /// requires MMQ to win specifically vs dp4a (B=16 or B≥32 — B=8
 /// regresses 17 % vs dp4a, B=24 marginal at +8 %, others win).
 ///
-/// Env override: `HIPFIRE_HFQ6_MMQ=0` disables MMQ routing globally.
+/// **Env var hierarchy** (highest precedence first):
+///   - `HIPFIRE_MMQ=0` → all MMQ off (HFQ4 + HFQ6). Checked at the
+///     `should_use_mmq` gate in callers, before this helper runs.
+///   - `HIPFIRE_HFQ6_MMQ=0` → HFQ6 MMQ off only (HFQ4 unaffected).
+///     Checked here.
+///   - `HIPFIRE_HFQ6_MMQ_ALL=1` → routes B≥8 unconditionally outside
+///     capture (overrides `hfq6_mmq_winning_size`'s conservative gate).
+///     Used by audit scripts to force MMQ at all batch sizes for sweeps.
+///   - `HIPFIRE_HFQ6_MMQ_DIAG_PASSTHROUGH=1` → MMQ kernel calls forward
+///     to the FP16 reference path. Checked inside the dispatcher itself,
+///     not here.
+///
+/// All env vars cached at first call via `OnceLock` — no per-dispatch
+/// `std::env::var` syscalls on the hot path.
 fn hfq6_mmq_route(capture_mode: bool, batch_size: usize) -> bool {
-    if std::env::var("HIPFIRE_HFQ6_MMQ").ok().as_deref() == Some("0") {
+    if hfq6_mmq_env_disabled() {
         return false;
     }
     if capture_mode {
         return batch_size >= 8;
     }
+    if hfq6_mmq_all_enabled() {
+        return batch_size >= 8;
+    }
     hfq6_mmq_winning_size(batch_size)
+}
+
+/// Cached env-var read for `HIPFIRE_HFQ6_MMQ=0` (global HFQ6 MMQ disable).
+fn hfq6_mmq_env_disabled() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("HIPFIRE_HFQ6_MMQ").ok().as_deref() == Some("0")
+    })
+}
+
+/// Cached env-var read for `HIPFIRE_HFQ6_MMQ_ALL=1` (force MMQ at any B≥8).
+fn hfq6_mmq_all_enabled() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("HIPFIRE_HFQ6_MMQ_ALL").ok().as_deref() == Some("1")
+    })
+}
+
+/// Cached env-var read for `HIPFIRE_MMQ_DIAG_PASSTHROUGH=1`
+/// (forwards MMQ calls to the FP16 reference path for numerical bisect).
+fn mmq_diag_passthrough_enabled() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("HIPFIRE_MMQ_DIAG_PASSTHROUGH").ok().as_deref() == Some("1")
+    })
+}
+
+/// Cached env-var read for `HIPFIRE_MMQ_DIAG_QUANTIZE_ONLY=1`
+/// (quantize x but skip the MMQ kernel; falls back to FP16).
+fn mmq_diag_quantize_only_enabled() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("HIPFIRE_MMQ_DIAG_QUANTIZE_ONLY").ok().as_deref() == Some("1")
+    })
+}
+
+/// Cached env-var read for `HIPFIRE_HFQ6_MMQ_DIAG_PASSTHROUGH=1`.
+fn hfq6_mmq_diag_passthrough_enabled() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("HIPFIRE_HFQ6_MMQ_DIAG_PASSTHROUGH").ok().as_deref() == Some("1")
+    })
 }
 
 pub fn gemv_dp4a_enabled(arch: &str) -> bool {
@@ -1342,6 +1400,7 @@ impl Gpu {
             let y_mmq = self.zeros(&[screen_batch * m], DType::F32)?;
 
             let saved_capture = self.capture_mode;
+            let saved_blobs_len = self.capture_blobs.len();
             self.capture_mode = true;
 
             // Reference path: use FP16 wave64 on gfx906, WMMA otherwise
@@ -1360,6 +1419,12 @@ impl Gpu {
             }
 
             self.capture_mode = saved_capture;
+            // Discard blobs the screen kernels pushed: they're owned by this
+            // synchronous call, not by an outer capture. Leaving them in
+            // capture_blobs would leak ~50 B/launch × ~6 launches/screen ×
+            // ~384 weights/27B ≈ 120 KB until the next legitimate capture
+            // begin clears the vec.
+            self.capture_blobs.truncate(saved_blobs_len);
             self.hip.device_synchronize()?;
 
             let ref_out = self.download_f32(&y_wmma)?;
@@ -1437,6 +1502,7 @@ impl Gpu {
             let y_mmq = self.zeros(&[screen_batch * m], DType::F32)?;
 
             let saved_capture = self.capture_mode;
+            let saved_blobs_len = self.capture_blobs.len();
             self.capture_mode = true;
 
             // Reference: FP16 wave64 on gfx906; WMMA elsewhere (HFQ6 has both).
@@ -1454,6 +1520,9 @@ impl Gpu {
             self.gemm_hfq6g256_residual_mmq_gfx906(a_raw, &x_gpu, &y_mmq, m, k, screen_batch)?;
 
             self.capture_mode = saved_capture;
+            // Discard blobs pushed by the screen kernels; see HFQ4 sibling
+            // for rationale.
+            self.capture_blobs.truncate(saved_blobs_len);
             self.hip.device_synchronize()?;
 
             let ref_out = self.download_f32(&y_ref)?;
@@ -7184,12 +7253,12 @@ impl Gpu {
         //   gemm_hfq4g256_residual_fp16_wave64 in the diag passthrough path
         // DIAGNOSTIC: HIPFIRE_MMQ_DIAG_PASSTHROUGH=1 forwards to the FP16
         // wave64 kernel instead of running the dp4a kernel.
-        if std::env::var("HIPFIRE_MMQ_DIAG_PASSTHROUGH").ok().as_deref() == Some("1") {
+        if mmq_diag_passthrough_enabled() {
             return self.gemm_hfq4g256_residual_fp16_wave64(a_raw, x, y, m, k, batch_size);
         }
         // Quantize activations to Q8_1.
         let x_q8_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
-        if std::env::var("HIPFIRE_MMQ_DIAG_QUANTIZE_ONLY").ok().as_deref() == Some("1") {
+        if mmq_diag_quantize_only_enabled() {
             return self.gemm_hfq4g256_residual_fp16_wave64(a_raw, x, y, m, k, batch_size);
         }
 
@@ -7417,54 +7486,39 @@ impl Gpu {
         // DIAG: HIPFIRE_HFQ6_MMQ_DIAG_PASSTHROUGH=1 redirects to fp16 reference
         // for numerical-correctness bisection (MMQ vs FP16). Mirrors HFQ4 at
         // dispatch.rs:7132.
-        if std::env::var("HIPFIRE_HFQ6_MMQ_DIAG_PASSTHROUGH").ok().as_deref() == Some("1") {
+        if hfq6_mmq_diag_passthrough_enabled() {
             return self.gemm_hfq6g256_residual_fp16(a_raw, x, y, m, k, batch_size);
         }
         // Quantize activations to Q8_1 (shared layout with HFQ4).
         let x_q8_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
 
-        // S2 + v3.2.6 b128-cliff fix: per-batch routing.
+        // S2 + v3.2.6 b128-cliff fix + v3.2.7 capture-mode lift:
         //
-        // Per-batch perf bench (M=3584 K=4096, MMQ vs wave64_dp4a, speedup):
-        //   B=8     → 0.86× ❌ regression — MMQ block too coarse
-        //   B=9-15  → unmeasured — conservatively route to dp4a
+        // Bench data (M=3584 K=4096, MMQ vs wave64_dp4a, speedup):
+        //   B=8     → 0.86× ❌ regression vs dp4a (capture: dp4a unsafe → use mmq_x=8)
         //   B=16    → 1.22× ✓
-        //   B=17-23 → unmeasured
-        //   B=24    → 1.08× marginal — route to dp4a
-        //   B=25-31 → unmeasured
+        //   B=24    → 1.08× marginal (capture: still beats fp16)
         //   B=32    → 1.15× ✓ (post b128-cliff fix at mmq_x>=32)
-        //   B=33-39 → unmeasured
         //   B=40    → 1.35× ✓
         //   B=41-63 → 1.26×-1.51× ✓
         //   B=64+   → 1.51×-3.03× ✓ monotonically improving
         //
-        // Under capture mode (DFlash), the wave64_dp4a fallback is
-        // hipMemset_async-unsafe (commit fa8785b). Caller (high-level
-        // dispatcher) gates capture entry via `hfq6_mmq_route` so we
-        // shouldn't fall through here under capture, but defensively we
-        // still avoid calling wave64_dp4a from within an MMQ-entered
-        // call when capture_mode is set.
-        let mmq_x_opt: Option<u32> = if batch_size == 16 { Some(16) }
-            else if batch_size >= 32 && batch_size <= 39 { Some(32) }
-            else if batch_size >= 40 && batch_size <= 47 { Some(40) }
-            else if batch_size >= 48 && batch_size <= 55 { Some(48) }
-            else if batch_size >= 56 && batch_size <= 63 { Some(56) }
-            else if batch_size >= 64 { Some(64) }
-            else { None };
-        let mmq_x = match mmq_x_opt {
-            Some(x) => x as usize,
-            None => {
-                // Conservative fallback. Under capture the dp4a kernel's
-                // memset_async would corrupt the captured stream — but the
-                // gating helper already prevented entry here under capture
-                // for non-winning sizes, so this is unreachable under
-                // capture in well-gated callers.
-                debug_assert!(!self.capture_mode,
-                    "MMQ fallback to wave64_dp4a entered under capture (B={batch_size}) — \
-                     hfq6_mmq_route should have prevented this");
-                return self.gemm_hfq6g256_residual_wave64_dp4a(a_raw, x, y, m, k, batch_size);
-            }
-        };
+        // Routing strategy:
+        //   - The high-level dispatcher (`hfq6_mmq_route`) gates whether
+        //     MMQ is the right choice given (capture_mode, batch_size).
+        //   - This function trusts that gate and just picks the right
+        //     mmq_x for the requested batch — no fallthrough to dp4a here.
+        //   - Mirrors `_mmq_set_gfx906`'s simple staircase so capture-mode
+        //     paths at B=8..15 / B=24..31 don't fall through to the
+        //     hipMemset_async-unsafe wave64_dp4a kernel mid-stream.
+        let mmq_x = if batch_size <= 8 { 8 }
+            else if batch_size <= 16 { 16 }
+            else if batch_size <= 24 { 24 }
+            else if batch_size <= 32 { 32 }
+            else if batch_size <= 40 { 40 }
+            else if batch_size <= 48 { 48 }
+            else if batch_size <= 56 { 56 }
+            else { 64 };
         let is_full = m % 128 == 0 && batch_size % mmq_x == 0;
         let base_name = "gemm_hfq6g256_residual_mmq_gfx906";
         let kernel_name = if is_full {
@@ -7570,11 +7624,15 @@ impl Gpu {
     ) -> HipResult<()> {
         // bind_thread: skip — caller already pre-quantized x via
         //   ensure_q8_1_mmq_x (which bind_threads); we only launch kernels.
-        // S2: same per-batch routing as residual sibling. Caller (fused
-        // dispatcher) is expected to fall back to wave64_dp4a for batch
-        // sizes where MMQ is non-winning. We accept any size here for
-        // testing and small-grid use; the fused dispatchers gate ahead
-        // of calling us.
+        // Caller (fused dispatcher) is expected to gate via `hfq6_mmq_route`;
+        // the assert below enforces that contract so a future caller can't
+        // silently route a non-winning batch through MMQ.
+        debug_assert!(
+            hfq6_mmq_route(self.capture_mode, batch_size),
+            "_mmq_set_gfx906 called at non-winning B={} (capture={}) — \
+             caller must gate via hfq6_mmq_route first",
+            batch_size, self.capture_mode,
+        );
         let mmq_x = if batch_size <= 8 { 8 }
             else if batch_size <= 16 { 16 }
             else if batch_size <= 24 { 24 }
@@ -7642,7 +7700,9 @@ impl Gpu {
         debug_assert!(shared_mem as usize <= 32 * 1024,
             "gfx906 MMQ LDS budget exceeded: {} B > 32 KiB", shared_mem);
 
+        // bytes = weight read + X read (Q8_1, ~1 byte/element + scale) + Y write (set, no read).
         let bytes = crate::profile::gemv_hfq6g256_bytes(m, k)
+            + batch_size * k
             + batch_size * m * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_hfq6g256_mmq_set_gfx906", bytes);
         let result = self.launch_maybe_blob(
@@ -8724,7 +8784,7 @@ impl Gpu {
         let batch_tiles = { const BATCH_TILE: usize = 8; (batch_size + BATCH_TILE - 1) / BATCH_TILE };
 
         // Bandwidth: weight (HFQ6: 200 bytes/group vs HFQ4: 136), per-batch x read, per-batch y RMW.
-        let bytes = crate::profile::gemv_hfq4g256_bytes(m, k)  // placeholder until hfq6 profiling added
+        let bytes = crate::profile::gemv_hfq6g256_bytes(m, k)
             + batch_size * k * 4
             + batch_size * m * 4 * 2;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_hfq6g256_residual", bytes);
@@ -8778,7 +8838,7 @@ impl Gpu {
 
         let batch_tiles = { const BATCH_TILE: usize = 8; (batch_size + BATCH_TILE - 1) / BATCH_TILE };
 
-        let bytes = crate::profile::gemv_hfq4g256_bytes(m, k)
+        let bytes = crate::profile::gemv_hfq6g256_bytes(m, k)
             + batch_size * k * 2  // FP16 X (half bandwidth)
             + batch_size * m * 4 * 2;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_hfq6g256_residual_fp16", bytes);
@@ -8834,7 +8894,7 @@ impl Gpu {
         let row_tiles = (m + row_step - 1) / row_step;
         let batch_tiles = (batch_size + 15) / 16;
 
-        let bytes = crate::profile::gemv_hfq4g256_bytes(m, k)
+        let bytes = crate::profile::gemv_hfq6g256_bytes(m, k)
             + batch_size * k * 2
             + batch_size * m * 4 * 2;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
@@ -8964,10 +9024,10 @@ impl Gpu {
         let batch_tiles = { const BATCH_TILE: usize = 8; (batch_size + BATCH_TILE - 1) / BATCH_TILE };
         let total_m = (qkv_m + z_m + beta_m + alpha_m) as u32;
 
-        let bytes = crate::profile::gemv_hfq4g256_bytes(qkv_m, k)
-                  + crate::profile::gemv_hfq4g256_bytes(z_m, k)
-                  + crate::profile::gemv_hfq4g256_bytes(beta_m, k)
-                  + crate::profile::gemv_hfq4g256_bytes(alpha_m, k);
+        let bytes = crate::profile::gemv_hfq6g256_bytes(qkv_m, k)
+                  + crate::profile::gemv_hfq6g256_bytes(z_m, k)
+                  + crate::profile::gemv_hfq6g256_bytes(beta_m, k)
+                  + crate::profile::gemv_hfq6g256_bytes(alpha_m, k);
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkvza_hfq6g256", bytes);
         let result = unsafe {
             self.hip.launch_kernel(
@@ -9042,10 +9102,10 @@ impl Gpu {
         let batch_tiles = { const BATCH_TILE: usize = 8; (batch_size + BATCH_TILE - 1) / BATCH_TILE };
         let total_m = (qkv_m + z_m + beta_m + alpha_m) as u32;
 
-        let bytes = crate::profile::gemv_hfq4g256_bytes(qkv_m, k)
-                  + crate::profile::gemv_hfq4g256_bytes(z_m, k)
-                  + crate::profile::gemv_hfq4g256_bytes(beta_m, k)
-                  + crate::profile::gemv_hfq4g256_bytes(alpha_m, k)
+        let bytes = crate::profile::gemv_hfq6g256_bytes(qkv_m, k)
+                  + crate::profile::gemv_hfq6g256_bytes(z_m, k)
+                  + crate::profile::gemv_hfq6g256_bytes(beta_m, k)
+                  + crate::profile::gemv_hfq6g256_bytes(alpha_m, k)
                   + batch_size * k * 2  // FP16 X
                   + batch_size * (qkv_m + z_m + beta_m + alpha_m) * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkvza_hfq6g256_fp16", bytes);
@@ -9264,10 +9324,10 @@ impl Gpu {
         let row_tiles = (total_m + 15) / 16;
         let batch_tiles = (batch_size + 15) / 16;
 
-        let bytes = crate::profile::gemv_hfq4g256_bytes(qkv_m, k)
-                  + crate::profile::gemv_hfq4g256_bytes(z_m, k)
-                  + crate::profile::gemv_hfq4g256_bytes(beta_m, k)
-                  + crate::profile::gemv_hfq4g256_bytes(alpha_m, k)
+        let bytes = crate::profile::gemv_hfq6g256_bytes(qkv_m, k)
+                  + crate::profile::gemv_hfq6g256_bytes(z_m, k)
+                  + crate::profile::gemv_hfq6g256_bytes(beta_m, k)
+                  + crate::profile::gemv_hfq6g256_bytes(alpha_m, k)
                   + batch_size * k * 2
                   + batch_size * total_m * 4 * 2;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkvza_hfq6g256_wmma", bytes);
@@ -9350,10 +9410,10 @@ impl Gpu {
         let row_tiles = (total_m + 15) / 16;
         let batch_tiles = (batch_size + 15) / 16;
 
-        let bytes = crate::profile::gemv_hfq4g256_bytes(qkv_m, k)
-                  + crate::profile::gemv_hfq4g256_bytes(z_m, k)
-                  + crate::profile::gemv_hfq4g256_bytes(beta_m, k)
-                  + crate::profile::gemv_hfq4g256_bytes(alpha_m, k)
+        let bytes = crate::profile::gemv_hfq6g256_bytes(qkv_m, k)
+                  + crate::profile::gemv_hfq6g256_bytes(z_m, k)
+                  + crate::profile::gemv_hfq6g256_bytes(beta_m, k)
+                  + crate::profile::gemv_hfq6g256_bytes(alpha_m, k)
                   + batch_size * k * 2
                   + batch_size * total_m * 4 * 2;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkvza_hfq6g256_wmma_gfx12", bytes);
@@ -9471,9 +9531,9 @@ impl Gpu {
         let batch_tiles = { const BATCH_TILE: usize = 8; (batch_size + BATCH_TILE - 1) / BATCH_TILE };
         let total_m = (q_m + k_m + v_m) as u32;
 
-        let bytes = crate::profile::gemv_hfq4g256_bytes(q_m, k)
-                  + crate::profile::gemv_hfq4g256_bytes(k_m, k)
-                  + crate::profile::gemv_hfq4g256_bytes(v_m, k);
+        let bytes = crate::profile::gemv_hfq6g256_bytes(q_m, k)
+                  + crate::profile::gemv_hfq6g256_bytes(k_m, k)
+                  + crate::profile::gemv_hfq6g256_bytes(v_m, k);
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkv_hfq6g256", bytes);
         let result = unsafe {
             self.hip.launch_kernel(
@@ -9542,9 +9602,9 @@ impl Gpu {
         let batch_tiles = { const BATCH_TILE: usize = 8; (batch_size + BATCH_TILE - 1) / BATCH_TILE };
         let total_m = (q_m + k_m + v_m) as u32;
 
-        let bytes = crate::profile::gemv_hfq4g256_bytes(q_m, k)
-                  + crate::profile::gemv_hfq4g256_bytes(k_m, k)
-                  + crate::profile::gemv_hfq4g256_bytes(v_m, k)
+        let bytes = crate::profile::gemv_hfq6g256_bytes(q_m, k)
+                  + crate::profile::gemv_hfq6g256_bytes(k_m, k)
+                  + crate::profile::gemv_hfq6g256_bytes(v_m, k)
                   + batch_size * k * 2  // FP16 X
                   + batch_size * (q_m + k_m + v_m) * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkv_hfq6g256_fp16", bytes);
@@ -9742,9 +9802,9 @@ impl Gpu {
         let row_tiles = (total_m + 15) / 16;
         let batch_tiles = (batch_size + 15) / 16;
 
-        let bytes = crate::profile::gemv_hfq4g256_bytes(q_m, k)
-                  + crate::profile::gemv_hfq4g256_bytes(k_m, k)
-                  + crate::profile::gemv_hfq4g256_bytes(v_m, k)
+        let bytes = crate::profile::gemv_hfq6g256_bytes(q_m, k)
+                  + crate::profile::gemv_hfq6g256_bytes(k_m, k)
+                  + crate::profile::gemv_hfq6g256_bytes(v_m, k)
                   + batch_size * k * 2
                   + batch_size * total_m * 4 * 2;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkv_hfq6g256_wmma", bytes);
@@ -9821,9 +9881,9 @@ impl Gpu {
         let row_tiles = (total_m + 15) / 16;
         let batch_tiles = (batch_size + 15) / 16;
 
-        let bytes = crate::profile::gemv_hfq4g256_bytes(q_m, k)
-                  + crate::profile::gemv_hfq4g256_bytes(k_m, k)
-                  + crate::profile::gemv_hfq4g256_bytes(v_m, k)
+        let bytes = crate::profile::gemv_hfq6g256_bytes(q_m, k)
+                  + crate::profile::gemv_hfq6g256_bytes(k_m, k)
+                  + crate::profile::gemv_hfq6g256_bytes(v_m, k)
                   + batch_size * k * 2
                   + batch_size * total_m * 4 * 2;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkv_hfq6g256_wmma_gfx12", bytes);
@@ -9931,8 +9991,8 @@ impl Gpu {
         let batch_tiles = { const BATCH_TILE: usize = 8; (batch_size + BATCH_TILE - 1) / BATCH_TILE };
         let total_m = (gate_m + up_m) as u32;
 
-        let bytes = crate::profile::gemv_hfq4g256_bytes(gate_m, k)
-                  + crate::profile::gemv_hfq4g256_bytes(up_m, k);
+        let bytes = crate::profile::gemv_hfq6g256_bytes(gate_m, k)
+                  + crate::profile::gemv_hfq6g256_bytes(up_m, k);
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_gate_up_hfq6g256", bytes);
         let result = unsafe {
             self.hip.launch_kernel(
@@ -9995,8 +10055,8 @@ impl Gpu {
         let batch_tiles = { const BATCH_TILE: usize = 8; (batch_size + BATCH_TILE - 1) / BATCH_TILE };
         let total_m = (gate_m + up_m) as u32;
 
-        let bytes = crate::profile::gemv_hfq4g256_bytes(gate_m, k)
-                  + crate::profile::gemv_hfq4g256_bytes(up_m, k)
+        let bytes = crate::profile::gemv_hfq6g256_bytes(gate_m, k)
+                  + crate::profile::gemv_hfq6g256_bytes(up_m, k)
                   + batch_size * k * 2  // FP16 X
                   + batch_size * (gate_m + up_m) * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_gate_up_hfq6g256_fp16", bytes);
@@ -10173,8 +10233,8 @@ impl Gpu {
         let row_tiles = (total_m + 15) / 16;
         let batch_tiles = (batch_size + 15) / 16;
 
-        let bytes = crate::profile::gemv_hfq4g256_bytes(gate_m, k)
-                  + crate::profile::gemv_hfq4g256_bytes(up_m, k)
+        let bytes = crate::profile::gemv_hfq6g256_bytes(gate_m, k)
+                  + crate::profile::gemv_hfq6g256_bytes(up_m, k)
                   + batch_size * k * 2
                   + batch_size * total_m * 4 * 2;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_gate_up_hfq6g256_wmma", bytes);
@@ -10245,8 +10305,8 @@ impl Gpu {
         let row_tiles = (total_m + 15) / 16;
         let batch_tiles = (batch_size + 15) / 16;
 
-        let bytes = crate::profile::gemv_hfq4g256_bytes(gate_m, k)
-                  + crate::profile::gemv_hfq4g256_bytes(up_m, k)
+        let bytes = crate::profile::gemv_hfq6g256_bytes(gate_m, k)
+                  + crate::profile::gemv_hfq6g256_bytes(up_m, k)
                   + batch_size * k * 2
                   + batch_size * total_m * 4 * 2;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_gate_up_hfq6g256_wmma_gfx12", bytes);

@@ -6087,13 +6087,25 @@ fn forward_scratch_layers_multi(
                         gpu, &layer.wqkv, &s.x, &layer.attn_norm, &s.tmp, &s.x_rot, config.norm_eps,
                     )?;
                     let dt = layer.wqkv.gpu_dtype;
-                    let fused_la4_ok = (dt == DType::MQ4G256 || dt == DType::HFQ4G256)
-                        && layer.wz.gpu_dtype == dt
+                    let same_dt = layer.wz.gpu_dtype == dt
                         && layer.w_beta.gpu_dtype == dt
                         && layer.w_alpha.gpu_dtype == dt;
+                    let fused_la4_ok = (dt == DType::MQ4G256 || dt == DType::HFQ4G256) && same_dt;
+                    let fused_la4_hfq6 = (dt == DType::MQ6G256 || dt == DType::HFQ6G256)
+                        && same_dt
+                        && rdna_compute::gemv_dp4a_enabled(&gpu.arch);
                     if fused_la4_ok {
                         let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
                         gpu.fused_qkvza_hfq4g256(
+                            &layer.wqkv.buf, &layer.wz.buf, &layer.w_beta.buf, &layer.w_alpha.buf,
+                            eff_x,
+                            &s.dn_qkv, &s.dn_z, &s.dn_beta, &s.dn_alpha,
+                            layer.wqkv.m, layer.wz.m, layer.w_beta.m, layer.w_alpha.m,
+                            layer.wqkv.k,
+                        )?;
+                    } else if fused_la4_hfq6 {
+                        let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
+                        gpu.fused_qkvza_hfq6g256_dp4a(
                             &layer.wqkv.buf, &layer.wz.buf, &layer.w_beta.buf, &layer.w_alpha.buf,
                             eff_x,
                             &s.dn_qkv, &s.dn_z, &s.dn_beta, &s.dn_alpha,
@@ -6158,11 +6170,23 @@ fn forward_scratch_layers_multi(
                         gpu, &layer.w_gate, &s.x, &layer.ffn_norm, &s.tmp, &s.x_rot, config.norm_eps,
                     )?;
                     let dt_g = layer.w_gate.gpu_dtype;
-                    let fused_gu_ok = (dt_g == DType::MQ4G256 || dt_g == DType::HFQ4G256)
-                        && layer.w_up.gpu_dtype == dt_g;
+                    let same_dt_g = layer.w_up.gpu_dtype == dt_g;
+                    let fused_gu_ok = (dt_g == DType::MQ4G256 || dt_g == DType::HFQ4G256) && same_dt_g;
+                    let fused_gu_hfq6 = (dt_g == DType::MQ6G256 || dt_g == DType::HFQ6G256)
+                        && same_dt_g
+                        && rdna_compute::gemv_dp4a_enabled(&gpu.arch);
                     if fused_gu_ok {
                         let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
                         gpu.fused_gate_up_hfq4g256(
+                            &layer.w_gate.buf, &layer.w_up.buf,
+                            eff_x,
+                            &s.gate_ffn, &s.up,
+                            layer.w_gate.m, layer.w_up.m,
+                            layer.w_gate.k,
+                        )?;
+                    } else if fused_gu_hfq6 {
+                        let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
+                        gpu.fused_gate_up_hfq6g256_dp4a(
                             &layer.w_gate.buf, &layer.w_up.buf,
                             eff_x,
                             &s.gate_ffn, &s.up,
@@ -6184,12 +6208,23 @@ fn forward_scratch_layers_multi(
                         gpu, &layer.wq, &s.x, &layer.attn_norm, &s.tmp, &s.x_rot, config.norm_eps,
                     )?;
                     let dt = layer.wq.gpu_dtype;
-                    let fused_fa3_ok = (dt == DType::MQ4G256 || dt == DType::HFQ4G256)
-                        && layer.wk.gpu_dtype == dt
-                        && layer.wv.gpu_dtype == dt;
+                    let same_dt_fa = layer.wk.gpu_dtype == dt && layer.wv.gpu_dtype == dt;
+                    let fused_fa3_ok = (dt == DType::MQ4G256 || dt == DType::HFQ4G256) && same_dt_fa;
+                    let fused_fa3_hfq6 = (dt == DType::MQ6G256 || dt == DType::HFQ6G256)
+                        && same_dt_fa
+                        && rdna_compute::gemv_dp4a_enabled(&gpu.arch);
                     if fused_fa3_ok {
                         let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
                         gpu.fused_qkv_hfq4g256(
+                            &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
+                            eff_x,
+                            &s.fa_q_full, &s.fa_k, &s.fa_v,
+                            layer.wq.m, layer.wk.m, layer.wv.m,
+                            layer.wq.k,
+                        )?;
+                    } else if fused_fa3_hfq6 {
+                        let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
+                        gpu.fused_qkv_hfq6g256_dp4a(
                             &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
                             eff_x,
                             &s.fa_q_full, &s.fa_k, &s.fa_v,
@@ -6289,11 +6324,23 @@ fn forward_scratch_layers_multi(
                         gpu, &layer.w_gate, &s.x, &layer.ffn_norm, &s.tmp, &s.x_rot, config.norm_eps,
                     )?;
                     let dt_g = layer.w_gate.gpu_dtype;
-                    let fused_gu_ok = (dt_g == DType::MQ4G256 || dt_g == DType::HFQ4G256)
-                        && layer.w_up.gpu_dtype == dt_g;
+                    let same_dt_g = layer.w_up.gpu_dtype == dt_g;
+                    let fused_gu_ok = (dt_g == DType::MQ4G256 || dt_g == DType::HFQ4G256) && same_dt_g;
+                    let fused_gu_hfq6 = (dt_g == DType::MQ6G256 || dt_g == DType::HFQ6G256)
+                        && same_dt_g
+                        && rdna_compute::gemv_dp4a_enabled(&gpu.arch);
                     if fused_gu_ok {
                         let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
                         gpu.fused_gate_up_hfq4g256(
+                            &layer.w_gate.buf, &layer.w_up.buf,
+                            eff_x,
+                            &s.gate_ffn, &s.up,
+                            layer.w_gate.m, layer.w_up.m,
+                            layer.w_gate.k,
+                        )?;
+                    } else if fused_gu_hfq6 {
+                        let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
+                        gpu.fused_gate_up_hfq6g256_dp4a(
                             &layer.w_gate.buf, &layer.w_up.buf,
                             eff_x,
                             &s.gate_ffn, &s.up,
@@ -6314,13 +6361,25 @@ fn forward_scratch_layers_multi(
                         gpu, &layer.wqkv, &s.x, &layer.attn_norm, &s.tmp, &s.x_rot, config.norm_eps,
                     )?;
                     let dt = layer.wqkv.gpu_dtype;
-                    let fused_la4_ok = (dt == DType::MQ4G256 || dt == DType::HFQ4G256)
-                        && layer.wz.gpu_dtype == dt
+                    let same_dt = layer.wz.gpu_dtype == dt
                         && layer.w_beta.gpu_dtype == dt
                         && layer.w_alpha.gpu_dtype == dt;
+                    let fused_la4_ok = (dt == DType::MQ4G256 || dt == DType::HFQ4G256) && same_dt;
+                    let fused_la4_hfq6 = (dt == DType::MQ6G256 || dt == DType::HFQ6G256)
+                        && same_dt
+                        && rdna_compute::gemv_dp4a_enabled(&gpu.arch);
                     if fused_la4_ok {
                         let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
                         gpu.fused_qkvza_hfq4g256(
+                            &layer.wqkv.buf, &layer.wz.buf, &layer.w_beta.buf, &layer.w_alpha.buf,
+                            eff_x,
+                            &s.dn_qkv, &s.dn_z, &s.dn_beta, &s.dn_alpha,
+                            layer.wqkv.m, layer.wz.m, layer.w_beta.m, layer.w_alpha.m,
+                            layer.wqkv.k,
+                        )?;
+                    } else if fused_la4_hfq6 {
+                        let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
+                        gpu.fused_qkvza_hfq6g256_dp4a(
                             &layer.wqkv.buf, &layer.wz.buf, &layer.w_beta.buf, &layer.w_alpha.buf,
                             eff_x,
                             &s.dn_qkv, &s.dn_z, &s.dn_beta, &s.dn_alpha,
@@ -6400,12 +6459,23 @@ fn forward_scratch_layers_multi(
                         gpu, &layer.wq, &s.x, &layer.attn_norm, &s.tmp, &s.x_rot, config.norm_eps,
                     )?;
                     let dt = layer.wq.gpu_dtype;
-                    let fused_fa3_ok = (dt == DType::MQ4G256 || dt == DType::HFQ4G256)
-                        && layer.wk.gpu_dtype == dt
-                        && layer.wv.gpu_dtype == dt;
+                    let same_dt_fa = layer.wk.gpu_dtype == dt && layer.wv.gpu_dtype == dt;
+                    let fused_fa3_ok = (dt == DType::MQ4G256 || dt == DType::HFQ4G256) && same_dt_fa;
+                    let fused_fa3_hfq6 = (dt == DType::MQ6G256 || dt == DType::HFQ6G256)
+                        && same_dt_fa
+                        && rdna_compute::gemv_dp4a_enabled(&gpu.arch);
                     if fused_fa3_ok {
                         let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
                         gpu.fused_qkv_hfq4g256(
+                            &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
+                            eff_x,
+                            &s.fa_q_full, &s.fa_k, &s.fa_v,
+                            layer.wq.m, layer.wk.m, layer.wv.m,
+                            layer.wq.k,
+                        )?;
+                    } else if fused_fa3_hfq6 {
+                        let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
+                        gpu.fused_qkv_hfq6g256_dp4a(
                             &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
                             eff_x,
                             &s.fa_q_full, &s.fa_k, &s.fa_v,

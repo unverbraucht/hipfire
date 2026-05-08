@@ -24,6 +24,38 @@
 //   covers a FULL sub-block per thread (vdr=8 ints over 32 K-elements),
 //   so the accumulation formula is `zp_eff * sum_x` with NO factor.
 //
+// ═══ KERNEL INVARIANTS — caller MUST satisfy ═══
+//
+//   1. K must be a multiple of 256 (= group_size). Body assumes
+//      `groups_per_row = K / 256`; not asserted at runtime (caller's job).
+//
+//   2. M alignment depends on the kernel variant:
+//        `_x{N}`        (need_check=true)  → ANY M ≥ 1 is safe.
+//                                            OOB rows clamp to M-1 weights
+//                                            in shared memory and accumulate
+//                                            spurious sums, but write_back
+//                                            skips them so observable Y is
+//                                            correct.
+//        `_full_add_x{N}` (need_check=false, add=1) → CALLER MUST GUARANTEE
+//                                                     `M % 128 == 0`.
+//        `_full_set_x{N}` (need_check=false, add=0) → CALLER MUST GUARANTEE
+//                                                     `M % 128 == 0`.
+//      The `_full_*` variants drop the `(row >= M ? skip)` check from
+//      writeback for ~5 % perf — they will write GARBAGE to OOB rows
+//      otherwise. The dispatcher at `dispatch.rs:7468` enforces
+//      `is_full = m % 128 == 0 && batch_size % mmq_x == 0` before naming
+//      a `_full_*` kernel; do not bypass that gate.
+//
+//   3. N (batch_size) alignment depends on the kernel variant:
+//        `_x{N}`        → ANY N ≥ 1 is safe (need_check=true skips OOB cols).
+//        `_full_*_x{N}` → CALLER MUST GUARANTEE `batch_size % mmq_x == 0`.
+//
+//   4. Body's row-clamp at lines `(row0 + i < M) ? (row0 + i) : (M - 1)`
+//      means non-`_full_*` variants over-fetch row M-1 weights into the
+//      LDS slots that correspond to OOB rows. This costs ~0 % perf (cache-
+//      hot reads) but breaks if M==0 (would index row -1 underflowing
+//      to 2^64-1). Caller must also guarantee M ≥ 1.
+//
 // Topology (wave-native gfx906) — UNCHANGED from HFQ4:
 //   block dim (64, 4, 1) = 256 threads = 4 wave64s
 //   mmq_y = 128
