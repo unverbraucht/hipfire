@@ -47,12 +47,16 @@ fn gemv_rows_override() -> Option<u32> {
 /// have shipped; this lever now toggles every fused dp4a path together.
 /// Phase B.2 — per-batch routing for HFQ6 MMQ-streaming.
 ///
-/// Returns true when the batch size is one where the S2 perf sweep
+/// Returns true when the batch size is one where the perf sweep
 /// confirmed MMQ beats wave64_dp4a by ≥10 % (M=3584, K=4096):
 ///   B=16   → 1.22× ✓
-///   B≥40   → 1.13×–3.03× ✓ monotonically improving
+///   B≥32   → 1.15×–3.03× ✓ monotonically improving
+///         (initial S2 sweep had B=32 at 0.96× regression with the b32
+///          stride path; v3.2.6 follow-up dropped the b128 cliff to
+///          mmq_x>=32, which fixed B=32 to 1.15× and improved 40-56
+///          by 16-20 %.)
 ///
-/// Returns false at non-winning sizes (B≤8, B∈[9,15], B∈[17,39]) — the
+/// Returns false at non-winning sizes (B≤8 and B∈[17,31]) — the
 /// caller falls through to wave64_dp4a there.
 ///
 /// Env override: `HIPFIRE_HFQ6_MMQ=0` disables HFQ6 MMQ routing globally
@@ -65,7 +69,7 @@ fn hfq6_mmq_winning_size(batch_size: usize) -> bool {
     if std::env::var("HIPFIRE_HFQ6_MMQ").ok().as_deref() == Some("0") {
         return false;
     }
-    batch_size == 16 || batch_size >= 40
+    batch_size == 16 || batch_size >= 32
 }
 
 pub fn gemv_dp4a_enabled(arch: &str) -> bool {
@@ -7440,8 +7444,10 @@ impl Gpu {
         ];
 
         // Window Streaming topology — KEEP IN SYNC WITH body.cuh.
+        // HFQ6 b128 cliff at mmq_x>=32 (lowered from HFQ4's >=64 per
+        // PMC sweep — see body.cuh::x_stride_for<>()).
         const MMQ_Y: usize = 128;
-        let x_stride: usize = if mmq_x >= 64 { 40 } else { 33 };
+        let x_stride: usize = if mmq_x >= 32 { 40 } else { 33 };
         const Y_STRIDE: usize = 36;
         const X_DM_HALF2: usize = 128;
         let row_tiles = (m + MMQ_Y - 1) / MMQ_Y;
@@ -7553,8 +7559,9 @@ impl Gpu {
             &mut add_val as *mut _ as *mut c_void,
         ];
 
+        // HFQ6 b128 cliff at mmq_x>=32 (KEEP IN SYNC WITH body.cuh).
         const MMQ_Y: usize = 128;
-        let x_stride: usize = if mmq_x >= 64 { 40 } else { 33 };
+        let x_stride: usize = if mmq_x >= 32 { 40 } else { 33 };
         const Y_STRIDE: usize = 36;
         const X_DM_HALF2: usize = 128;
         let row_tiles = (m + MMQ_Y - 1) / MMQ_Y;

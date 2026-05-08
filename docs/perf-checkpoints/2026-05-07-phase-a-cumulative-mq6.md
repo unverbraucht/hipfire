@@ -545,6 +545,53 @@ HEAD = **597.7 tok/s** (vs pre-B.2 mq4 baseline 598.7) — within 0.2 %,
 no regression. The HFQ6 MMQ path is properly isolated from HFQ4
 dispatch.
 
+### Phase B.2 follow-up: b128 cliff lowered for HFQ6 (B=32 fixed)
+
+S2 sweep had B=32 at 0.96× regression (mmq_x=32 used b32 LDS path,
+8 ds_read_b32 per inner ALU iter — issue-rate starvation).
+
+PMC at mmq_x ∈ {16, 24, 32, 40} (all using b32 path before fix):
+
+| Batch | mmq_x | LDS (B) | VALUBusy | MemUnitBusy | L2 hit |
+|---:|---:|---:|---:|---:|---:|
+| 16 | 16 | 20480 | 11.2 % | 28.8 % | 42.6 % |
+| 24 | 24 | 21504 | 13.4 % | 21.0 % | 47.3 % |
+| **32** | 32 | 22528 | **10.8 %** | **13.8 %** | 47.6 % |
+| 40 | 40 | 24064 | 12.0 % | 16.0 % | 51.2 % |
+
+MemUnitBusy collapsed to 13.8 % at mmq_x=32 — kernel idle, not stalled.
+Same SQ_WAVES (112), same VGPR (~92), no LDS bank conflicts. The b32
+path's 8-way ds_read sequence was choking the LDS pipeline.
+
+**Fix:** drop the b128 cliff from `mmq_x >= 64` to `mmq_x >= 32` in
+`x_stride_for<>()` and the `vec_dot_dp4a_streaming` `if constexpr` —
+both must move together (b128 reads need stride=40 for 16-byte
+alignment; stride=33 only supports b32). This activates b128 (=
+2 ds_read_b128 per inner ALU iter) for mmq_x ∈ {32, 40, 48, 56, 64}.
+
+**Microbench (M=3584, K=4096, MMQ vs wave64_dp4a):**
+
+| Batch | mmq_x | Before µs | After µs | Speedup before | Speedup after |
+|---:|---:|---:|---:|---:|---:|
+| 32 | 32 | 381 | **316** | 0.96× ❌ | **1.15× ✓** |
+| 40 | 40 | 415 | **348** | 1.13× | **1.35×** |
+| 48 | 48 | 466 | **391** | 1.26× | **1.51×** |
+| 56 | 56 | 542 | **433** | 1.21× | **1.51×** |
+| 64+ | 64 | 475-485 | 475-485 | (already b128, unchanged) | unchanged |
+
+**16-20 % per-call improvement at mmq_x ∈ {32, 40, 48, 56}**,
+flipping B=32 from regression to a 1.15× win.
+
+End-to-end mq6 9B pp128 unchanged at 561.1 tok/s — pp128 always picks
+mmq_x=64, which was already on b128. The fix is forward-looking: B=32
+spec-decode verify shapes now route to MMQ instead of falling back.
+
+`hfq6_mmq_winning_size` updated: B≥32 now routes (was B≥40);
+B=24 stays on wave64_dp4a (b32 path still marginal there at 1.08×).
+
+Correctness: 14/14 PASS in test_hfq6_mmq.rs (all mmq_x ∈ {8..64}).
+27B mq6 pp128: 192.6 tok/s (vs 192.8 pre-fix, within noise).
+
 ### 27B mq6 validation (was deferred in pre-S1 item 8)
 
 After Phase B.2 shipped, we discovered `qwen3.6-27b.mq6` is already on

@@ -49,9 +49,16 @@
 
 // Reuse HFQ4's stride choices. HFQ4 PMC validated per
 // docs/perf-checkpoints/2026-05-05-gfx906-mmq-redesign-final.md §5.
-// HFQ6 may need re-tuning in S2 if PMC sweep finds a different cliff.
+// HFQ6 PMC sweep (Phase B.2 follow-up, 2026-05-08) found b32 path
+// underperforms at mmq_x=32 (MemUnitBusy 13.8% vs 28.8% at mmq_x=16)
+// — LDS issue-rate starvation. Lowering the b128 cliff to mmq_x>=32
+// activates b128 (= 2 ds_read_b128 per inner ALU iter vs 8 ds_read_b32)
+// for mmq_x ∈ {32, 40, 48, 56, 64}. mmq_x=16/24 stay on b32 because
+// the unpack overhead at small mmq_x exceeds the issue-rate win
+// (HFQ4 cliff at 64 was empirically tuned for that family; HFQ6's
+// heavier unpack benefits from b128 sooner).
 template <int mmq_x>
-constexpr int x_stride_for() { return mmq_x >= 64 ? 40 : 33; }
+constexpr int x_stride_for() { return mmq_x >= 32 ? 40 : 33; }
 
 #define Y_STRIDE 36
 
@@ -218,7 +225,9 @@ static __device__ __forceinline__ void vec_dot_dp4a_streaming(
             const int i = i0 + threadIdx.x;
 
             int sumi = 0;
-            if constexpr (mmq_x >= 64) {
+            // HFQ6 b128 cliff at mmq_x>=32 (lowered from HFQ4's >=64 per
+            // PMC sweep — see x_stride_for<>() comment above).
+            if constexpr (mmq_x >= 32) {
                 // b128 path: issue 8 ints per operand as 2× int4 (b128) reads.
                 const int4 x_v0 = *(const int4*)&x_qs[i * x_stride + kx_start + 0];
                 const int4 x_v1 = *(const int4*)&x_qs[i * x_stride + kx_start + 4];
