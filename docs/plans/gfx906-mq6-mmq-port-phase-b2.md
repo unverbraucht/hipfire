@@ -26,7 +26,25 @@
   - DFlash mq6 has no baseline ever — gate dropped, coherence prefill is proxy
   - `should_use_mmq` threshold confirmed at B≥8 for gfx906
   - Plan §4 S5 + §6 GO/NO-GO updated to reflect dropped DFlash gate.
-- **v2.3 (this rev, 2026-05-08)** — S4 + S5 polish:
+- **v2.4 (this rev, 2026-05-08)** — post-Phase-B follow-ups (master plan v3.2.7):
+  - **b128 cliff lowered to mmq_x>=32** (commit `3ac7a3d`). PMC found
+    B=32 was LDS-issue-rate-starved on the b32 path (MemUnitBusy 13.8 %);
+    activating b128 for mmq_x ∈ {32, 40, 48, 56, 64} flipped B=32 from
+    0.96× regression to 1.15× win and improved B=40-56 by 16-20 %.
+    `hfq6_mmq_winning_size` updated B≥40 → B≥32.
+  - **Capture-mode gate lifted on all 4 HFQ6 MMQ branches** (commit
+    `fa8785b`). Unlocked DFlash mq6 spec-decode: 4.74 → 15.05 tok/s
+    decode at 27B (3.18×). MMQ is capture-safe after warmup populates
+    `ensure_q8_1_mmq_x` scratch + JIT cache. New helper
+    `hfq6_mmq_route(capture_mode, batch_size)` routes B≥8 under capture
+    (MMQ vs fp16 — always wins) and B=16 or B≥32 outside capture (MMQ
+    vs dp4a — needs winning_size).
+  - **Plan v3.2.4 follow-up cleanup** (commit `8528923`):
+    `audit-dispatch-coverage.sh` already shipped (item 13);
+    `debug_assert!(gemv_dp4a_enabled)` added on all 11 dp4a Rust fns
+    (item 6); 17 pre-existing `bind_thread` audit violations cleared
+    (305/305 pub fns now clean).
+- **v2.3 (commit `bcce686`, 2026-05-08)** — S4 + S5 polish:
   - S4: `gemm_hfq6g256_batched_lmhead` rewired to MMQ set-semantics
     (no memset). pp128 within 0.04 % of S3 (561.4 vs 561.2).
   - S5: `HIPFIRE_HFQ6_MMQ=0` kill-switch + `HIPFIRE_HFQ6_MMQ_DIAG_PASSTHROUGH=1`

@@ -467,14 +467,15 @@ v3.2.5 framed this as "stretch"; we hit it.
    benches** — same architecture family, on disk, no quantize step
    needed.
 
-**Items deferred to future errata (still open):**
+**Items deferred to future errata (status as of v3.2.6 write-time):**
 
 - Per-mmq_x stride PMC tuning (S2.4 secondary): non-monotonic perf at
   B=24/32 not yet diagnosed; B=16 and B≥40 work fine but the
   intermediate batches fall through to wave64_dp4a. Probably worth
-  ~½ session of investigation.
+  ~½ session of investigation. [**Closed in v3.2.7** — b128 cliff at
+  mmq_x>=32, B=32 now wins 1.15× and B=40-56 improved 16-20 %.]
 - MoE-indexed HFQ6 MMQ (plan v3.2.4 item 4): no MoE mq6 model on
-  disk, defer until one ships.
+  disk, defer until one ships. [**Still open.**]
 - `audit-dispatch-coverage.sh` (plan v3.2.4 item 13): **closed** — script
   shipped in repo at `scripts/audit-dispatch-coverage.sh`, runs the
   per-quant DType matcher coverage audit (the silent-corruption gate
@@ -483,10 +484,14 @@ v3.2.5 framed this as "stretch"; we hit it.
   several) which are out-of-scope for Phase B.2 but worth fixing in
   a separate cleanup PR.
 - Phase A defensive `assert!(gemv_dp4a_enabled(arch))` on dp4a Rust
-  fns (plan v3.2.4 item 6): still pending.
+  fns (plan v3.2.4 item 6): still pending. [**Closed in v3.2.7**
+  — `debug_assert!` added at top of all 11 dp4a Rust fns.]
 - DFlash spec-verify mq6 baseline: project has no DFlash + mq6
   workflow today; B.2 used the coherence-harness mq6 reasoning prompt
-  as a proxy and confirmed no decode regression.
+  as a proxy and confirmed no decode regression. [**Established in
+  v3.2.7** — qwen3.6-27b.mq6 + qwen36-27b-dflash-mq4 baseline at
+  τ=5.18, decode 4.74 → 15.05 tok/s (3.18×) after capture-mode gate
+  lift.]
 
 **Items closed by Phase B:**
 
@@ -520,6 +525,120 @@ B.2 commits `8755a35` + `1acef95` + `bcce686` + `9705856`.
 - Cumulative dev-log: `docs/perf-checkpoints/2026-05-07-phase-a-cumulative-mq6.md`
 - Path 1 ceiling: `2bee6e6` + `ff9e210`
 - Path 2 (S1+S2+S3+S4+S5+27B): `8755a35`, `1acef95`, `bcce686`, `9705856`
+
+### v3.2.7 errata (2026-05-08): Phase B.2 polish — DFlash unlock + cleanup
+
+Three follow-up items shipped post-v3.2.6 close-out:
+
+**1. b128 cliff lowered to mmq_x≥32** (commit `3ac7a3d`).
+
+S2's perf sweep had B=32 at 0.96× (regression vs wave64_dp4a). PMC
+diagnosis: at mmq_x=32, the b32 LDS path issues 8 ds_read_b32 per
+inner ALU iter, choking the LDS pipeline (MemUnitBusy collapsed to
+13.8 %, kernel idle not stalled). HFQ4's b128 cliff at `mmq_x >= 64`
+was wrong for HFQ6's heavier unpack — lowered to `mmq_x >= 32` in
+both `body.cuh::x_stride_for<>()` and the `vec_dot_dp4a_streaming`
+`if constexpr`. Stride must follow (b128 reads need stride=40 for
+16-byte alignment).
+
+| Batch | mmq_x | Before | After | Speedup before | After |
+|---|---|---:|---:|---:|---:|
+| 32 | 32 | 381 µs | 316 µs | 0.96× ❌ | **1.15× ✓** |
+| 40 | 40 | 415 | 348 | 1.13× | **1.35×** |
+| 48 | 48 | 466 | 391 | 1.26× | **1.51×** |
+| 56 | 56 | 542 | 433 | 1.21× | **1.51×** |
+| 64+ | 64 | (already b128) | unchanged | | |
+
+`hfq6_mmq_winning_size` updated: B≥32 routes (was B≥40). End-to-end
+9B pp128 unchanged at 561 tok/s — pp128 always picks mmq_x=64 which
+was already on b128. Forward-looking for spec-decode and other
+small-batch shapes.
+
+**2. capture_mode gate lifted for HFQ6 MMQ** (commit `fa8785b`) —
+unlocked DFlash mq6.
+
+Initial DFlash mq6 bench (post-Phase-B baseline) showed only 4.74
+tok/s decode — investigation revealed 90 % of DFlash time was in
+`gemm_*_hfq6g256_fp16` fallback kernels, not MMQ. Root cause: the
+4 HFQ6 MMQ branches had `&& !self.capture_mode` guards (leftover
+from Phase A's wave64_dp4a hipMemset-during-capture bug). MMQ is
+actually capture-safe after the warmup pass populates
+`ensure_q8_1_mmq_x`'s scratch buffer + JIT cache.
+
+| State                       | DFlash mq6 27B decode | τ      | accept |
+|---|---:|---:|---:|
+| Pre-fix (MMQ capture-gated) | 4.74 tok/s            | 5.182  | 0.345  |
+| Post-fix (MMQ allowed)      | **15.05 tok/s**        | 5.182  | 0.345  |
+| Speedup                     | **3.18×**              | (same) | (same) |
+
+τ and accept_rate unchanged → bit-identical output, bit-identical
+acceptance pattern. Pure speedup, no quality drift.
+
+Added capture-aware routing helper `hfq6_mmq_route(capture_mode,
+batch_size)`:
+- `capture_mode=true`: route MMQ at any B≥8 (vs fp16 fallback, MMQ
+  always wins; the wins-vs-dp4a heuristic is irrelevant under
+  capture — dp4a is gated off by its own memset_async-during-capture
+  bug).
+- `capture_mode=false`: use original `hfq6_mmq_winning_size` (B=16
+  or B≥32 post-b128-cliff fix) — required to win specifically vs
+  dp4a, which IS available outside capture.
+
+This separation prevents the B=8 microbench regression vs dp4a from
+being pessimized by capture-mode-only DFlash workloads.
+
+**3. v3.2.4 follow-up cleanup** (commit `8528923`).
+
+- `audit-dispatch-coverage.sh` (item 13): already shipped — surfaces
+  14 pre-existing MQ-family matcher coverage gaps in qwen35.rs as a
+  separate cleanup target.
+- Defensive `debug_assert!(gemv_dp4a_enabled(&self.arch))` on all 11
+  dp4a Rust fns (item 6). Catches future caller mistakes loud in
+  debug; release pays nothing.
+- 17 pre-existing `bind_thread` audit violations cleared. 14 fns get
+  `// bind_thread: skip — delegated via ensure_q8_1_mmq_x` markers
+  (they call into `ensure_q8_1_mmq_x` first which bind_threads); 3
+  fns get real `self.bind_thread()?;` (moe_topk + the new HFQ6 MMQ
+  dispatchers I introduced in B.2). `verify-bind-thread.sh` now
+  reports OK on 305/305 pub fns.
+
+Bonus inside the cleanup commit: `gemm_hfq6g256_residual_mmq_gfx906`'s
+internal size-routing was stuck at the pre-v3.2.7 staircase (B≥40
+only). Updated to include B=32 per the b128-cliff fix. Added a
+`debug_assert!(!self.capture_mode)` on the wave64_dp4a fall-through
+path to defensively catch capture-mode misuse.
+
+**Final state — what's left for HFQ6 on gfx906:**
+
+| Item | Status |
+|---|---|
+| Phase A: decode (Wave64 + ILP-prefetch + dp4a fused) | ✓ shipped |
+| Phase B.1: BT propagation (BT=8→16) | ✓ shipped |
+| Phase B.2: MMQ-streaming port | ✓ shipped |
+| b128 cliff at mmq_x>=32 | ✓ shipped (v3.2.7) |
+| capture_mode lift for DFlash | ✓ shipped (v3.2.7) |
+| profile.rs HFQ6 byte counts | ✓ shipped (v3.2.4 item 5) |
+| audit-dispatch-coverage.sh | ✓ shipped (v3.2.4 item 13) |
+| Defensive asserts on dp4a fns | ✓ shipped (v3.2.4 item 6) |
+| bind_thread audit clean | ✓ shipped (v3.2.7) |
+| MoE-indexed HFQ6 MMQ | ⚠️ deferred (no MoE mq6 model exists) |
+| 27B Qwen3.5 (vs 3.6) regression | ⚠️ deferred (used 3.6 as proxy) |
+| B=24 b32-path marginal optimization | ⚠️ low-value micro-optimization |
+
+**Final mq6 9B pp128 prefill: 562 tok/s.** vs mq4 9B pp128 = 599
+tok/s (same git ref). mq6/mq4 ratio = **0.939 — within 6 % of mq4
+parity.** Bandwidth-bound floor exceeded by 38 %. Phase B done.
+
+**Final 27B mq6 prefill: 192 tok/s.** Phase B unlock = 3.52× over
+the wave64_dp4a baseline (54.8 → 192). Bigger speedup than 9B
+because larger M means more MMQ_Y=128 row tiles utilized.
+
+**Final DFlash mq6 27B decode: 15.0 tok/s.** v3.2.7 capture-mode
+fix = 3.18× over the pre-fix baseline (4.74 → 15.05).
+
+**References:**
+- v3.2.7 commits: `3ac7a3d`, `fa8785b`, `8528923`
+- Dev-log: `docs/perf-checkpoints/2026-05-07-phase-a-cumulative-mq6.md`
 
 ### Calibrated decode-lift expectations (gfx906, post-v3.2.2)
 
@@ -566,15 +685,19 @@ separately. v1 conflated them in a single "fused" column.
 | **HFQ6** | ✓ (base / fp16 / dot2 / wmma / wmma_gfx12 / wave64+dp4a / **MMQ-streaming**) | ✓ (Phase A) | ✓ MMQ (Phase B.2) | ✗ (deferred — no MoE mq6 model) |
 | **HFQ8** | ✗ | ✗ | ✗ | ✗ |
 
-**Bottom line (updated post-Phase-B, v3.2.6):**
+**Bottom line (updated post-Phase-B + polish, v3.2.7):**
 
-- **HFQ6 has near-parity coverage on gfx906** post-Phase-B.
-  9B mq6 prefill at 561 tok/s = 0.94× of mq4's 599; 27B at 192 tok/s
-  = 3.52× over the wave64_dp4a baseline. Phase A (decode) + Phase B.1
-  (BT tuning) + Phase B.2 (MMQ-streaming port) closed the original
-  3.15× gap to 1.07×. Remaining gap is the bandwidth-byte-overhead
-  floor (HFQ6 has 1.47× more weight bytes per output than HFQ4) —
-  fundamentally limited by memory bandwidth, not kernel design.
+- **HFQ6 has near-parity coverage on gfx906** post-Phase-B + v3.2.7
+  polish. 9B mq6 prefill at 562 tok/s = 0.94× of mq4's 599; 27B at
+  192 tok/s = 3.52× over the wave64_dp4a baseline. Phase A (decode)
+  + Phase B.1 (BT tuning) + Phase B.2 (MMQ-streaming port) closed
+  the original 3.15× gap to 1.07×. Remaining gap is the
+  bandwidth-byte-overhead floor (HFQ6 has 1.47× more weight bytes
+  per output than HFQ4) — fundamentally limited by memory
+  bandwidth, not kernel design.
+- **DFlash mq6 spec-decode unlocked at 27B** (v3.2.7 capture-mode
+  fix). 27B mq6 + qwen36-27b-dflash-mq4 draft = 15.0 tok/s decode,
+  τ=5.18, accept=0.345. 3.18× over the pre-fix baseline.
 - **HFQ8 runs end-to-end at B=1 today on gfx906** via
   `gemv_hfq8g256` + `attention_hfq8_kv` + `kv_cache_write_hfq8`.
   The gap is throughput at B>1 (no batched GEMM at all) and the
@@ -591,9 +714,11 @@ separately. v1 conflated them in a single "fused" column.
 
 | Lever | HFQ4 | HFQ6 | HFQ8 | Why |
 |---|:---:|:---:|:---:|---|
-| wave64 topology (~3 % decode, foundation only) | ✓ shipped | ✓ residual shipped 2026-05-06 (`466f1a6`) | applicable | mechanical port; no quant dependence; **single-lever lift modest per v3.2.2 errata** |
-| ILP-prefetch in residual GEMV | ✓ shipped | applicable | applicable | mechanical port; per-thread byte count differs (HFQ6=6, HFQ8=8) but pattern transfers |
-| dp4a (int8×int8 via `__builtin_amdgcn_sudot4`) | ✓ shipped | applicable (int8 unpack from 6-bit) | **shipped as MQ8**, see §3.2 | gfx906 has the instruction; works for any int8-dequantizable weight |
+| wave64 topology (~3 % decode, foundation only) | ✓ shipped | ✓ shipped (Phase A.1a, `466f1a6`) | applicable | mechanical port; no quant dependence; **single-lever lift modest per v3.2.2 errata** |
+| ILP-prefetch in residual GEMV | ✓ shipped | ✓ shipped (Phase A.1b) | applicable | mechanical port; per-thread byte count differs (HFQ6=6, HFQ8=8) but pattern transfers |
+| dp4a (int8×int8 via `__builtin_amdgcn_sdot4`) | ✓ shipped | ✓ shipped (Phase A.1c+A.2+A.3) | **shipped as MQ8**, see §3.2 | gfx906 has the instruction; works for any int8-dequantizable weight |
+| MMQ-streaming (Window Streaming dp4a) | ✓ shipped (PR #158) | ✓ shipped (Phase B.2 + v3.2.7 b128 cliff) | applicable | small-tile dp4a-MMQ; biggest single-lever win for prefill (Phase B.2 = 2.94×–3.52×) |
+| Capture-mode-safe MMQ for DFlash | ✓ via HFQ4 path | ✓ shipped (v3.2.7 `fa8785b`) | applicable | DFlash spec-decode unlock; 3.18× decode at 27B mq6 |
 | dot8 (`v_dot8_i32_i4`, int4×int4) | ✓ HFQ4 native | **NO — would require lossy 6→4 repack** | **NO — would require lossy 8→4 repack** | hardware is int4×int4 only, no mixed-precision; see §2.4 |
 | MFMA / WMMA (CDNA2+ / RDNA3+) | n/a on gfx906 | n/a on gfx906 | n/a on gfx906 | hardware not available |
 
@@ -609,14 +734,14 @@ separate per-layer kernel, not part of the GEMV/GEMM inner loop.
 
 | Surface | MQ6 | MQ8 | Notes |
 |---|---:|---:|---|
-| wave64 GEMV (AR decode B=1) | ~½ session | ~¼ session | MQ8 dword-aligned and trivially ports; MQ6 needs split-load handling |
-| wave64 residual GEMV + ILP-prefetch | ~½ session | ~½ session | mechanical mirror of HFQ4 work |
-| Single-token fused GEMVs (gate_up / qkv / qkvza) | ~1 session | ~1 session | new GEMV-level surface for both quants |
-| Wave64 batched GEMM (LM-head + per-layer residual, dp4a) | ~1 session | ~½ session | MQ6 needs both `_wave64` and `_residual_wave64` (per-layer residual fires at 6 call sites — see §5.8); MMQ Phase C separate. MQ8 covered by direct register-tile dp4a IF wiring exists (see v3.2 errata). |
-| MoE-indexed kernels (5 files per quant) | ~1 session | ~½ session | A3B / MoE workload coverage |
-| **AR-only complete coverage** | **~3.5 sessions** (revised v3.2.1 +½ for residual_wave64) | **~2.5 sessions** | MQ8 lighter only counts kernels, not the 14 missing dispatch sites — see v3.2 errata for the expanded MQ8 estimate (~5–6 sessions). |
-| dp4a port for fused GEMVs (MQ6 only — MQ8 is dp4a from day one) | ~1 session | n/a | PMC-gated before commit |
-| MMQ-equivalent dp4a path (DFlash verify) | **5 sessions** | **not needed** (Phase A item 4 covers it) | MQ6 needs full MMQ port; MQ8 batched is structurally simpler |
+| wave64 GEMV (AR decode B=1) | ✓ shipped (Phase A.1a) | ~¼ session | MQ8 dword-aligned and trivially ports; MQ6 needs split-load handling |
+| wave64 residual GEMV + ILP-prefetch | ✓ shipped (Phase A.1b) | ~½ session | mechanical mirror of HFQ4 work |
+| Single-token fused GEMVs (gate_up / qkv / qkvza) | ✓ shipped (Phase A.1c) | ~1 session | new GEMV-level surface for both quants |
+| Wave64 batched GEMM (LM-head + per-layer residual, dp4a) | ✓ shipped (Phase A.2-A.4) | ~½ session | MQ6 done; MQ8 covered by direct register-tile dp4a IF wiring exists (see v3.2 errata). |
+| MoE-indexed kernels (5 files per quant) | ⚠️ deferred (no MoE mq6 model on disk) | ~½ session | A3B / MoE workload coverage |
+| **AR-only complete coverage** | **✓ shipped (cumulative ~3 sessions for Phase A)** | **~2.5 sessions** | MQ8 lighter only counts kernels, not the 14 missing dispatch sites — see v3.2 errata for the expanded MQ8 estimate (~5–6 sessions). |
+| dp4a port for fused GEMVs (MQ6 only — MQ8 is dp4a from day one) | ✓ shipped (Phase A.1c) | n/a | PMC-gated before commit |
+| MMQ-equivalent dp4a path (DFlash verify) | **✓ shipped (Phase B.2 + v3.2.7 — 5 sessions actual, matched v2.3 budget)** | **not needed** (Phase A item 4 covers it) | MQ6 done; MQ8 batched is structurally simpler |
 
 **v2 caveat: every lift estimate above is gated on baseline measurement
 (Priority 0).** v1's `+30-50% AR decode` claim was unbacked by gfx906
