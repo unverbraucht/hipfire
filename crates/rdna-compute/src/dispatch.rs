@@ -72,6 +72,29 @@ fn hfq6_mmq_winning_size(batch_size: usize) -> bool {
     batch_size == 16 || batch_size >= 32
 }
 
+/// Phase B.2 follow-up — capture-mode-aware routing.
+///
+/// When capture_mode is true, the wave64_dp4a fallback is gated off
+/// (its hipMemset_async-during-capture is unsafe), so MMQ's only
+/// alternative is the fp16 scalar path. MMQ beats fp16 at every
+/// batch size we've measured — so under capture, route MMQ for any
+/// `should_use_mmq`-eligible batch (B≥8 on gfx906).
+///
+/// Outside capture, fall back to `hfq6_mmq_winning_size` which
+/// requires MMQ to win specifically vs dp4a (B=16 or B≥32 — B=8
+/// regresses 17 % vs dp4a, B=24 marginal at +8 %, others win).
+///
+/// Env override: `HIPFIRE_HFQ6_MMQ=0` disables MMQ routing globally.
+fn hfq6_mmq_route(capture_mode: bool, batch_size: usize) -> bool {
+    if std::env::var("HIPFIRE_HFQ6_MMQ").ok().as_deref() == Some("0") {
+        return false;
+    }
+    if capture_mode {
+        return batch_size >= 8;
+    }
+    hfq6_mmq_winning_size(batch_size)
+}
+
 pub fn gemv_dp4a_enabled(arch: &str) -> bool {
     static CACHE: OnceLock<Option<bool>> = OnceLock::new();
     let override_ = *CACHE.get_or_init(|| {
@@ -8419,11 +8442,11 @@ impl Gpu {
         // is set-semantics (overwrite Y, no residual fuse), so we use
         // gemm_hfq6g256_mmq_set_gfx906 — no memset needed since _full_set
         // writes Y[...] = sum (overwrite), unlike the dp4a kernel which
-        // uses += and requires a zero-init Y. Routes only at confirmed-
-        // winning batch sizes per S2 sweep.
-        if batch_size > 1 && gemv_dp4a_enabled(&self.arch) && !self.capture_mode
+        // uses += and requires a zero-init Y. Routes at confirmed-winning
+        // batch sizes per S2 sweep. Capture-safe after warmup.
+        if batch_size > 1 && gemv_dp4a_enabled(&self.arch)
             && should_use_mmq(&self.arch, batch_size)
-            && hfq6_mmq_winning_size(batch_size)
+            && hfq6_mmq_route(self.capture_mode, batch_size)
         {
             let safe = if self.mmq_screen {
                 self.mmq_screen_weight_hfq6(a_raw, m, k)
@@ -8599,9 +8622,15 @@ impl Gpu {
             // gfx906: MMQ-streaming first (Phase B.2 §5.1 item 6). Only
             // routes here when MMQ wins per S2 sweep (see hfq6_mmq_winning_size).
             // The mmq_screen check guards against pathological quant groups (#87).
-            if gemv_dp4a_enabled(&self.arch) && !self.capture_mode
+            //
+            // Capture-safe: ensure_q8_1_mmq_x's hipMalloc and ensure_kernel
+            // both fire on first use only and cache thereafter. As long as
+            // the warmup pass (which precedes capture) hits this code path,
+            // capture sees only the kernel launches (capture-safe via
+            // launch_maybe_blob's blob path). Phase B.2 follow-up (2026-05-08).
+            if gemv_dp4a_enabled(&self.arch)
                 && should_use_mmq(&self.arch, batch_size)
-                && hfq6_mmq_winning_size(batch_size)
+                && hfq6_mmq_route(self.capture_mode, batch_size)
             {
                 let safe = if self.mmq_screen {
                     self.mmq_screen_weight_hfq6(a_raw, m, k)
@@ -8799,11 +8828,13 @@ impl Gpu {
             // fall through to fused wave64_dp4a for beta+alpha (their M is
             // small — MMQ_Y=128 wastes 75 % of row-tiles at small M).
             //
-            // Only routes here when MMQ wins per S2 sweep: B=16 or B≥40.
-            // (Reusing should_use_mmq + mmq_x_winning_for_hfq6 helper below.)
-            if gemv_dp4a_enabled(&self.arch) && !self.capture_mode
+            // Only routes here when MMQ wins per S2 sweep: B=16 or B≥32.
+            // Capture-safe: ensure_q8_1_mmq_x's malloc + ensure_kernel cache
+            // after first use (warmup pass populates them); mmq_screen has
+            // a cache short-circuit at first line. Phase B.2 follow-up.
+            if gemv_dp4a_enabled(&self.arch)
                 && should_use_mmq(&self.arch, batch_size)
-                && hfq6_mmq_winning_size(batch_size)
+                && hfq6_mmq_route(self.capture_mode, batch_size)
             {
                 let qz_safe = if self.mmq_screen {
                     self.mmq_screen_weight_hfq6(a_qkv, qkv_m, k)
@@ -9315,11 +9346,12 @@ impl Gpu {
                 return self.gemm_qkv_hfq6g256_wmma(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
             }
             // gfx906 MMQ-streaming (Phase B.2). 3 _mmq_set calls into y_q,
-            // y_k, y_v. Mirrors HFQ4 dispatch.rs:3854-3873. Routes only at
-            // S2-confirmed winning batch sizes (B=16 or B≥40).
-            if gemv_dp4a_enabled(&self.arch) && !self.capture_mode
+            // y_k, y_v. Mirrors HFQ4 dispatch.rs:3854-3873. Routes at
+            // confirmed winning batch sizes (B=16 or B≥32). Capture-safe
+            // after warmup pass populates the kernel + scratch caches.
+            if gemv_dp4a_enabled(&self.arch)
                 && should_use_mmq(&self.arch, batch_size)
-                && hfq6_mmq_winning_size(batch_size)
+                && hfq6_mmq_route(self.capture_mode, batch_size)
             {
                 let qkv_safe = if self.mmq_screen {
                     self.mmq_screen_weight_hfq6(a_q, q_m, k)
@@ -9781,11 +9813,12 @@ impl Gpu {
                 return self.gemm_gate_up_hfq6g256_wmma(a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size);
             }
             // gfx906 MMQ-streaming (Phase B.2). 2 _mmq_set calls into
-            // y_gate, y_up. Mirrors HFQ4 dispatch.rs:4238-4252. Routes only
-            // at S2-confirmed winning batch sizes (B=16 or B≥40).
-            if gemv_dp4a_enabled(&self.arch) && !self.capture_mode
+            // y_gate, y_up. Mirrors HFQ4 dispatch.rs:4238-4252. Routes at
+            // confirmed winning batch sizes (B=16 or B≥32). Capture-safe
+            // after warmup pass populates the kernel + scratch caches.
+            if gemv_dp4a_enabled(&self.arch)
                 && should_use_mmq(&self.arch, batch_size)
-                && hfq6_mmq_winning_size(batch_size)
+                && hfq6_mmq_route(self.capture_mode, batch_size)
             {
                 let safe = if self.mmq_screen {
                     self.mmq_screen_weight_hfq6(a_gate, gate_m, k)
