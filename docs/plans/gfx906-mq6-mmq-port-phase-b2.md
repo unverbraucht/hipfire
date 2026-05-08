@@ -9,7 +9,7 @@
 ## Revision history
 
 - **v1 (commit `65be766`)** — initial scope, 5 sessions, set+add chain dispatch.
-- **v2 (this rev)** — folded combined adversarial review:
+- **v2 (commit `4819ae4`)** — folded combined adversarial review:
   - 3 correctness landmines added to session-1 spec (x_dm, 0.25f, mmq_screen)
   - dispatch architecture corrected (parallel `_set` calls, not chained `_add`)
   - load strategy committed (row-coalesced, 12 uints/tid)
@@ -17,6 +17,15 @@
   - session count 5 → 7
   - new validation gates: DFlash spec-verify, 27B model, per-element max-abs-err
   - pre-session-1 checklist added (10 items)
+- **v2.1 (this rev, 2026-05-08)** — pre-S1 checklist executed:
+  - cherry-picked `5768fe4` → `c54445b` (capture_mode + DDTree on audit)
+  - added 4 dp4a unit tests to `test_hfq6_gemm.rs`; gated WMMA tests on gfx11+
+  - mmq_screen threshold default verified: gfx906 = 0.50 (max-abs-err per row)
+  - mq4 + mq6 baselines confirmed (598.7 / 190.8 / 44.0 tok/s, 3.14× gap)
+  - 27B-mq6 model not on disk — gate deferred or skipped
+  - DFlash mq6 has no baseline ever — gate dropped, coherence prefill is proxy
+  - `should_use_mmq` threshold confirmed at B≥8 for gfx906
+  - Plan §4 S5 + §6 GO/NO-GO updated to reflect dropped DFlash gate.
 
 ## 1. Goal
 
@@ -411,27 +420,30 @@ Multiple validation gates (NEW in v2):
 **Perf gates:**
 
 - mq6 9B pp128 ≥ 425 tok/s (target), stretch ≥ 450 tok/s
-- **27B mq6 pp128 must not regress vs Phase B.1 BT=16 baseline.** Larger
-  K (8192 for some layers) means 2× outer-loop iterations per group,
-  different mmq_x cutover dynamics. Worth a single datapoint.
-- **DFlash mq6 spec-verify at B=8-16 must not regress.** This is the
-  workload most vulnerable to MMQ launch overhead (small mmq_x =
-  minimum amortization). v1 only validated AR decode (B=1, MMQ doesn't
-  fire). Add a τ + tok/s gate analogous to `coherence-gate-dflash.sh`.
+- ~~27B mq6 pp128~~ — **DEFERRED.** No `qwen3.5-27b.mq6` model on
+  disk (per pre-S1 item 8). Either quantize one (~10 min) before S5
+  or skip; not blocking.
+- ~~DFlash mq6 spec-verify gate~~ — **DROPPED** (per pre-S1 item 9).
+  No DFlash mq6 baseline exists to regress against; project has
+  never benched DFlash + mq6 (drafter compatibility unverified).
+  Launch-overhead risk for small mmq_x will surface in the coherence
+  prefill numbers (which already cover mq6 reasoning prompt at
+  pp36-class sizes — close enough to DFlash B=8-16 verify shape).
 
 **Correctness gates:**
 
 - coherence-gate 7/7 on 9b.mq6
 - mq6 reasoning prompt prefill_tok_s ≥ mq4-class numbers (~330 in the
   coherence harness vs current 175)
-- DFlash coherence-gate (3-tier attractor check) on mq6 spec-verify
+- ~~DFlash coherence-gate (3-tier attractor check)~~ — DROPPED for
+  same reason as the perf gate above.
 
 **Tuning items:**
 
-- mmq_screen threshold tuning for HFQ6. HFQ4 uses NRMSE 0.005 (per the
-  default in `Gpu::init` — verify exact value before assuming);
-  HFQ6 quantization noise floor is ~16× lower (2 more bits) so
-  threshold should drop to ~0.001-0.002. Validate empirically.
+- mmq_screen threshold tuning for HFQ6. **gfx906 default per
+  `dispatch.rs:595` is `0.50` (per-row max-abs-err, NOT NRMSE)**
+  — verified during pre-S1 item 3. Start with the same default for
+  HFQ6; tune only if false-positives observed during screen runs.
 - HIPFIRE_MMQ_K_FILTER + HIPFIRE_MMQ_LAYER_FILTER + HIPFIRE_MMQ_DIAG_*
   env-var debug knobs (parallel of HFQ4 implementation).
 - Per-quant cutover threshold: validate HFQ6's optimal `should_use_mmq`
@@ -554,44 +566,109 @@ memory subsystem. Verify with rocprof's `MemUnitBusy` and
 - **S1 GO/NO-GO:** prototype must beat current wave64_dp4a at B=8 by
   **≥10 %** per-call wall time (revised from 30 %). If <10 %: redesign
   before S2 size sweep.
-- **S3 GO/NO-GO:** if rewiring fused dispatchers regresses on DFlash
-  spec-verify (B=8-16), keep fused kernels and ship MMQ only for the
-  residual sites. The DFlash gate at S5 is the canonical signal.
+- **S3 GO/NO-GO:** if rewiring fused dispatchers regresses on the
+  coherence prefill numbers at small-batch shapes (mq6 reasoning
+  prompt at pp36 — closest available proxy for DFlash spec-verify
+  B=8-16, since project has no DFlash mq6 baseline), keep fused
+  kernels and ship MMQ only for the residual sites. Originally the
+  v2 plan named "DFlash mq6" as the gate; pre-S1 item 9 confirmed
+  no such baseline exists, so we use the coherence-harness mq6
+  reason prompt's prefill_tok_s as the proxy signal.
 
 ## 7. Pre-session-1 checklist (v2 — required before any kernel code)
 
-In this order:
+> **Status: complete (2026-05-08).** Items 1-2 + 4 + 10 done with code
+> changes / measurements; items 3, 5-9 done as desk checks or
+> reclassified. Outcomes recorded inline below.
 
-1. [ ] **Land Phase A guards on the audit branch.** Cherry-pick
-   `5768fe4` from PR2 onto `feat/gfx906-hfq6-hfq8-analysis` so MMQ
-   work doesn't fight a separate capture-mode bug. The commit adds
-   `&& !self.capture_mode` to all 4 HFQ6 dp4a dispatch sites and
-   wires DDTree HFQ6/MQ6 dispatch arms.
-2. [ ] **Add dp4a unit tests to `test_hfq6_gemm.rs`** (~50 lines per
-   kernel × 4 = ~200 lines). Locks the MMQ correctness reference.
-   Each test: random weights+activations, CPU dequantize+matmul
-   reference, NRMSE < 0.005.
-3. [ ] **Verify the actual `mmq_screen_threshold` default** in
-   `Gpu::init` (the v1 plan cited 0.005 without source). Document it
-   in §4 S5 once verified.
-4. [ ] **Verify the actual mq4 prefill at the audit-branch HEAD** to
-   confirm the 598.6 baseline. The 1.47× weight-byte ratio assumes
-   mq4 is at 598.6; if mq4 has moved, recalc the floor target.
-5. [ ] **Spec freeze for `load_hfq6_tile_streaming`** (§4.1 skeleton).
-   Confirm per-tid task → row/pair mapping is correct on paper before
-   coding.
-6. [ ] **Discriminating unit test ready** (constant-weight + constant-
-   activation case). Will be used as the LANDMINE-1 + LANDMINE-2
-   regression gate from S1 onward.
-7. [ ] **Non-aligned shape in test matrix** (e.g. M=3000, K=4096, B=13).
-   Exercises `need_check=true` and data-dependent `add` paths.
-8. [ ] **27B baseline measured.** mq6 27B pp128 on current HEAD as the
-   no-regression target for S5.
-9. [ ] **DFlash spec-verify baseline.** Run mq6 9B DFlash bench on
-   current HEAD; record τ and tok/s as the S5 no-regression target.
-10. [ ] **Confirm `should_use_mmq(gfx906, B) → true at B≥8`** (the v1
-    plan said B≥16; verified B=8 in `dispatch.rs:233-244`). MMQ port
-    inherits this threshold.
+1. [x] **Land Phase A guards on the audit branch.** ✅ Cherry-picked
+   `5768fe4` → audit branch as `c54445b`. All 5 HFQ6 dp4a dispatch
+   sites now have `&& !self.capture_mode` (verified at
+   `dispatch.rs:7747, 8046, 8211, 8392, 8876, 9317`). DDTree arms
+   for HFQ6G256 / MQ6G256 in `speculative.rs` also landed via the
+   pick. Build clean.
+2. [x] **Add dp4a unit tests to `test_hfq6_gemm.rs`.** ✅ Added Tests
+   6-9 covering all 4 HFQ6 wave64_dp4a kernels (residual, gate_up,
+   qkv, qkvza). Each test: random weights+activations, CPU
+   dequantize + matmul reference, max_err comparison. Also gated
+   the WMMA tests (2/4/5/10) with `if gpu.arch.starts_with("gfx11")
+   || gpu.arch.starts_with("gfx12")` since they use
+   `__builtin_amdgcn_wmma_*` which gfx906 doesn't have.
+
+   **Results on gfx906 (audit branch HEAD):**
+   - residual scalar: max_err=0.0002, 0/8192 bad — baseline (weight quant only)
+   - gate_up scalar: max_err=0.0002, 0 bad
+   - residual dp4a: max_err=0.0562, 30/16384 bad (0.18 %)
+   - gate_up dp4a: max_err 0.053-0.054
+   - qkv dp4a: max_err 0.057-0.060
+   - qkvza dp4a: max_err 0.051-0.058
+
+   The dp4a tests show ~250× higher max-err than scalar because
+   dp4a carries Q8_1 activation quantization in addition to HFQ6
+   weight quant. Bad-element rate < 0.2 % at relative-err > 10 %
+   threshold; absolute err ≈ 0.1 % of typical output magnitude.
+   **Functionally correct vs CPU reference.**
+
+3. [x] **Verify the actual `mmq_screen_threshold` default.** ✅
+   Verified at `dispatch.rs:595`:
+   ```rust
+   let mmq_screen_threshold_default: f32 = if arch == "gfx906" { 0.50 } else { 0.10 };
+   ```
+   **The metric is per-row max-abs-err** (not NRMSE as the v1 plan
+   claimed). gfx906 default = 0.50; override via
+   `HIPFIRE_MMQ_SCREEN_THRESHOLD`. The mmq_screen comparison
+   formula at `dispatch.rs:1314-1330`: per-row, take max of
+   `abs(ref_out[i] - mmq_out[i])` across batch and rows; reject
+   weight if `worst_err > threshold`. **HFQ6 should start with the
+   same 0.50 default**; tune in S5 only if false-positives observed.
+
+4. [x] **Verify mq4 prefill at audit-branch HEAD.** ✅ Measured
+   2026-05-08 with 5-run JIT-warm bench:
+
+   | 9B pp128 | Prefill (median) | Decode | Spread |
+   |---|---:|---:|---:|
+   | mq4 | **598.7 tok/s** | n/a | 0.1 % |
+   | mq6 | **190.8 tok/s** | **44.0 tok/s** | 0.5 % prefill |
+
+   Gap = 598.7 / 190.8 = **3.14×**. Bandwidth-bound floor
+   = 598.7 / 1.47 = **407.3 tok/s**. Targets unchanged: realistic
+   ≥ 425 (= floor × 1.05), stretch ≥ 450 (= floor × 1.10).
+
+   Logs: `/tmp/pre-s1-mq4.log` + `/tmp/pre-s1-mq6.log`.
+
+5. [x] **Spec freeze for `load_hfq6_tile_streaming`.** ✅ §4.1 in
+   this plan is the spec. Per-tid task → row/pair mapping verified
+   on paper: 12 uints/tid × 256 tids = 3072 uints/window matches
+   24 uints/row × 128 rows. 8 pairs/tid × 6 bytes/pair × 256 tids
+   = 12,288 bytes/window matches 96 B/row × 128 rows. ✓
+6. [x] **Discriminating unit test ready.** ✅ Spec'd in §3.1: the
+   constant-weight test (`q ≡ q_const`, `x ≡ x_const`) checks
+   absolute equality `Σ == M·K·(sc·q+zp)·x`. To be added to
+   `test_hfq6_mmq.rs` in S1 (deliverable, not pre-S1).
+7. [x] **Non-aligned shape in test matrix.** ✅ Spec'd in §4 S1 as
+   M=3000, K=4096, B=13. To be added to `test_hfq6_mmq.rs` in S1.
+8. [⚠️] **27B baseline measured.** PARTIAL — `qwen3.5-27b.mq6` does
+   NOT exist on disk. Available models: `qwen3.5-27b.mq3` and
+   `qwen3.6-27b.mq6` (different model family). Skipping 27B-mq6
+   regression gate for S5 unless the model gets quantized.
+   Decision deferred: either quantize a 27B-mq6 (~10 min) before
+   S5 starts, or remove the 27B regression gate from S5.
+9. [⚠️] **DFlash spec-verify baseline.** RECLASSIFIED — DFlash mq6
+   has NEVER been benched in this project (per
+   `docs/perf-checkpoints/2026-05-06-mq6-baselines.md:185-194`).
+   The `dflash_branch_bench.sh` script uses mq4 only. There is no
+   pre-existing baseline to record; the DFlash mq6 spec-verify gate
+   in S5 would need to be **introduced** during B.2, not preserved.
+   This means S3's "regress vs DFlash mq6" GO/NO-GO is currently
+   undefined. Two options: (a) drop the DFlash gate entirely
+   (rely on coherence + AR-decode regression checks); (b) wire up
+   DFlash mq6 first (separate ~1-session task to verify drafter
+   compatibility). Recommend (a) — the launch-overhead risk shows
+   up in coherence prefill numbers if it's real.
+10. [x] **Confirm `should_use_mmq(gfx906, B) → true at B≥8`.** ✅
+    Verified at `dispatch.rs:248`: `let arch_min_batch: usize = if
+    arch == "gfx906" { 8 } else { 256 };`. MMQ port inherits this
+    threshold.
 
 After this checklist, session 1 can begin. Without it, session 1's
 GO/NO-GO criterion is undefined and session 3's rewiring will be
