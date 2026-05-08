@@ -280,6 +280,16 @@ pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_X40_SRC: &str = include_str!("../../
 pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_X48_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq_gfx906_x48.hip");
 pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_X56_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq_gfx906_x56.hip");
 pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_X64_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq_gfx906_x64.hip");
+
+// HFQ6 MMQ — Phase B.2 (gfx906 dp4a-MMQ port for 6-bit weights).
+// Same Window Streaming topology as HFQ4; differences in body.cuh:
+//   - HFQ6 group bytes: 200 (vs HFQ4's 136)
+//   - HFQ6 q is unsigned [0,63], no -8 shift → x_dm = (sc, zp) NOT (sc, zp+8sc)
+//   - 6-byte unpack per (int_a, int_b) pair (vs HFQ4's 4-byte uint per pair)
+// S1 ships x8 only; size sweep in S2.
+pub const GEMM_HFQ6G256_RESIDUAL_MMQ_GFX906_BODY_CUH: &str = include_str!("../../../kernels/src/gemm_hfq6g256_residual_mmq_gfx906_body.cuh");
+pub const GEMM_HFQ6G256_RESIDUAL_MMQ_GFX906_X8_SRC: &str = include_str!("../../../kernels/src/gemm_hfq6g256_residual_mmq_gfx906_x8.hip");
+pub const GEMM_HFQ6G256_RESIDUAL_MMQ_GFX906_X64_SRC: &str = include_str!("../../../kernels/src/gemm_hfq6g256_residual_mmq_gfx906_x64.hip");
 pub const GEMM_MW16_RESIDUAL_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_mw16_residual_wmma.hip");
 pub const DEQUANT_HFQ4G256_TO_F16_SRC: &str = include_str!("../../../kernels/src/dequant_hfq4g256_to_f16.hip");
 pub const GEMM_GATE_UP_HFQ4G256_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma.hip");

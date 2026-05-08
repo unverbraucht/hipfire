@@ -153,6 +153,24 @@ pub fn gemm_hfq4g256_bytes(m: usize, k: usize, batch: usize) -> usize {
     hfq4g256_weight_bytes(m, k) + batch * (k + m) * 4
 }
 
+/// HFQ6-G256 weight matrix: 200 bytes per group of 256 weights.
+/// (8 B header + 192 B weights = 200 B.)
+pub fn hfq6g256_weight_bytes(m: usize, k: usize) -> usize {
+    let groups = k / 256;
+    m * groups * 200
+}
+
+/// Bytes for a single-row HFQ6-G256 GEMV: weight + input vector + output vector.
+pub fn gemv_hfq6g256_bytes(m: usize, k: usize) -> usize {
+    hfq6g256_weight_bytes(m, k) + k * 4 + m * 4
+}
+
+/// Bytes for a B-way batched HFQ6-G256 GEMM (weight read once, B input/output
+/// vectors).
+pub fn gemm_hfq6g256_bytes(m: usize, k: usize, batch: usize) -> usize {
+    hfq6g256_weight_bytes(m, k) + batch * (k + m) * 4
+}
+
 /// FWHT rotation kernel: read x, read two sign tables, write x_rot.
 pub fn mq_rotate_bytes(k: usize) -> usize {
     k * 4 + 256 * 4 * 2 + k * 4

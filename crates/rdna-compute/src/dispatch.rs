@@ -368,6 +368,13 @@ pub struct Gpu {
     //   - env override: `HIPFIRE_MMQ_SCREEN=0` to disable,
     //     `HIPFIRE_MMQ_SCREEN_THRESHOLD=0.05` to tune
     mmq_screen_cache: HashMap<usize, bool>,
+    /// Per-weight HFQ6 MMQ screening cache (Phase B.2). Separate from
+    /// `mmq_screen_cache` because the same buffer pointer could in principle
+    /// hold HFQ4 vs HFQ6 weights across model reloads — keying by pointer
+    /// alone would mix dtype results. In practice each weight is a fixed
+    /// dtype for its lifetime, so pollution is unlikely; the separate cache
+    /// is defensive.
+    mmq_screen_cache_hfq6: HashMap<usize, bool>,
     /// Whether MMQ per-weight screening is enabled.
     /// Per-arch default (set in `Gpu::init`): true on gfx906, false elsewhere.
     pub mmq_screen: bool,
@@ -616,6 +623,7 @@ impl Gpu {
             q8_1_mmq_x_scratch: None,
             q8_1_mmq_x_scratch_bytes: 0,
             mmq_screen_cache: HashMap::new(),
+            mmq_screen_cache_hfq6: HashMap::new(),
             // Per-arch default for MMQ per-weight screening:
             //   gfx906: on (paired with the 0.50 threshold default below).
             //     Acts as a regression safety net; expected to reject 0
@@ -1342,6 +1350,100 @@ impl Gpu {
             false
         });
         self.mmq_screen_cache.insert(key, safe);
+        safe
+    }
+
+    /// Phase B.2 — HFQ6 MMQ weight screening.
+    ///
+    /// Mirror of `mmq_screen_weight` for 6-bit weights. References are HFQ6
+    /// (`gemm_hfq6g256_residual_fp16` on gfx906; `gemm_hfq6g256_residual_wmma`
+    /// elsewhere). Candidate is the new `gemm_hfq6g256_residual_mmq_gfx906`.
+    ///
+    /// Threshold reuses `self.mmq_screen_threshold` (default 0.50 max-abs-err
+    /// per row on gfx906 — see `Gpu::init`). HFQ6 quantization noise is lower
+    /// than HFQ4, so this default is loose; tune in S5 if false-positives are
+    /// observed.
+    pub fn mmq_screen_weight_hfq6(&mut self, a_raw: &GpuTensor, m: usize, k: usize) -> bool {
+        self.bind_thread_or_warn();
+        let key = a_raw.buf.as_ptr() as usize;
+        if let Some(&safe) = self.mmq_screen_cache_hfq6.get(&key) {
+            return safe;
+        }
+
+        let screen_batch = 16usize;
+        let threshold = self.mmq_screen_threshold;
+
+        // Generate synthetic activations on CPU (same RNG as HFQ4 screen).
+        let mut state = 0xDEAD_BEEF_CAFE_BABEu64;
+        let x_data: Vec<f32> = (0..screen_batch * k).map(|_| {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let t = (state >> 33) as f32 / (u32::MAX as f32);
+            t * 4.0 - 2.0
+        }).collect();
+
+        let result = (|| -> HipResult<bool> {
+            let x_gpu = self.upload_f32(&x_data, &[screen_batch * k])?;
+            let y_ref = self.zeros(&[screen_batch * m], DType::F32)?;
+            let y_mmq = self.zeros(&[screen_batch * m], DType::F32)?;
+
+            let saved_capture = self.capture_mode;
+            self.capture_mode = true;
+
+            // Reference: FP16 wave64 on gfx906; WMMA elsewhere (HFQ6 has both).
+            if self.arch == "gfx906" {
+                self.gemm_hfq6g256_residual_fp16(a_raw, &x_gpu, &y_ref, m, k, screen_batch)?;
+            } else {
+                self.gemm_hfq6g256_residual_wmma(a_raw, &x_gpu, &y_ref, m, k, screen_batch)?;
+            }
+
+            // MMQ candidate. S1: only batch_size<=8 path is implemented;
+            // screen at screen_batch=16 hits wave64_dp4a fallback inside
+            // gemm_hfq6g256_residual_mmq_gfx906. That's actually fine for S1
+            // — we want to confirm the dispatcher routes correctly. S2 will
+            // make this a real screen once the size sweep lands.
+            self.gemm_hfq6g256_residual_mmq_gfx906(a_raw, &x_gpu, &y_mmq, m, k, screen_batch)?;
+
+            self.capture_mode = saved_capture;
+            self.hip.device_synchronize()?;
+
+            let ref_out = self.download_f32(&y_ref)?;
+            let mmq_out = self.download_f32(&y_mmq)?;
+
+            self.free_tensor(x_gpu).ok();
+            self.free_tensor(y_ref).ok();
+            self.free_tensor(y_mmq).ok();
+
+            // Per-row max error check.
+            let mut worst_row = 0usize;
+            let mut worst_err = 0f32;
+            for r in 0..m {
+                let mut row_max = 0f32;
+                for b in 0..screen_batch {
+                    let idx = b * m + r;
+                    let err = (ref_out[idx] - mmq_out[idx]).abs();
+                    if err > row_max { row_max = err; }
+                }
+                if row_max > worst_err {
+                    worst_err = row_max;
+                    worst_row = r;
+                }
+            }
+
+            let safe = worst_err <= threshold;
+            if !safe {
+                eprintln!(
+                    "  MMQ screen (HFQ6): UNSAFE weight ptr={key:#x} m={m} k={k} \
+                     worst_row={worst_row} max_err={worst_err:.4} > threshold={threshold:.4} — falling back to wave64_dp4a"
+                );
+            }
+            Ok(safe)
+        })();
+
+        let safe = result.unwrap_or_else(|e| {
+            eprintln!("  MMQ screen (HFQ6): error during screening ({e}), assuming unsafe");
+            false
+        });
+        self.mmq_screen_cache_hfq6.insert(key, safe);
         safe
     }
 
@@ -7203,6 +7305,211 @@ impl Gpu {
         let bytes = crate::profile::gemv_hfq4g256_bytes(m, k)
             + batch_size * m * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_hfq4g256_mmq_set_gfx906", bytes);
+        let result = self.launch_maybe_blob(
+            &kernel_name,
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [64, 4, 1], // nwarps=4
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr); b.push_ptr(xq_ptr); b.push_ptr(y_ptr);
+                b.push_i32(m_val); b.push_i32(k_val); b.push_i32(n_val);
+                b.push_i32(add_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// Phase B.2 — HFQ6 MMQ-streaming dispatcher (residual fuse, add=1).
+    ///
+    /// Mirror of `gemm_hfq4g256_residual_mmq_gfx906` for 6-bit weights.
+    /// Used by `gemm_hfq6g256_residual` for the wo / w_down / lm_head sites
+    /// where Y already holds the residual stream and the projection
+    /// accumulates onto it.
+    ///
+    /// S1: x8 path only. S2 will add the full size sweep
+    /// {x16, x24, x32, x40, x48, x56, x64}.
+    pub fn gemm_hfq6g256_residual_mmq_gfx906(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        // Quantize activations to Q8_1 (shared layout with HFQ4).
+        let x_q8_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+
+        // S1 ships {x8, x64}. Other sizes fall through to wave64_dp4a
+        // until S2 lands the size sweep. x8 covers B≤8 (decode + small spec);
+        // x64 covers B≥64 (production prefill at pp128).
+        let mmq_x = if batch_size <= 8 { 8 }
+            else if batch_size >= 64 { 64 }
+            else {
+                // 8 < B < 64 — no mmq_x in S1; fall back.
+                return self.gemm_hfq6g256_residual_wave64_dp4a(a_raw, x, y, m, k, batch_size);
+            };
+        let is_full = m % 128 == 0 && batch_size % mmq_x == 0;
+        let base_name = "gemm_hfq6g256_residual_mmq_gfx906";
+        let kernel_name = if is_full {
+            format!("{}_full_add_x{}", base_name, mmq_x)
+        } else {
+            format!("{}_x{}", base_name, mmq_x)
+        };
+
+        let wrapper_src = match mmq_x {
+            8 => kernels::GEMM_HFQ6G256_RESIDUAL_MMQ_GFX906_X8_SRC,
+            64 => kernels::GEMM_HFQ6G256_RESIDUAL_MMQ_GFX906_X64_SRC,
+            _ => unreachable!("S1 ships only mmq_x=8 and mmq_x=64"),
+        };
+        let inlined = wrapper_src.replace(
+            "#include \"gemm_hfq6g256_residual_mmq_gfx906_body.cuh\"",
+            kernels::GEMM_HFQ6G256_RESIDUAL_MMQ_GFX906_BODY_CUH,
+        );
+
+        self.ensure_kernel(&format!("{}_x{}", base_name, mmq_x), &inlined, &kernel_name)?;
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut xq_ptr = x_q8_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut add_val = 1i32; // residual fuse
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut xq_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+            &mut add_val as *mut _ as *mut c_void,
+        ];
+
+        // Window Streaming topology — KEEP IN SYNC WITH body.cuh.
+        const MMQ_Y: usize = 128;
+        let x_stride: usize = if mmq_x >= 64 { 40 } else { 33 };
+        const Y_STRIDE: usize = 36;
+        const X_DM_HALF2: usize = 128;
+        let row_tiles = (m + MMQ_Y - 1) / MMQ_Y;
+        let batch_tiles = (batch_size + mmq_x - 1) / mmq_x;
+
+        let shared_mem = (
+            (MMQ_Y * x_stride * 4)
+            + (X_DM_HALF2 * 8)
+            + (mmq_x * Y_STRIDE * 4)
+        ) as u32;
+        debug_assert!(shared_mem as usize <= 32 * 1024,
+            "gfx906 MMQ LDS budget exceeded: {} B > 32 KiB", shared_mem);
+
+        let bytes = crate::profile::gemv_hfq6g256_bytes(m, k)
+            + batch_size * k
+            + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", base_name, bytes);
+        let result = self.launch_maybe_blob(
+            &kernel_name,
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [64, 4, 1], // nwarps=4
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr); b.push_ptr(xq_ptr); b.push_ptr(y_ptr);
+                b.push_i32(m_val); b.push_i32(k_val); b.push_i32(n_val);
+                b.push_i32(add_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// Phase B.2 — HFQ6 MMQ-streaming dispatcher (set / overwrite, add=0).
+    ///
+    /// Used by fused-projection dispatchers (`gemm_qkvza_hfq6g256`,
+    /// `gemm_qkv_hfq6g256`, `gemm_gate_up_hfq6g256`) — N parallel calls
+    /// into N separate Y buffers, each writes its own projection's output.
+    ///
+    /// Caller passes `x_q8_ptr` (pre-quantized via `ensure_q8_1_mmq_x` once
+    /// for the fused group, reused across sibling projections). Do NOT
+    /// re-quantize per call.
+    ///
+    /// S1: x8 path only. S2 will add the full size sweep.
+    pub fn gemm_hfq6g256_mmq_set_gfx906(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_q8_ptr: *mut c_void,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        // S1: ships {x8, x64}. 8 < B < 64 returns error; caller routes to dp4a.
+        let mmq_x = if batch_size <= 8 { 8 }
+            else if batch_size >= 64 { 64 }
+            else {
+                return Err(hip_bridge::HipError::new(0,
+                    "S1 set-mode supports batch_size<=8 or >=64; caller must route 8<B<64 to wave64_dp4a"));
+            };
+        let is_full = m % 128 == 0 && batch_size % mmq_x == 0;
+        let base_name = "gemm_hfq6g256_residual_mmq_gfx906";
+        let kernel_name = if is_full {
+            format!("{}_full_set_x{}", base_name, mmq_x)
+        } else {
+            format!("{}_x{}", base_name, mmq_x)
+        };
+
+        let wrapper_src = match mmq_x {
+            8 => kernels::GEMM_HFQ6G256_RESIDUAL_MMQ_GFX906_X8_SRC,
+            64 => kernels::GEMM_HFQ6G256_RESIDUAL_MMQ_GFX906_X64_SRC,
+            _ => unreachable!("S1 ships only mmq_x=8 and mmq_x=64"),
+        };
+        let inlined = wrapper_src.replace(
+            "#include \"gemm_hfq6g256_residual_mmq_gfx906_body.cuh\"",
+            kernels::GEMM_HFQ6G256_RESIDUAL_MMQ_GFX906_BODY_CUH,
+        );
+
+        self.ensure_kernel(&format!("{}_x{}", base_name, mmq_x), &inlined, &kernel_name)?;
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut xq_ptr = x_q8_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut add_val = 0i32; // overwrite (set semantics)
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut xq_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+            &mut add_val as *mut _ as *mut c_void,
+        ];
+
+        const MMQ_Y: usize = 128;
+        let x_stride: usize = if mmq_x >= 64 { 40 } else { 33 };
+        const Y_STRIDE: usize = 36;
+        const X_DM_HALF2: usize = 128;
+        let row_tiles = (m + MMQ_Y - 1) / MMQ_Y;
+        let batch_tiles = (batch_size + mmq_x - 1) / mmq_x;
+
+        let shared_mem = (
+            (MMQ_Y * x_stride * 4)
+            + (X_DM_HALF2 * 8)
+            + (mmq_x * Y_STRIDE * 4)
+        ) as u32;
+        debug_assert!(shared_mem as usize <= 32 * 1024,
+            "gfx906 MMQ LDS budget exceeded: {} B > 32 KiB", shared_mem);
+
+        let bytes = crate::profile::gemv_hfq6g256_bytes(m, k)
+            + batch_size * m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_hfq6g256_mmq_set_gfx906", bytes);
         let result = self.launch_maybe_blob(
             &kernel_name,
             [row_tiles as u32, batch_tiles as u32, 1],
