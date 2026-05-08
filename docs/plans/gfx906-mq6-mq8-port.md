@@ -384,6 +384,137 @@ catches what we remembered. Use the latter for in-process
 correlation against application-level metrics, not for kernel-level
 bottleneck identification.
 
+### v3.2.6 errata (2026-05-08): Phase B shipped — Path 2 (MMQ port) won 2.94× at 9B, 3.52× at 27B
+
+Phase B done in 5 sessions (vs 5-7 budgeted). Both paths from v3.2.5
+implemented; results contradict v3.2.5's prediction direction.
+
+**Path 1 (BT tuning + multi-wave): capped at +14.5 %.**
+
+| Phase | Commit | mq6 9B pp128 | Cumulative Δ |
+|---|---|---:|---:|
+| Pre-Phase-B (BT=8 baseline) | — | 165.8 | — |
+| B.1 gate_up only (BT=8→16) | `2bee6e6` | 178.0 | +7 % |
+| B.1.1 all 4 dp4a (BT=8→16) | `ff9e210` | 190.8 | +15 % |
+
+Multi-wave / 4-rows-per-block experiments (B.1.1 second half) all
+regressed at gfx906 due to occupancy loss (256-thread blocks → 10
+blocks/SIMD vs 21 with 64-thread). v3.2.5's lower-bound prediction
+"+1.5–2 ×" overshot — Path 1's actual ceiling is +1.15 ×.
+
+**Path 2 (MMQ-streaming port): exceeded v3.2.5's upper-bound prediction.**
+
+| Model | Pre-B.2 (kill-switch) | B.2 (MMQ on) | Speedup | v3.2.5 prediction |
+|---|---:|---:|---:|---|
+| 9B mq6 pp128 | 190.8 tok/s | **561.2** | **2.94×** | 3-4× ✓ within range |
+| 27B mq6 pp128 | 54.8 tok/s | **192.8** | **3.52×** | (not predicted; bigger M → bigger win) |
+| Decode (both) | unchanged | unchanged | 1.00 × | n/a (MMQ never fires at B=1) |
+
+**Bandwidth-bound floor: exceeded by 38 %.** v3.2.5 calculated 407
+tok/s (= mq4_pp128 / 1.47 weight-byte ratio) as the parity target;
+B.2 hit **561 tok/s = 38 % over floor**. The prediction
+underestimated amortization wins:
+- Q8_1 quantize shared across sibling projections (one quantize
+  per fused-projection group, not per-call)
+- LDS-staged A reused across batch tiles (mmq_x=64 → 4 row-tile
+  reuses per batch tile)
+- Compile-time `_full_set` / `_full_add` variants eliminating
+  branch overhead in the writeback hot loop
+
+**Final mq6/mq4 prefill ratio: 0.939 — within 6 % of mq4 parity.**
+v3.2.5 framed this as "stretch"; we hit it.
+
+**Path 2 effort breakdown (5 sessions actual):**
+
+| Session | Outcome |
+|---|---|
+| Pre-S1 checklist | 10 items closed; 2 deferred (27B model + DFlash baseline never benched) |
+| S1 — body.cuh + x8 + x64 + dispatchers + screen | 6/6 correctness tests pass; LANDMINE discriminator catches both math-identity bugs |
+| S2 — size sweep + per-batch routing | mmq_x ∈ {8..64} all correct; perf wins at B=16 + B≥40 |
+| S3 — dispatcher rewiring (qkvza/qkv/gate_up/residual) | end-to-end **+194 % wall** on 9B pp128 |
+| S4 — lm_head MMQ + fast paths | small marginal change (lm_head is small fraction of pp128) |
+| S5 — debug knobs + final validation | kill-switch verified, mq4 regression check (-0.2 %), 27B bench |
+
+**Effort attribution surprises:**
+
+1. **S1's "≥10 % at B=8" GO/NO-GO was the wrong reference workload.**
+   At B=8, MMQ x8 is actually 16 % SLOWER than wave64_dp4a (block
+   size mismatched to small grid; 112 waves vs 1792). Strict
+   adherence to the threshold would have aborted before discovering
+   the 3× win at production B=128. **Lesson: GO/NO-GO thresholds
+   must anchor on the actual production workload, not a microbench
+   convenient size.** Updated: B.1.1 BT=16 ceiling diagnosis at B=128
+   should be the reference for any future MMQ-class experiment on
+   gfx906.
+
+2. **The plan's three correctness landmines (`x_dm` shift, `0.25f`
+   factor, dispatch architecture) all surfaced during S1 spec work.**
+   The discriminator unit test (q ≡ 5, x ≡ 1.0) caught nothing
+   because the plan flagged them upfront and the implementation got
+   them right on first try. Pre-spec'ing landmines worked.
+
+3. **lm_head MMQ (S4) added almost nothing (+0.04 %).** The lm_head
+   is a small fraction of pp128 GEMM time (M=vocab=248k is huge but
+   it fires once per prefill, not 64×/layer like the residual sites).
+   In hindsight S4 wasn't worth a session of its own; could have
+   been folded into S3.
+
+4. **27B regression validation (deferred from pre-S1 item 8 because
+   no Qwen 3.5 27B mq6 model existed)** turned out to show a *bigger*
+   speedup than 9B (3.52× vs 2.94×), not a regression. The win
+   scales WITH model size because larger M means more `MMQ_Y=128`
+   row tiles fully utilized. **Use Qwen 3.6-27B for future 27B-class
+   benches** — same architecture family, on disk, no quantize step
+   needed.
+
+**Items deferred to future errata (still open):**
+
+- Per-mmq_x stride PMC tuning (S2.4 secondary): non-monotonic perf at
+  B=24/32 not yet diagnosed; B=16 and B≥40 work fine but the
+  intermediate batches fall through to wave64_dp4a. Probably worth
+  ~½ session of investigation.
+- MoE-indexed HFQ6 MMQ (plan v3.2.4 item 4): no MoE mq6 model on
+  disk, defer until one ships.
+- `audit-dispatch-coverage.sh` (plan v3.2.4 item 13): still pending.
+- Phase A defensive `assert!(gemv_dp4a_enabled(arch))` on dp4a Rust
+  fns (plan v3.2.4 item 6): still pending.
+- DFlash spec-verify mq6 baseline: project has no DFlash + mq6
+  workflow today; B.2 used the coherence-harness mq6 reasoning prompt
+  as a proxy and confirmed no decode regression.
+
+**Items closed by Phase B:**
+
+- profile.rs HFQ6 byte counts (plan v3.2.4 item 5): **closed** —
+  added `hfq6g256_weight_bytes` / `gemv_hfq6g256_bytes` /
+  `gemm_hfq6g256_bytes` in S1.
+- Phase A `&& !self.capture_mode` guards on audit branch
+  (cherry-picked from PR2): **closed** in pre-S1 item 1
+  (commit `c54445b`).
+- DDTree HFQ6/MQ6 dispatch arms: **closed** (same cherry-pick).
+
+**Calibration takeaway for future plans:**
+
+The HFQ4 reference attribution was a *lower bound*, again — same
+direction as v3.2.3's takeaway from Phase A decode (+41-50 % vs
++15-18 % predicted). For new quant ports on gfx906, treat
+HFQ4-derived numbers as **estimates of the last incremental lever's
+effect**, with realistic upside from amortization wins that compound
+when:
+- the quantize step is shared (Q8_1 once per fused-projection group)
+- LDS-staged data is reused across batch tiles
+- the kernel architecture matches mq4's (Window Streaming with
+  `_full_set` / `_full_add` compile-time variants)
+
+**Coverage table update (§1.1 row 2 — HFQ6):** all four columns now
+✓. The dp4a/MMQ batched cell that was ✗ in v3.2.3 → now ✓ via Phase
+B.2 commits `8755a35` + `1acef95` + `bcce686` + `9705856`.
+
+**References:**
+- B.2 plan: `docs/plans/gfx906-mq6-mmq-port-phase-b2.md` v2.3
+- Cumulative dev-log: `docs/perf-checkpoints/2026-05-07-phase-a-cumulative-mq6.md`
+- Path 1 ceiling: `2bee6e6` + `ff9e210`
+- Path 2 (S1+S2+S3+S4+S5+27B): `8755a35`, `1acef95`, `bcce686`, `9705856`
+
 ### Calibrated decode-lift expectations (gfx906, post-v3.2.2)
 
 | Lever | Expected 9B mq6 decode Δ | Measured (post-v3.2.3) |
@@ -418,7 +549,7 @@ separately. v1 conflated them in a single "fused" column.
 | Quant | Bits | Group bytes | GEMV (B=1) | residual GEMV (B=1) | fused GEMV (B=1: gate_up/qkv/qkvza) | wave64 GEMV variant | dp4a/MMQ batched | KV cache | attn KV |
 |---|---:|---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
 | **HFQ4** | 4 | 136 | ✓ | ✓ + prefetch | ✓ + dp4a | ✓ | ✓ MMQ + dot4a (PR #158) | ✓ | ✓ |
-| **HFQ6** | 6 | 200 | ✓ (wave32) | ✓ (wave32) | ✗ | ✗ | ✗ | (n/a) | (n/a) |
+| **HFQ6** | 6 | 200 | ✓ (wave32) | ✓ + prefetch (Phase A.1b) | ✓ + dp4a (Phase A.1c) | ✓ (Phase A.1a) | ✓ MMQ + dp4a (Phase B.2) | (n/a) | (n/a) |
 | **HFQ8** | 8 | 264 | ✓ (wave32) | ✗ | ✗ | ✗ | ✗ | ✓ | ✓ |
 | HFQ3 | 3 | 104 | ✓ | ✓ | ✗ | ✗ | ✗ | (n/a) | (n/a) |
 | HFQ2 | 2 | 72 | ✓ | ✗ | ✗ | ✗ | ✗ | (n/a) | (n/a) |
@@ -426,23 +557,29 @@ separately. v1 conflated them in a single "fused" column.
 | Quant | batched GEMM (B>1: gate_up/qkv/qkvza/residual) | wave64 batched GEMM | dp4a batched | MoE-indexed |
 |---|:---:|:---:|:---:|:---:|
 | **HFQ4** | ✓ (multiple variants) | ✓ | ✓ MMQ | ✓ wave64 |
-| **HFQ6** | ✓ (base / fp16 / dot2 / wmma / wmma_gfx12 — 15 dispatch fns total) | ✗ | ✗ | ✗ |
+| **HFQ6** | ✓ (base / fp16 / dot2 / wmma / wmma_gfx12 / wave64+dp4a / **MMQ-streaming**) | ✓ (Phase A) | ✓ MMQ (Phase B.2) | ✗ (deferred — no MoE mq6 model) |
 | **HFQ8** | ✗ | ✗ | ✗ | ✗ |
 
-**Bottom line:**
+**Bottom line (updated post-Phase-B, v3.2.6):**
 
-- **HFQ6 has full FP-path coverage at the *batched GEMM* level for
-  prefill / DFlash verify** (5 fused families × {base, fp16, dot2,
-  wmma, wmma_gfx12}). The gap on gfx906 is everything else: no
-  wave64 variant, no single-token fused GEMVs, no dp4a/MMQ batched.
+- **HFQ6 has near-parity coverage on gfx906** post-Phase-B.
+  9B mq6 prefill at 561 tok/s = 0.94× of mq4's 599; 27B at 192 tok/s
+  = 3.52× over the wave64_dp4a baseline. Phase A (decode) + Phase B.1
+  (BT tuning) + Phase B.2 (MMQ-streaming port) closed the original
+  3.15× gap to 1.07×. Remaining gap is the bandwidth-byte-overhead
+  floor (HFQ6 has 1.47× more weight bytes per output than HFQ4) —
+  fundamentally limited by memory bandwidth, not kernel design.
 - **HFQ8 runs end-to-end at B=1 today on gfx906** via
   `gemv_hfq8g256` + `attention_hfq8_kv` + `kv_cache_write_hfq8`.
   The gap is throughput at B>1 (no batched GEMM at all) and the
-  wave64 / dp4a optimizations available for HFQ4.
-- **MoE-indexed kernel coverage is HFQ4-only**. Five MoE kernel
+  wave64 / dp4a optimizations available for HFQ4. Phase A approach
+  could port to HFQ8 mechanically if a workload demand emerges.
+- **MoE-indexed kernel coverage is HFQ4-only.** Five MoE kernel
   files exist for HFQ4 (down + gate_up, indexed + batched
-  variants). Zero exist for HFQ6 or HFQ8. A3B-class models with
-  mq6 weights on gfx906 fall through to wave32 FP fallbacks.
+  variants). Zero exist for HFQ6 or HFQ8 — A3B-class models with
+  mq6 weights on gfx906 fall through to wave32 FP fallbacks. Phase
+  B.2 explicitly out-of-scope; estimated ~1 session post-B.2 once
+  an MoE mq6 model ships.
 
 ### 1.2 Lever availability at a glance
 
