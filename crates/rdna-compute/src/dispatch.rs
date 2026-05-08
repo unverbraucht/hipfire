@@ -55,9 +55,16 @@ fn gemv_rows_override() -> Option<u32> {
 /// Returns false at non-winning sizes (B≤8, B∈[9,15], B∈[17,39]) — the
 /// caller falls through to wave64_dp4a there.
 ///
+/// Env override: `HIPFIRE_HFQ6_MMQ=0` disables HFQ6 MMQ routing globally
+/// (returns false for all batches). Useful for A/B regression bisects vs
+/// the wave64_dp4a baseline.
+///
 /// Future: as more batch sizes are benched, refine this map. Conservative
 /// today (only confirmed-winning sizes route to MMQ).
 fn hfq6_mmq_winning_size(batch_size: usize) -> bool {
+    if std::env::var("HIPFIRE_HFQ6_MMQ").ok().as_deref() == Some("0") {
+        return false;
+    }
     batch_size == 16 || batch_size >= 40
 }
 
@@ -7357,6 +7364,12 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        // DIAG: HIPFIRE_HFQ6_MMQ_DIAG_PASSTHROUGH=1 redirects to fp16 reference
+        // for numerical-correctness bisection (MMQ vs FP16). Mirrors HFQ4 at
+        // dispatch.rs:7132.
+        if std::env::var("HIPFIRE_HFQ6_MMQ_DIAG_PASSTHROUGH").ok().as_deref() == Some("1") {
+            return self.gemm_hfq6g256_residual_fp16(a_raw, x, y, m, k, batch_size);
+        }
         // Quantize activations to Q8_1 (shared layout with HFQ4).
         let x_q8_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
 
@@ -8395,6 +8408,25 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // gfx906 MMQ-streaming first (Phase B.2 §5.1 item 6 + S4). lm_head
+        // is set-semantics (overwrite Y, no residual fuse), so we use
+        // gemm_hfq6g256_mmq_set_gfx906 — no memset needed since _full_set
+        // writes Y[...] = sum (overwrite), unlike the dp4a kernel which
+        // uses += and requires a zero-init Y. Routes only at confirmed-
+        // winning batch sizes per S2 sweep.
+        if batch_size > 1 && gemv_dp4a_enabled(&self.arch) && !self.capture_mode
+            && should_use_mmq(&self.arch, batch_size)
+            && hfq6_mmq_winning_size(batch_size)
+        {
+            let safe = if self.mmq_screen {
+                self.mmq_screen_weight_hfq6(a_raw, m, k)
+            } else { true };
+            if safe {
+                let xq = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+                return self.gemm_hfq6g256_mmq_set_gfx906(a_raw, xq, y, m, k, batch_size);
+            }
+            // else: screening rejected — fall through to wave64_dp4a.
+        }
         // gfx906: dp4a residual + zero-init Y for `=` semantics.
         // Skip in capture mode (the residual kernel calls ensure_q8_1_mmq_x
         // which launches an internal quantize kernel — matches HFQ4 sibling).

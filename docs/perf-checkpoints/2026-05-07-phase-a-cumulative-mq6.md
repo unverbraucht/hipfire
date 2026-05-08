@@ -513,6 +513,47 @@ B=16 and B≥40, not at intermediate sizes. **The pp128 wall-clock
 gain (190.8 → 561.2) is the headline number; coherence-harness
 pp36 is not a regression test for B.2 by design.**
 
+### S4 + S5 polish
+
+**S4 — lm_head MMQ retarget.** `gemm_hfq6g256_batched_lmhead` rewired
+to use `gemm_hfq6g256_mmq_set_gfx906` at `set` semantics (no memset
+needed since `_full_set` overwrites). Routes via the same
+`hfq6_mmq_winning_size` gate. End-to-end mq6 9B pp128 stayed at
+561.4 tok/s (within 0.04 % of S3's 561.2) — the lm_head is a small
+fraction of pp128 GEMM time, so the win is amortized into the
+multi-projection sites. Decode unchanged at 44.2 tok/s.
+
+**S5 — debug env vars + final regression.**
+
+Two env-var knobs added in S5 to support production debugging:
+
+| Env var | Effect |
+|---|---|
+| `HIPFIRE_HFQ6_MMQ=0` | Kill-switch: `hfq6_mmq_winning_size` always returns false → all 4 dispatcher sites fall through to wave64_dp4a |
+| `HIPFIRE_HFQ6_MMQ_DIAG_PASSTHROUGH=1` | Forces `gemm_hfq6g256_residual_mmq_gfx906` to redirect to `gemm_hfq6g256_residual_fp16` for numerical-correctness bisection |
+
+Validated via mq6 9B pp128:
+
+| Config | mq6 pp128 | Match |
+|---|---:|---|
+| Default (MMQ on) | 562.1 tok/s | — |
+| `HIPFIRE_HFQ6_MMQ=0` | **189.7 tok/s** | matches pre-B.2 baseline ✓ |
+| `HIPFIRE_HFQ6_MMQ_DIAG_PASSTHROUGH=1` | 129.4 tok/s | FP16 fallback ≈ 70 % of wave64_dp4a |
+
+**mq4 regression check** (S5 mandatory): mq4 9B pp128 at audit
+HEAD = **597.7 tok/s** (vs pre-B.2 mq4 baseline 598.7) — within 0.2 %,
+no regression. The HFQ6 MMQ path is properly isolated from HFQ4
+dispatch.
+
+**Methodology lesson re-confirmed:** during S4 testing a coherence-gate
+chain held the GPU at 99 °C junction temp, causing a phantom 50 %
+decode regression (43.7 → 21.2). Pulling the load and waiting for
+cooldown restored the numbers. This matches the
+`feedback_perf_noise_decode.md` memory — 5+ warm runs with consistent
+spread is necessary but not sufficient; thermal junction temp needs
+to be checked explicitly via `rocm-smi --showtemp` before trusting
+"this regressed" claims.
+
 ## Cross-references
 
 - Plan: `docs/plans/gfx906-mq6-mq8-port.md` v3.2.3 (commit `d02dc95`)

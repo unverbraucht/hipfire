@@ -26,7 +26,17 @@
   - DFlash mq6 has no baseline ever — gate dropped, coherence prefill is proxy
   - `should_use_mmq` threshold confirmed at B≥8 for gfx906
   - Plan §4 S5 + §6 GO/NO-GO updated to reflect dropped DFlash gate.
-- **v2.2 (this rev, 2026-05-08)** — S1 + S2 + S3 shipped:
+- **v2.3 (this rev, 2026-05-08)** — S4 + S5 polish:
+  - S4: `gemm_hfq6g256_batched_lmhead` rewired to MMQ set-semantics
+    (no memset). pp128 within 0.04 % of S3 (561.4 vs 561.2).
+  - S5: `HIPFIRE_HFQ6_MMQ=0` kill-switch + `HIPFIRE_HFQ6_MMQ_DIAG_PASSTHROUGH=1`
+    FP16-redirect debug knob. Validated:
+    - Kill-switch ON: 189.7 tok/s (matches pre-B.2 baseline)
+    - DIAG passthrough: 129.4 tok/s (FP16 fallback, slower than wave64_dp4a)
+  - mq4 9B pp128 regression check: 597.7 tok/s (vs 598.7 baseline) — no
+    regression, HFQ6 MMQ path is isolated from HFQ4.
+  - Final coherence-gate: 7/7 OK.
+- **v2.2 (commit `1acef95`, 2026-05-08)** — S1 + S2 + S3 shipped:
   - S1 (commit `8755a35`): body.cuh + x8/x64 + 2 Rust dispatchers + screen.
     Microbench at B=128: 484 µs (MMQ x64) vs 1471 µs (wave64_dp4a) = **3.02×**
   - S2: x16-x56 wrappers + dispatcher size-routing helper
