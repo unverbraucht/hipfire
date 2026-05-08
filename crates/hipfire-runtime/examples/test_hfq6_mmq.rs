@@ -429,6 +429,44 @@ fn main() {
         gpu.free_tensor(d_y).ok();
     }
 
+    // ─── Test 6: per-mmq_x correctness sweep (S2.3) ────────────────────────
+    // For each mmq_x ∈ {8,16,24,32,40,48,56,64}, run a B=mmq_x bench at
+    // M=128 K=4096 (smallest tile-aligned shape). Catches any size-specific
+    // bug in the body template (e.g. bad b128/b32 path selection at the
+    // mmq_x>=64 boundary).
+    {
+        eprintln!("\n[Test 6] per-mmq_x correctness sweep (M=128, K=4096)");
+        let m = 128usize;
+        let k = 4096usize;
+        for &n in &[8usize, 16, 24, 32, 40, 48, 56, 64] {
+            let x_data: Vec<f32> = (0..n*k).map(|i| rand_f32(50 + n as u32, i) * 0.5).collect();
+            let w_data: Vec<f32> = (0..m*k).map(|i| rand_f32(150 + n as u32, i) * 0.3).collect();
+            let q = quantize_hfq6g256(&w_data);
+            let w_dq = cpu_dequant(&q, m, k);
+            let y_cpu = cpu_gemm(&w_dq, &x_data, m, k, n);
+
+            let d_x = gpu.upload_f32(&x_data, &[n * k]).unwrap();
+            let d_a = gpu.upload_raw(&q, &[q.len()]).unwrap();
+            let d_y = gpu.zeros(&[n * m], rdna_compute::DType::F32).unwrap();
+            let xq = gpu.ensure_q8_1_mmq_x(&d_x, n, k).unwrap();
+            gpu.gemm_hfq6g256_mmq_set_gfx906(&d_a, xq, &d_y, m, k, n).unwrap();
+            let y_gpu = gpu.download_f32(&d_y).unwrap();
+
+            let nr = nrmse(&y_cpu, &y_gpu);
+            let (mae, _) = max_abs_err(&y_cpu, &y_gpu);
+            let label = format!("mmq_x={n:2} (B={n})");
+            if nr < 0.005 {
+                pass(&label, &format!("nrmse={nr:.5} max_abs_err={mae:.4}"));
+            } else {
+                fail(&label, &format!("nrmse={nr:.5} max_abs_err={mae:.4}"));
+            }
+
+            gpu.free_tensor(d_x).ok();
+            gpu.free_tensor(d_a).ok();
+            gpu.free_tensor(d_y).ok();
+        }
+    }
+
     eprintln!("\n=== Summary: {} passed, {} failed ===", total_pass.get(), total_fail.get());
     if total_fail.get() > 0 {
         std::process::exit(1);

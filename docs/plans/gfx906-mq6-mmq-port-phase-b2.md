@@ -17,7 +17,7 @@
   - session count 5 → 7
   - new validation gates: DFlash spec-verify, 27B model, per-element max-abs-err
   - pre-session-1 checklist added (10 items)
-- **v2.1 (this rev, 2026-05-08)** — pre-S1 checklist executed:
+- **v2.1 (commit `ab043d5`, 2026-05-08)** — pre-S1 checklist executed:
   - cherry-picked `5768fe4` → `c54445b` (capture_mode + DDTree on audit)
   - added 4 dp4a unit tests to `test_hfq6_gemm.rs`; gated WMMA tests on gfx11+
   - mmq_screen threshold default verified: gfx906 = 0.50 (max-abs-err per row)
@@ -26,6 +26,22 @@
   - DFlash mq6 has no baseline ever — gate dropped, coherence prefill is proxy
   - `should_use_mmq` threshold confirmed at B≥8 for gfx906
   - Plan §4 S5 + §6 GO/NO-GO updated to reflect dropped DFlash gate.
+- **v2.2 (this rev, 2026-05-08)** — S1 + S2 + S3 shipped:
+  - S1 (commit `8755a35`): body.cuh + x8/x64 + 2 Rust dispatchers + screen.
+    Microbench at B=128: 484 µs (MMQ x64) vs 1471 µs (wave64_dp4a) = **3.02×**
+  - S2: x16-x56 wrappers + dispatcher size-routing helper
+    `hfq6_mmq_winning_size`. Per-batch sweep showed wins at B=16 and B≥40,
+    marginal at B=24/32, regression at B=8. Dispatcher routes only at
+    confirmed-winning sizes.
+  - S3: rewired `gemm_qkvza_hfq6g256` (2 set + fp16 tail), `gemm_qkv_hfq6g256`
+    (3 set), `gemm_gate_up_hfq6g256` (2 set), `gemm_hfq6g256_residual`
+    (1 residual_mmq), all gated by `hfq6_mmq_winning_size`.
+  - **End-to-end mq6 9B pp128: 190.8 → 561.2 tok/s (+194 %)**
+  - **mq6/mq4 ratio: 0.937 (within 6 % of mq4 prefill parity).** Exceeds
+    plan stretch target (450 tok/s) by 25 %; exceeds bandwidth-bound
+    floor (407) by 38 %.
+  - Coherence 7/7 OK. Decode unchanged at 43.7 tok/s (MMQ never fires
+    at B=1).
 
 ## 1. Goal
 

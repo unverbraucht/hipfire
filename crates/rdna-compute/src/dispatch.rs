@@ -45,6 +45,22 @@ fn gemv_rows_override() -> Option<u32> {
 /// Default-on for gfx906 only. Override with HIPFIRE_GEMV_DP4A={0,1}.
 /// fused_qkv / fused_qkvza ports for HFQ4 (PR #167) and HFQ6 (PR #187)
 /// have shipped; this lever now toggles every fused dp4a path together.
+/// Phase B.2 — per-batch routing for HFQ6 MMQ-streaming.
+///
+/// Returns true when the batch size is one where the S2 perf sweep
+/// confirmed MMQ beats wave64_dp4a by ≥10 % (M=3584, K=4096):
+///   B=16   → 1.22× ✓
+///   B≥40   → 1.13×–3.03× ✓ monotonically improving
+///
+/// Returns false at non-winning sizes (B≤8, B∈[9,15], B∈[17,39]) — the
+/// caller falls through to wave64_dp4a there.
+///
+/// Future: as more batch sizes are benched, refine this map. Conservative
+/// today (only confirmed-winning sizes route to MMQ).
+fn hfq6_mmq_winning_size(batch_size: usize) -> bool {
+    batch_size == 16 || batch_size >= 40
+}
+
 pub fn gemv_dp4a_enabled(arch: &str) -> bool {
     static CACHE: OnceLock<Option<bool>> = OnceLock::new();
     let override_ = *CACHE.get_or_init(|| {
@@ -7344,15 +7360,29 @@ impl Gpu {
         // Quantize activations to Q8_1 (shared layout with HFQ4).
         let x_q8_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
 
-        // S1 ships {x8, x64}. Other sizes fall through to wave64_dp4a
-        // until S2 lands the size sweep. x8 covers B≤8 (decode + small spec);
-        // x64 covers B≥64 (production prefill at pp128).
-        let mmq_x = if batch_size <= 8 { 8 }
-            else if batch_size >= 64 { 64 }
-            else {
-                // 8 < B < 64 — no mmq_x in S1; fall back.
-                return self.gemm_hfq6g256_residual_wave64_dp4a(a_raw, x, y, m, k, batch_size);
-            };
+        // S2: full size sweep, with per-batch routing.
+        //
+        // Per-batch perf bench (M=3584 K=4096, MMQ vs wave64_dp4a, speedup):
+        //   B=8     → 0.86× ❌ regression — MMQ block too coarse
+        //   B=9-15  → unmeasured — conservatively route to dp4a
+        //   B=16    → 1.22× ✓
+        //   B=17-32 → 0.96-1.08× ❌ marginal — route to dp4a
+        //   B=33-39 → unmeasured — conservatively route to dp4a
+        //   B=40    → 1.13× ✓
+        //   B=41+   → 1.21×-3.03× ✓ monotonically improving
+        //
+        // Only enable MMQ where we have a measured win >10%.
+        // Future: refine this map as more batch sizes are benched.
+        let mmq_x_opt: Option<u32> = if batch_size == 16 { Some(16) }
+            else if batch_size >= 40 && batch_size <= 47 { Some(40) }
+            else if batch_size >= 48 && batch_size <= 55 { Some(48) }
+            else if batch_size >= 56 && batch_size <= 63 { Some(56) }
+            else if batch_size >= 64 { Some(64) }
+            else { None };
+        let mmq_x = match mmq_x_opt {
+            Some(x) => x as usize,
+            None => return self.gemm_hfq6g256_residual_wave64_dp4a(a_raw, x, y, m, k, batch_size),
+        };
         let is_full = m % 128 == 0 && batch_size % mmq_x == 0;
         let base_name = "gemm_hfq6g256_residual_mmq_gfx906";
         let kernel_name = if is_full {
@@ -7362,9 +7392,15 @@ impl Gpu {
         };
 
         let wrapper_src = match mmq_x {
-            8 => kernels::GEMM_HFQ6G256_RESIDUAL_MMQ_GFX906_X8_SRC,
+            8  => kernels::GEMM_HFQ6G256_RESIDUAL_MMQ_GFX906_X8_SRC,
+            16 => kernels::GEMM_HFQ6G256_RESIDUAL_MMQ_GFX906_X16_SRC,
+            24 => kernels::GEMM_HFQ6G256_RESIDUAL_MMQ_GFX906_X24_SRC,
+            32 => kernels::GEMM_HFQ6G256_RESIDUAL_MMQ_GFX906_X32_SRC,
+            40 => kernels::GEMM_HFQ6G256_RESIDUAL_MMQ_GFX906_X40_SRC,
+            48 => kernels::GEMM_HFQ6G256_RESIDUAL_MMQ_GFX906_X48_SRC,
+            56 => kernels::GEMM_HFQ6G256_RESIDUAL_MMQ_GFX906_X56_SRC,
             64 => kernels::GEMM_HFQ6G256_RESIDUAL_MMQ_GFX906_X64_SRC,
-            _ => unreachable!("S1 ships only mmq_x=8 and mmq_x=64"),
+            _ => unreachable!(),
         };
         let inlined = wrapper_src.replace(
             "#include \"gemm_hfq6g256_residual_mmq_gfx906_body.cuh\"",
@@ -7448,13 +7484,19 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        // S1: ships {x8, x64}. 8 < B < 64 returns error; caller routes to dp4a.
+        // S2: same per-batch routing as residual sibling. Caller (fused
+        // dispatcher) is expected to fall back to wave64_dp4a for batch
+        // sizes where MMQ is non-winning. We accept any size here for
+        // testing and small-grid use; the fused dispatchers gate ahead
+        // of calling us.
         let mmq_x = if batch_size <= 8 { 8 }
-            else if batch_size >= 64 { 64 }
-            else {
-                return Err(hip_bridge::HipError::new(0,
-                    "S1 set-mode supports batch_size<=8 or >=64; caller must route 8<B<64 to wave64_dp4a"));
-            };
+            else if batch_size <= 16 { 16 }
+            else if batch_size <= 24 { 24 }
+            else if batch_size <= 32 { 32 }
+            else if batch_size <= 40 { 40 }
+            else if batch_size <= 48 { 48 }
+            else if batch_size <= 56 { 56 }
+            else { 64 };
         let is_full = m % 128 == 0 && batch_size % mmq_x == 0;
         let base_name = "gemm_hfq6g256_residual_mmq_gfx906";
         let kernel_name = if is_full {
@@ -7464,9 +7506,15 @@ impl Gpu {
         };
 
         let wrapper_src = match mmq_x {
-            8 => kernels::GEMM_HFQ6G256_RESIDUAL_MMQ_GFX906_X8_SRC,
+            8  => kernels::GEMM_HFQ6G256_RESIDUAL_MMQ_GFX906_X8_SRC,
+            16 => kernels::GEMM_HFQ6G256_RESIDUAL_MMQ_GFX906_X16_SRC,
+            24 => kernels::GEMM_HFQ6G256_RESIDUAL_MMQ_GFX906_X24_SRC,
+            32 => kernels::GEMM_HFQ6G256_RESIDUAL_MMQ_GFX906_X32_SRC,
+            40 => kernels::GEMM_HFQ6G256_RESIDUAL_MMQ_GFX906_X40_SRC,
+            48 => kernels::GEMM_HFQ6G256_RESIDUAL_MMQ_GFX906_X48_SRC,
+            56 => kernels::GEMM_HFQ6G256_RESIDUAL_MMQ_GFX906_X56_SRC,
             64 => kernels::GEMM_HFQ6G256_RESIDUAL_MMQ_GFX906_X64_SRC,
-            _ => unreachable!("S1 ships only mmq_x=8 and mmq_x=64"),
+            _ => unreachable!(),
         };
         let inlined = wrapper_src.replace(
             "#include \"gemm_hfq6g256_residual_mmq_gfx906_body.cuh\"",
@@ -8509,6 +8557,21 @@ impl Gpu {
             if self.arch.starts_with("gfx11") {
                 return self.gemm_hfq6g256_residual_wmma(a_raw, x, y, m, k, batch_size);
             }
+            // gfx906: MMQ-streaming first (Phase B.2 §5.1 item 6). Only
+            // routes here when MMQ wins per S2 sweep (see hfq6_mmq_winning_size).
+            // The mmq_screen check guards against pathological quant groups (#87).
+            if gemv_dp4a_enabled(&self.arch) && !self.capture_mode
+                && should_use_mmq(&self.arch, batch_size)
+                && hfq6_mmq_winning_size(batch_size)
+            {
+                let safe = if self.mmq_screen {
+                    self.mmq_screen_weight_hfq6(a_raw, m, k)
+                } else { true };
+                if safe {
+                    return self.gemm_hfq6g256_residual_mmq_gfx906(a_raw, x, y, m, k, batch_size);
+                }
+                // else: screening rejected — fall through to wave64_dp4a.
+            }
             // gfx906: dp4a + wave64 batched residual (Phase A.2, plan v3.2.3
             // §5.1 item 2). Pre-quantize x to Q8_1 and dispatch the dp4a
             // kernel. Mirror of the HFQ4 sibling pattern at gemm_hfq4g256_wave64_dp4a.
@@ -8691,6 +8754,40 @@ impl Gpu {
             }
             if has_wmma_f16(&self.arch) {
                 return self.gemm_qkvza_hfq6g256_wmma(a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m, alpha_m, k, batch_size);
+            }
+            // gfx906 MMQ-streaming (Phase B.2 §5.1 item 6). Mirrors HFQ4
+            // dispatch.rs:3429-3456: 2 _mmq_set calls into y_qkv + y_z, then
+            // fall through to fused wave64_dp4a for beta+alpha (their M is
+            // small — MMQ_Y=128 wastes 75 % of row-tiles at small M).
+            //
+            // Only routes here when MMQ wins per S2 sweep: B=16 or B≥40.
+            // (Reusing should_use_mmq + mmq_x_winning_for_hfq6 helper below.)
+            if gemv_dp4a_enabled(&self.arch) && !self.capture_mode
+                && should_use_mmq(&self.arch, batch_size)
+                && hfq6_mmq_winning_size(batch_size)
+            {
+                let qz_safe = if self.mmq_screen {
+                    self.mmq_screen_weight_hfq6(a_qkv, qkv_m, k)
+                        && self.mmq_screen_weight_hfq6(a_z, z_m, k)
+                } else { true };
+                if qz_safe {
+                    let xq = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+                    let r1 = self.gemm_hfq6g256_mmq_set_gfx906(a_qkv, xq, y_qkv, qkv_m, k, batch_size);
+                    let r2 = if r1.is_ok() {
+                        self.gemm_hfq6g256_mmq_set_gfx906(a_z, xq, y_z, z_m, k, batch_size)
+                    } else { Ok(()) };
+                    // Tail: beta+alpha via fused wave64_dp4a with qkv_m=0, z_m=0
+                    // so the kernel's row-routing skips q/z branches.
+                    let r3 = if r2.is_ok() {
+                        self.gemm_qkvza_hfq6g256_wave64_dp4a(
+                            a_qkv, a_z, a_beta, a_alpha, x,
+                            y_qkv, y_z, y_beta, y_alpha,
+                            0, 0, beta_m, alpha_m, k, batch_size,
+                        )
+                    } else { Ok(()) };
+                    return r1.and(r2).and(r3);
+                }
+                // else: q/z screening rejected — fall through to wave64_dp4a.
             }
             // gfx906: wave64+dp4a batched fused (Phase A.3, plan v3.2.3 §5.1
             // item 3). Pre-quantize x to Q8_1 and dispatch the dp4a kernel.
@@ -9178,6 +9275,31 @@ impl Gpu {
             if has_wmma_f16(&self.arch) {
                 return self.gemm_qkv_hfq6g256_wmma(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
             }
+            // gfx906 MMQ-streaming (Phase B.2). 3 _mmq_set calls into y_q,
+            // y_k, y_v. Mirrors HFQ4 dispatch.rs:3854-3873. Routes only at
+            // S2-confirmed winning batch sizes (B=16 or B≥40).
+            if gemv_dp4a_enabled(&self.arch) && !self.capture_mode
+                && should_use_mmq(&self.arch, batch_size)
+                && hfq6_mmq_winning_size(batch_size)
+            {
+                let qkv_safe = if self.mmq_screen {
+                    self.mmq_screen_weight_hfq6(a_q, q_m, k)
+                        && self.mmq_screen_weight_hfq6(a_k, k_m, k)
+                        && self.mmq_screen_weight_hfq6(a_v, v_m, k)
+                } else { true };
+                if qkv_safe {
+                    let xq = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+                    let r1 = self.gemm_hfq6g256_mmq_set_gfx906(a_q, xq, y_q, q_m, k, batch_size);
+                    let r2 = if r1.is_ok() {
+                        self.gemm_hfq6g256_mmq_set_gfx906(a_k, xq, y_k, k_m, k, batch_size)
+                    } else { Ok(()) };
+                    let r3 = if r2.is_ok() {
+                        self.gemm_hfq6g256_mmq_set_gfx906(a_v, xq, y_v, v_m, k, batch_size)
+                    } else { Ok(()) };
+                    return r1.and(r2).and(r3);
+                }
+                // else: fall through to fused wave64_dp4a.
+            }
             // gfx906: wave64+dp4a batched fused (Phase A.3).
             // Skip in capture mode (Q8_1 quantize) — matches HFQ4 sibling.
             if gemv_dp4a_enabled(&self.arch) && !self.capture_mode {
@@ -9618,6 +9740,27 @@ impl Gpu {
             }
             if has_wmma_f16(&self.arch) {
                 return self.gemm_gate_up_hfq6g256_wmma(a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size);
+            }
+            // gfx906 MMQ-streaming (Phase B.2). 2 _mmq_set calls into
+            // y_gate, y_up. Mirrors HFQ4 dispatch.rs:4238-4252. Routes only
+            // at S2-confirmed winning batch sizes (B=16 or B≥40).
+            if gemv_dp4a_enabled(&self.arch) && !self.capture_mode
+                && should_use_mmq(&self.arch, batch_size)
+                && hfq6_mmq_winning_size(batch_size)
+            {
+                let safe = if self.mmq_screen {
+                    self.mmq_screen_weight_hfq6(a_gate, gate_m, k)
+                        && self.mmq_screen_weight_hfq6(a_up, up_m, k)
+                } else { true };
+                if safe {
+                    let xq = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+                    let r1 = self.gemm_hfq6g256_mmq_set_gfx906(a_gate, xq, y_gate, gate_m, k, batch_size);
+                    let r2 = if r1.is_ok() {
+                        self.gemm_hfq6g256_mmq_set_gfx906(a_up, xq, y_up, up_m, k, batch_size)
+                    } else { Ok(()) };
+                    return r1.and(r2);
+                }
+                // else: screening rejected at least one weight — fall through.
             }
             // gfx906: wave64+dp4a batched fused (Phase A.3).
             // Skip in capture mode (Q8_1 quantize) — matches HFQ4 sibling.

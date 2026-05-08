@@ -431,6 +431,88 @@ Path 2 is the right next move per the v3.2.5 errata sequencing.
 Path 1's room is exhausted with BT=16 + single-wave 64-thread
 blocks.
 
+## Phase B.2: HFQ6 MMQ-streaming port — RESULT
+
+Implementation: `docs/plans/gfx906-mq6-mmq-port-phase-b2.md` v2.1
+sessions S1+S2+S3. Three commits on audit branch
+(`feat/gfx906-hfq6-hfq8-analysis`):
+
+- `8755a35` — S1: body.cuh + x8 + x64 + 2 Rust dispatchers + screen
+- *(S2 commit pending)* — size sweep x16-x56 + dispatcher routing
+- *(S3 commit pending)* — rewire 4 fused/residual dispatchers
+
+### End-to-end mq6 9B prefill (5-run JIT-warm, spread 0.16 %)
+
+| State | Prefill pp128 | Decode g50 | Δ vs prior |
+|---|---:|---:|---:|
+| Pre-Phase-B (BT=8 baseline) | 165.8 | 42.5 | — |
+| HEAD before B.2 (`ff9e210`, BT=16) | 190.8 | 44.0 | +15 % |
+| **Phase B.2 S3 (MMQ wired)** | **561.2** | **43.7** | **+194 %** |
+| mq4 reference (audit HEAD) | 598.7 | n/a | — |
+| **mq6/mq4 ratio** | **0.937** | | gap closed 3.14× → 1.07× |
+
+**Result: 561.2 tok/s — exceeds the v2 plan's stretch target (450)
+by 25 %; within 6 % of mq4 prefill parity.** Bandwidth-bound floor
+of 407 tok/s (mq4/1.47) is exceeded by 38 % — the win is bigger
+than 1.47× weight-byte overhead would predict, suggesting MMQ
+amortizes more than just the per-byte cost (Q8_1 quantize sharing
+across sibling projections + LDS-stage A reuse across batch tiles).
+
+Decode unchanged at 43.7 tok/s (within 0.6 % of pre-B.2 baseline).
+The MMQ path is gated by `should_use_mmq && hfq6_mmq_winning_size`
+and never fires at B=1, so AR decode is unaffected by design.
+
+### Per-call kernel timings (microbench, M=3584, K=4096)
+
+S1.5 GO/NO-GO threshold (≥10 % over wave64_dp4a) was anchored on
+B=8 in the v2 plan. At B=8, MMQ is actually 16 % SLOWER (block-size
+mismatch with small grid; PMC: 112 waves vs 1792 for dp4a, VALUBusy
+9 % vs 33 %). The threshold was the wrong reference workload.
+Production prefill is B=128, where MMQ x64 wins big:
+
+| Batch | mmq_x | MMQ µs | wave64_dp4a µs | Speedup |
+|---:|---:|---:|---:|---:|
+|   8 |  8 |  158 |  135 | 0.86× ❌ |
+|  16 | 16 |  199 |  243 | 1.22× ✓ |
+|  24 | 24 |  275 |  297 | 1.08× marginal |
+|  32 | 32 |  381 |  366 | 0.96× marginal |
+|  40 | 40 |  415 |  470 | 1.13× ✓ |
+|  48 | 48 |  466 |  588 | 1.26× ✓ |
+|  56 | 56 |  542 |  657 | 1.21× ✓ |
+|  64 | 64 |  475 |  720 | 1.51× ✓ |
+|  96 | 64 |  469 | 1082 | 2.31× ✓ |
+| 128 | 64 |  485 | 1470 | **3.03×** ✓ |
+
+Dispatcher routes MMQ only at B=16 or B≥40 (helper
+`hfq6_mmq_winning_size`). B=24/32 fall through to wave64_dp4a — the
+intermediate sizes are non-monotonic and not worth a regression risk
+in S3 dispatch. Future S5 PMC stride sweep may close this gap.
+
+### Cross-quant validation (LANDMINE discriminator)
+
+Constant-weight test (`q ≡ 5`, `x ≡ 1.0`, expected
+`Σ = M·K·(sc·q + zp) = 10240`): max_dev=0.125. Both math-identity
+landmines from plan §3.1 (x_dm shift compensation, 0.25f factor)
+clear by absolute equality.
+
+Cross-architecture (MMQ vs wave64_dp4a at B=8): max_abs_err=0.00009
+on a M=128 K=4096 random workload — essentially bit-exact.
+
+Per-mmq_x sweep (M=128 K=4096, B=mmq_x for each ∈ {8,16,24,32,40,48,56,64}):
+NRMSE 0.00031-0.00033 across all 8 sizes, no size-specific bug.
+
+### Coherence
+
+7/7 OK on the post-MMQ-wired daemon (mq3, mq4, mq6 prompts).
+
+The 9b.mq6 reasoning prompt's prefill_tok_s in the coherence harness
+stays at ~175.8 — same as pre-B.2 — because the prompt is 36 tokens
+and `hfq6_mmq_winning_size(36) == false` (sizes 17-39 fall through to
+wave64_dp4a per the S2 routing decision). MMQ wins materialize at
+B=16 and B≥40, not at intermediate sizes. **The pp128 wall-clock
+gain (190.8 → 561.2) is the headline number; coherence-harness
+pp36 is not a regression test for B.2 by design.**
+
 ## Cross-references
 
 - Plan: `docs/plans/gfx906-mq6-mq8-port.md` v3.2.3 (commit `d02dc95`)
