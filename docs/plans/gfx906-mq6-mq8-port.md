@@ -475,7 +475,13 @@ v3.2.5 framed this as "stretch"; we hit it.
   ~½ session of investigation.
 - MoE-indexed HFQ6 MMQ (plan v3.2.4 item 4): no MoE mq6 model on
   disk, defer until one ships.
-- `audit-dispatch-coverage.sh` (plan v3.2.4 item 13): still pending.
+- `audit-dispatch-coverage.sh` (plan v3.2.4 item 13): **closed** — script
+  shipped in repo at `scripts/audit-dispatch-coverage.sh`, runs the
+  per-quant DType matcher coverage audit (the silent-corruption gate
+  from plan §5.4 part 2). Surfaces 14 pre-existing MQ-family coverage
+  gaps in qwen35.rs (MQ8 missing from 14 matchers, MQ2 missing from
+  several) which are out-of-scope for Phase B.2 but worth fixing in
+  a separate cleanup PR.
 - Phase A defensive `assert!(gemv_dp4a_enabled(arch))` on dp4a Rust
   fns (plan v3.2.4 item 6): still pending.
 - DFlash spec-verify mq6 baseline: project has no DFlash + mq6

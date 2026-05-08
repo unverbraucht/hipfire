@@ -3021,6 +3021,9 @@ impl Gpu {
         q_m: usize, k_m: usize, v_m: usize,
         k: usize,
     ) -> HipResult<()> {
+        // bind_thread: skip — delegated via ensure_q8_1_mmq_x
+        debug_assert!(gemv_dp4a_enabled(&self.arch),
+            "fused_qkv_hfq4g256_dp4a called on arch={} without dp4a — caller bug", self.arch);
         let xq_ptr = self.ensure_q8_1_mmq_x(x, 1, k)?;
 
         self.ensure_kernel(
@@ -3088,6 +3091,9 @@ impl Gpu {
         q_m: usize, k_m: usize, v_m: usize,
         k: usize,
     ) -> HipResult<()> {
+        // bind_thread: skip — delegated via ensure_q8_1_mmq_x
+        debug_assert!(gemv_dp4a_enabled(&self.arch),
+            "fused_qkv_hfq6g256_dp4a called on arch={} without dp4a — caller bug", self.arch);
         let xq_ptr = self.ensure_q8_1_mmq_x(x, 1, k)?;
 
         self.ensure_kernel(
@@ -3146,6 +3152,9 @@ impl Gpu {
         qkv_m: usize, z_m: usize, beta_m: usize, alpha_m: usize,
         k: usize,
     ) -> HipResult<()> {
+        // bind_thread: skip — delegated via ensure_q8_1_mmq_x
+        debug_assert!(gemv_dp4a_enabled(&self.arch),
+            "fused_qkvza_hfq6g256_dp4a called on arch={} without dp4a — caller bug", self.arch);
         let xq_ptr = self.ensure_q8_1_mmq_x(x, 1, k)?;
 
         self.ensure_kernel(
@@ -3212,6 +3221,9 @@ impl Gpu {
         gate_m: usize, up_m: usize,
         k: usize,
     ) -> HipResult<()> {
+        // bind_thread: skip — delegated via ensure_q8_1_mmq_x
+        debug_assert!(gemv_dp4a_enabled(&self.arch),
+            "fused_gate_up_hfq6g256_dp4a called on arch={} without dp4a — caller bug", self.arch);
         let xq_ptr = self.ensure_q8_1_mmq_x(x, 1, k)?;
 
         self.ensure_kernel(
@@ -3447,6 +3459,9 @@ impl Gpu {
         qkv_m: usize, z_m: usize, beta_m: usize, alpha_m: usize,
         k: usize,
     ) -> HipResult<()> {
+        // bind_thread: skip — delegated via ensure_q8_1_mmq_x
+        debug_assert!(gemv_dp4a_enabled(&self.arch),
+            "fused_qkvza_hfq4g256_dp4a called on arch={} without dp4a — caller bug", self.arch);
         let xq_ptr = self.ensure_q8_1_mmq_x(x, 1, k)?;
 
         self.ensure_kernel(
@@ -6242,6 +6257,7 @@ impl Gpu {
         n_exp: usize,
         norm_topk: bool,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "moe_topk_renorm_k8",
             kernels::MOE_TOPK_RENORM_K8_SRC,
@@ -6468,6 +6484,7 @@ impl Gpu {
         norm_topk: bool,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "moe_topk_renorm_k8_batched",
             kernels::MOE_TOPK_RENORM_K8_BATCHED_SRC,
@@ -7163,6 +7180,8 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        // bind_thread: skip — delegated via ensure_q8_1_mmq_x and
+        //   gemm_hfq4g256_residual_fp16_wave64 in the diag passthrough path
         // DIAGNOSTIC: HIPFIRE_MMQ_DIAG_PASSTHROUGH=1 forwards to the FP16
         // wave64 kernel instead of running the dp4a kernel.
         if std::env::var("HIPFIRE_MMQ_DIAG_PASSTHROUGH").ok().as_deref() == Some("1") {
@@ -7283,6 +7302,8 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        // bind_thread: skip — caller already pre-quantized x via
+        //   ensure_q8_1_mmq_x (which bind_threads); we only launch kernels.
         let mmq_x = if batch_size <= 8 { 8 }
             else if batch_size <= 16 { 16 }
             else if batch_size <= 24 { 24 }
@@ -7391,6 +7412,8 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        // bind_thread: skip — delegated via ensure_q8_1_mmq_x and
+        //   gemm_hfq6g256_residual_fp16 in the diag passthrough path
         // DIAG: HIPFIRE_HFQ6_MMQ_DIAG_PASSTHROUGH=1 redirects to fp16 reference
         // for numerical-correctness bisection (MMQ vs FP16). Mirrors HFQ4 at
         // dispatch.rs:7132.
@@ -7400,20 +7423,29 @@ impl Gpu {
         // Quantize activations to Q8_1 (shared layout with HFQ4).
         let x_q8_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
 
-        // S2: full size sweep, with per-batch routing.
+        // S2 + v3.2.6 b128-cliff fix: per-batch routing.
         //
         // Per-batch perf bench (M=3584 K=4096, MMQ vs wave64_dp4a, speedup):
         //   B=8     → 0.86× ❌ regression — MMQ block too coarse
         //   B=9-15  → unmeasured — conservatively route to dp4a
         //   B=16    → 1.22× ✓
-        //   B=17-32 → 0.96-1.08× ❌ marginal — route to dp4a
-        //   B=33-39 → unmeasured — conservatively route to dp4a
-        //   B=40    → 1.13× ✓
-        //   B=41+   → 1.21×-3.03× ✓ monotonically improving
+        //   B=17-23 → unmeasured
+        //   B=24    → 1.08× marginal — route to dp4a
+        //   B=25-31 → unmeasured
+        //   B=32    → 1.15× ✓ (post b128-cliff fix at mmq_x>=32)
+        //   B=33-39 → unmeasured
+        //   B=40    → 1.35× ✓
+        //   B=41-63 → 1.26×-1.51× ✓
+        //   B=64+   → 1.51×-3.03× ✓ monotonically improving
         //
-        // Only enable MMQ where we have a measured win >10%.
-        // Future: refine this map as more batch sizes are benched.
+        // Under capture mode (DFlash), the wave64_dp4a fallback is
+        // hipMemset_async-unsafe (commit fa8785b). Caller (high-level
+        // dispatcher) gates capture entry via `hfq6_mmq_route` so we
+        // shouldn't fall through here under capture, but defensively we
+        // still avoid calling wave64_dp4a from within an MMQ-entered
+        // call when capture_mode is set.
         let mmq_x_opt: Option<u32> = if batch_size == 16 { Some(16) }
+            else if batch_size >= 32 && batch_size <= 39 { Some(32) }
             else if batch_size >= 40 && batch_size <= 47 { Some(40) }
             else if batch_size >= 48 && batch_size <= 55 { Some(48) }
             else if batch_size >= 56 && batch_size <= 63 { Some(56) }
@@ -7421,7 +7453,17 @@ impl Gpu {
             else { None };
         let mmq_x = match mmq_x_opt {
             Some(x) => x as usize,
-            None => return self.gemm_hfq6g256_residual_wave64_dp4a(a_raw, x, y, m, k, batch_size),
+            None => {
+                // Conservative fallback. Under capture the dp4a kernel's
+                // memset_async would corrupt the captured stream — but the
+                // gating helper already prevented entry here under capture
+                // for non-winning sizes, so this is unreachable under
+                // capture in well-gated callers.
+                debug_assert!(!self.capture_mode,
+                    "MMQ fallback to wave64_dp4a entered under capture (B={batch_size}) — \
+                     hfq6_mmq_route should have prevented this");
+                return self.gemm_hfq6g256_residual_wave64_dp4a(a_raw, x, y, m, k, batch_size);
+            }
         };
         let is_full = m % 128 == 0 && batch_size % mmq_x == 0;
         let base_name = "gemm_hfq6g256_residual_mmq_gfx906";
@@ -7526,6 +7568,8 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        // bind_thread: skip — caller already pre-quantized x via
+        //   ensure_q8_1_mmq_x (which bind_threads); we only launch kernels.
         // S2: same per-batch routing as residual sibling. Caller (fused
         // dispatcher) is expected to fall back to wave64_dp4a for batch
         // sizes where MMQ is non-winning. We accept any size here for
@@ -8256,6 +8300,9 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        // bind_thread: skip — delegated via ensure_q8_1_mmq_x
+        debug_assert!(gemv_dp4a_enabled(&self.arch),
+            "gemm_hfq4g256_dp4a called on arch={} without dp4a — caller bug", self.arch);
         // Quantize x → Xq[K/128 * batch_size] block_q8_1_mmq via the
         // shared scratch. Stride layout: kblock-major (matches
         // quantize_q8_1_mmq_ds4 at gemm_hfq4g256_residual_mmq.hip:80).
@@ -8557,6 +8604,9 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        // bind_thread: skip — delegated via ensure_q8_1_mmq_x
+        debug_assert!(gemv_dp4a_enabled(&self.arch),
+            "gemm_hfq6g256_residual_wave64_dp4a called on arch={} without dp4a — caller bug", self.arch);
         let xq_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
 
         self.ensure_kernel(
@@ -9030,6 +9080,9 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        // bind_thread: skip — delegated via ensure_q8_1_mmq_x
+        debug_assert!(gemv_dp4a_enabled(&self.arch),
+            "gemm_qkvza_hfq6g256_wave64_dp4a called on arch={} without dp4a — caller bug", self.arch);
         let xq_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
 
         self.ensure_kernel(
@@ -9524,6 +9577,9 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        // bind_thread: skip — delegated via ensure_q8_1_mmq_x
+        debug_assert!(gemv_dp4a_enabled(&self.arch),
+            "gemm_qkv_hfq6g256_wave64_dp4a called on arch={} without dp4a — caller bug", self.arch);
         let xq_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
 
         self.ensure_kernel(
@@ -9972,6 +10028,9 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        // bind_thread: skip — delegated via ensure_q8_1_mmq_x
+        debug_assert!(gemv_dp4a_enabled(&self.arch),
+            "gemm_gate_up_hfq6g256_wave64_dp4a called on arch={} without dp4a — caller bug", self.arch);
         let xq_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
 
         self.ensure_kernel(
@@ -11372,6 +11431,9 @@ impl Gpu {
         y_gate: &GpuTensor, y_up: &GpuTensor,
         gate_m: usize, up_m: usize, k: usize,
     ) -> HipResult<()> {
+        // bind_thread: skip — delegated via ensure_q8_1_mmq_x
+        debug_assert!(gemv_dp4a_enabled(&self.arch),
+            "fused_gate_up_hfq4g256_dp4a called on arch={} without dp4a — caller bug", self.arch);
         // Quantize x → Xq[K/128] block_q8_1_mmq via the existing shared
         // scratch path. Batch=1 for GEMV.
         let xq_ptr = self.ensure_q8_1_mmq_x(x, 1, k)?;
