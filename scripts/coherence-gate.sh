@@ -91,6 +91,21 @@ SHORT_TESTS=(
     # drift between bit-widths is comparable.
     "qwen3.5-9b.mq3|reason-mq3|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|300"
     "qwen3.5-27b.mq3|cap-mq3-27b|What is the capital of France? Answer in one short sentence.|80"
+    # MQ3-Lloyd coverage (PR #115 — research-gated format, --allow-mq3-lloyd
+    # at quantize time only; no runtime gate). 4B + 9B exercise the K4 +
+    # fp32-LDS-codebook gfx1100 kernel + tail-rotation logic. Runs anywhere
+    # with the model file present.
+    "qwen3.5-4b.mq3-lloyd|cap-mq3-lloyd-4b|What is the capital of France? Answer in one short sentence.|80"
+    "qwen3.5-9b.mq3-lloyd|reason-mq3-lloyd-9b|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|300"
+    # MQ3-Lloyd batched-prefill coverage (companion to issue #116 Phase B2).
+    # Uses a ~180-token prompt (well above MIN_BATCH=2) to exercise the
+    # batched-prefill path's new WMMA fused kernels (qkv, qkvza, gate_up,
+    # residual) under a realistic single-chunk forward. Prompt is loaded
+    # from benchmarks/prompts/coherence_lloyd_long.txt — referenced by
+    # md5 below to detect drift (per CLAUDE.md prompt-md5 rule).
+    #   md5(coherence_lloyd_long.txt) = f20bbc4f5b88ab5f7b44fe7c7da0e2e3
+    "qwen3.5-4b.mq3-lloyd|long-prefill-mq3-lloyd-4b|@coherence_lloyd_long.txt|220"
+    "qwen3.5-9b.mq3-lloyd|long-prefill-mq3-lloyd-9b|@coherence_lloyd_long.txt|220"
     # MQ6 coverage — different quant family (HFQ6-G256, 200 B/group). Used
     # as a regression-safety check that gfx906's new HFQ4 dp4a/prefetch
     # defaults don't disturb the mq6 dispatch routing. Skipped if model
@@ -130,6 +145,23 @@ for entry in "${tests[@]}"; do
         echo "## $model_file — $prompt_id — SKIPPED (model not present)" >> "$OUT"
         echo >> "$OUT"
         continue
+    fi
+
+    # `@filename` syntax: read the user prompt from benchmarks/prompts/<file>.
+    # Used for long-prompt batched-prefill rows where embedding the prompt
+    # inline would violate CLAUDE.md's prompt-md5 rule (heredocs in scripts
+    # are reformatting-sensitive, breaking byte-identical reproduction).
+    prompt_md5=""
+    prompt_ref=""
+    if [ "${prompt:0:1}" = "@" ]; then
+        prompt_ref="${prompt:1}"
+        prompt_path="benchmarks/prompts/$prompt_ref"
+        if [ ! -f "$prompt_path" ]; then
+            echo "## $model_file — $prompt_id — SKIPPED (prompt file $prompt_path not found)" >> "$OUT"
+            continue
+        fi
+        prompt=$(cat "$prompt_path")
+        prompt_md5=$(md5sum "$prompt_path" | awk '{print $1}')
     fi
 
     # Optional system prompt: load from benchmarks/prompts/ if specified
@@ -211,7 +243,11 @@ print("".join(json.loads(l).get("text","") for l in sys.stdin if "token" in l))'
         if [ -n "$done_line" ]; then
             echo "- stats: \`$done_line\`"
         fi
-        echo "- prompt: \"$prompt\""
+        if [ -n "$prompt_md5" ]; then
+            echo "- prompt: \`@$prompt_ref\` (md5: \`$prompt_md5\`)"
+        else
+            echo "- prompt: \"$prompt\""
+        fi
         echo
         if [ -n "$panic" ]; then
             echo '**PANIC/ERROR DETECTED:**'

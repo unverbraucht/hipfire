@@ -641,6 +641,15 @@ function buildLoadMessage(path: string, tag?: string | null): any {
 
 const HF_BASE = "https://huggingface.co";
 
+function hfHeaders(): Record<string, string> {
+  const h: Record<string, string> = {
+    "User-Agent": "hipfire",
+  };
+  const token = process.env.HF_TOKEN;
+  if (token) h["Authorization"] = `Bearer ${token}`;
+  return h;
+}
+
 interface ModelEntry {
   /// Empty string = local-only. `pull()` short-circuits with a clear message
   /// instead of attempting a 404'ing fetch against a HF repo that doesn't
@@ -954,12 +963,14 @@ class Engine {
 
   async start() {
     const exe = process.platform === "win32" ? ".exe" : "";
+    const envBin = process.env.HIPFIRE_DAEMON_BIN;
     const bins = [
+      ...(envBin ? [envBin] : []),
       resolve(__dirname, `../target/release/examples/daemon${exe}`),
       join(HIPFIRE_DIR, "bin", `daemon${exe}`),
     ];
     const bin = bins.find(p => existsSync(p));
-    if (!bin) throw new Error("daemon not found. cargo build --release --features deltanet --example daemon -p engine");
+    if (!bin) throw new Error("daemon not found. cargo build --release --features deltanet --example daemon -p hipfire-runtime");
 
     this.proc = spawn([bin], { stdin: "pipe", stdout: "pipe", stderr: "inherit", env: { ...process.env } });
     this.reader = this.proc.stdout!.getReader();
@@ -1108,7 +1119,7 @@ async function pull(tag: string): Promise<string> {
   console.error(`Pulling ${resolved} (${entry.size_gb}GB)...`);
   console.error(`  ${url}`);
 
-  const res = await fetch(url);
+  const res = await fetch(url, { headers: hfHeaders() });
   if (!res.ok) {
     console.error(`Download failed: ${res.status} ${res.statusText}`);
     console.error(`URL: ${url}`);
@@ -1156,7 +1167,7 @@ async function pull(tag: string): Promise<string> {
       const sidecarUrl = `${HF_BASE}/${entry.repo}/resolve/main/${entry.triattn.file}`;
       console.error(`  Fetching TriAttention sidecar: ${entry.triattn.file}`);
       try {
-        const sres = await fetch(sidecarUrl);
+        const sres = await fetch(sidecarUrl, { headers: hfHeaders() });
         if (!sres.ok) {
           console.error(`  WARN: sidecar fetch failed (${sres.status} ${sres.statusText}) — model is usable, run hipfire config cask-profile off to silence.`);
         } else {
@@ -4281,7 +4292,7 @@ switch (cmd) {
     // Rebuild
     console.error("Rebuilding daemon (this may take a few minutes)...");
     const build = Bun.spawnSync(
-      [CARGO_BIN, "build", "--release", "--features", "deltanet", "--example", "daemon", "--example", "infer", "--example", "run", "-p", "engine"],
+      [CARGO_BIN, "build", "--release", "--features", "deltanet", "--example", "daemon", "--example", "infer", "--example", "run", "-p", "hipfire-runtime"],
       { cwd: repoDir, stdio: ["inherit", "inherit", "inherit"], env: { ...process.env } }
     );
     if (build.exitCode !== 0) {
@@ -4291,7 +4302,7 @@ switch (cmd) {
       console.error("  daemon binary was NOT rebuilt.");
       console.error("");
       console.error("  To diagnose:  hipfire diag");
-      console.error("  To retry:     cd ~/.hipfire/src && cargo build --release --features deltanet -p engine --example daemon");
+      console.error("  To retry:     cd ~/.hipfire/src && cargo build --release --features deltanet -p hipfire-runtime --example daemon");
       process.exit(1);
     }
     // Build the CPU quantizer binary too so `hipfire quantize` works out of the box.
@@ -4477,7 +4488,9 @@ switch (cmd) {
     // ── 4. Daemon binary + models ──────────────────────────
     console.log("");
     const exe2 = process.platform === "win32" ? ".exe" : "";
+    const envBin2 = process.env.HIPFIRE_DAEMON_BIN;
     const daemonBins = [
+      ...(envBin2 ? [envBin2] : []),
       resolve(__dirname, `../target/release/examples/daemon${exe2}`),
       join(HIPFIRE_DIR, "bin", `daemon${exe2}`),
     ];
