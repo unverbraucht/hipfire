@@ -691,6 +691,20 @@ fn load_norm_weight_raw(hfq: &HfqFile, gpu: &mut Gpu, name: &str, shape: &[usize
     gpu.upload_f32(&f32_data, shape)
 }
 
+/// Should the MoE final norm fall back to the pre-fix raw load (no `+= 1.0`)?
+///
+/// Default is false (correct GemmaRMSNorm convention for everyone). Setting
+/// `HIPFIRE_QWEN_MOE_FINAL_NORM_RAW=1` opts MoE models back into the
+/// pre-93c015e under-scaled behavior. See `load_weights` (the main load
+/// path) for the rationale block, and `docs/plans/qwen35-moe-rmsnorm-fix.md`
+/// for the full audit trail.
+fn moe_final_norm_raw_fallback(num_experts: usize) -> bool {
+    num_experts > 0
+        && std::env::var("HIPFIRE_QWEN_MOE_FINAL_NORM_RAW")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+}
+
 
 /// Load weight tensor from raw bytes + quant_type (no name lookup needed).
 fn load_weight_tensor_raw(gpu: &Gpu, quant_type: u8, data: &[u8], m: usize, k: usize) -> HipResult<WeightTensor> {
@@ -1240,11 +1254,7 @@ pub fn load_weights(hfq: &mut HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> 
     // prompts, set `HIPFIRE_QWEN_MOE_FINAL_NORM_RAW=1` to fall back to the
     // old behavior while the underlying MoE precision bug gets a separate
     // audit. Default is correct convention for everyone.
-    let moe_raw_fallback = config.num_experts > 0
-        && std::env::var("HIPFIRE_QWEN_MOE_FINAL_NORM_RAW")
-            .map(|v| v == "1")
-            .unwrap_or(false);
-    let output_norm = if moe_raw_fallback {
+    let output_norm = if moe_final_norm_raw_fallback(config.num_experts) {
         eprintln!("    HIPFIRE_QWEN_MOE_FINAL_NORM_RAW=1: skipping +1 bake on MoE final norm (workaround mode)");
         load_norm_weight_raw(hfq, gpu, "norm.weight", &[config.dim])?
     } else {
@@ -1476,11 +1486,8 @@ fn load_output_into(
     eprintln!("  loading output_norm...");
     // See the matching block in the main load path for the rationale and
     // the `HIPFIRE_QWEN_MOE_FINAL_NORM_RAW` env-var fallback.
-    let moe_raw_fallback = config.num_experts > 0
-        && std::env::var("HIPFIRE_QWEN_MOE_FINAL_NORM_RAW")
-            .map(|v| v == "1")
-            .unwrap_or(false);
-    let output_norm = if moe_raw_fallback {
+    let output_norm = if moe_final_norm_raw_fallback(config.num_experts) {
+        eprintln!("    HIPFIRE_QWEN_MOE_FINAL_NORM_RAW=1: skipping +1 bake on MoE final norm (workaround mode)");
         load_norm_weight_raw(hfq, gpu, "norm.weight", &[config.dim])?
     } else {
         load_norm_weight(hfq, gpu, "norm.weight", &[config.dim])?
