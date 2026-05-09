@@ -621,7 +621,7 @@ path to defensively catch capture-mode misuse.
 | audit-dispatch-coverage.sh | ✓ shipped (v3.2.4 item 13) |
 | Defensive asserts on dp4a fns | ✓ shipped (v3.2.4 item 6) |
 | bind_thread audit clean | ✓ shipped (v3.2.7) |
-| MoE-indexed HFQ6 MMQ | ⚠️ deferred (no MoE mq6 model exists) |
+| MoE-indexed HFQ6 MMQ | ⚠️ deferred (no MoE mq6 model exists; 4 dispatch sites scoped in v3.2.8) |
 | 27B Qwen3.5 (vs 3.6) regression | ⚠️ deferred (used 3.6 as proxy) |
 | B=24 b32-path marginal optimization | ⚠️ low-value micro-optimization |
 
@@ -639,6 +639,94 @@ fix = 3.18× over the pre-fix baseline (4.74 → 15.05).
 **References:**
 - v3.2.7 commits: `3ac7a3d`, `fa8785b`, `8528923`
 - Dev-log: `docs/perf-checkpoints/2026-05-07-phase-a-cumulative-mq6.md`
+
+### v3.2.8 errata (2026-05-08): MoE+HFQ6 dispatcher gap audit (post-merge sanity check)
+
+Surfaced during a structural audit of the upstream/master merge commit
+(merge `32cfa61` of 41 upstream commits). Pre-existing gap, **not a
+merge regression** — every HFQ6 reference that existed pre-merge is
+preserved post-merge (verified: la4_hfq6 6→6, fa3_hfq6 10→10,
+gu_hfq6 10→10).
+
+**The gap:** the v3.2.7 BLOCKER fix `5ea9050` (C1-MULTIGPU-HFQ6)
+added the `fused_la4_hfq6` arm to `forward_scratch_layers_multi`'s
+DeltaNetMoe + LinearAttention path, but the same retrofit was not
+applied to the equivalent **single-GPU** MoE path in
+`forward_scratch_layers`. With upstream's PR #195/#205 lloyd-MQ3
+work merged, the MoE dispatch site now has `mq4 + lloyd_mq3` arms
+but still no `hfq6` arm.
+
+| function | path | la4_hfq6 | fa3_hfq6 | notes |
+|---|---|:---:|:---:|---|
+| forward_scratch_layers | DeltaNetMoe + LA | **❌** | n/a | **the gap** |
+| forward_scratch_layers | FullAttnMoe + FA | n/a | ✅ | covered |
+| forward_scratch_layers_multi | DeltaNetMoe + LA | ✅ (5ea9050) | n/a | covered |
+| forward_scratch_layers_multi | FullAttnMoe + FA | n/a | ✅ | covered |
+
+**Exactly 1 missing arm: `fused_la4_hfq6` for DeltaNetMoe LA in the
+single-GPU forward path** (qkvza projection: wqkv + wz + w_beta +
+w_alpha fused into one fused_qkvza_hfq6g256_dp4a call vs the
+fallback's four separate weight_gemv_prerotated calls).
+
+**Why MoE FFN paths are NOT in this gap list:** MoE FFN dispatch
+goes through `moe_ffn_decode` (router + top-K + per-expert dispatch),
+not the fused gate_up arms. There is no `else if fused_gu_hfq6` site
+to add to the MoE FFN — the structure is fundamentally different
+from dense FFN. `gu_hfq6` arms only apply to dense LA/FFN blocks.
+
+**`forward_from_x_gpu` and `forward_prefill_chunk` are intentionally
+NOT in this gap list either.** Both paths have zero fused dispatch
+in *any* variant (dense or MoE) — they call raw per-output
+`weight_gemv` for all weight types. Adding hfq6 arms there would be
+net-new work, not gap-closing.
+
+**Correctness vs perf:** Correctness is fine. The fallback path
+(`weight_gemv_prerotated` per output) produces correct output via
+sequential per-row GEMVs. The cost is **~4× slower than the fused
+single-GPU path** on MoE attention layers (per the original
+C1-MULTIGPU-HFQ6 commit message in `5ea9050`).
+
+**Exposure today:** zero. No MoE+MQ6/HFQ6 model exists on disk or in
+the registry; the only A3B model shipped is `qwen3.6-35b-a3b.mq4`,
+and the standard MoE quantization recipe is mixed-precision MQ4
+attention + MQ6 routed experts (quantize/main.rs:2247) where the
+attention projections this gap touches are kept at MQ4. **The gap
+only matters for fully-MQ6-quantized A3B**, which would be a
+deliberate experimental build.
+
+**When triggered:** silent perf cliff. A user benching mq6-A3B vs
+mq4-A3B would see mq6 mysteriously slow on attention without an
+obvious reason. To make this loud rather than silent, v3.2.8 also
+adds a one-time `eprintln!` warning at daemon startup when an HFQ6/
+MQ6 weight is detected in a MoE attention dispatch site that lacks
+the fused arm. See commit reference below.
+
+**Decision: defer the actual fix.** The mechanical retrofit is small
+(~30 min, mirrors the existing 3-way merge pattern at
+`forward_scratch_layers_multi:la4_hfq6`) but should be paired with
+an MoE+MQ6 model to bench against. Phase 5 of the original v3.2 plan
+already documents this work as gated on "MoE+MQ6 demand"; this
+errata just makes the specific dispatcher sites explicit.
+
+**To close when triggered:**
+1. Add `fused_la4_hfq6` predicate + arm to `forward_scratch_layers`'s
+   `(DeltaNetMoe, LinearAttention)` match (mirror the existing pattern
+   at the dense `(DeltaNet, LinearAttention)` site or the existing
+   MoE site in `forward_scratch_layers_multi`).
+2. Validate via `test_hfq6_mmq` (existing 14-test battery) plus a
+   per-layer correctness probe against an mq6-quantized A3B target.
+
+That's the entire fix — single dispatch site, ~15 lines mirrored
+from the multi-GPU arm. The defensive `eprintln!` warning shipped in
+v3.2.8 (see commit reference below) makes this gap audible the first
+time someone loads an mq6/hfq6-quantized A3B model on gfx906, so the
+perf cliff stops being silent.
+
+**References:**
+- v3.2.8 deferred-list status: `MoE-indexed HFQ6 MMQ` row in v3.2.7
+  final state table (line 624 of this doc)
+- Pre-existing exposure documented in C1-MULTIGPU-HFQ6 BLOCKER
+  rationale within commit `5ea9050`
 
 ### Calibrated decode-lift expectations (gfx906, post-v3.2.2)
 

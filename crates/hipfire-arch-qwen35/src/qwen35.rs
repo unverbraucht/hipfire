@@ -10,6 +10,29 @@ use crate::speculative::HiddenStateRingBuffer;
 use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
+/// One-time warning when an HFQ6/MQ6-quantized MoE attention layer falls
+/// through to the slow per-output `weight_gemv_prerotated` path on a gfx906
+/// device that has dp4a available. See plan v3.2.8 errata: the fused
+/// `fused_qkvza_hfq6g256_dp4a` arm is wired in `forward_scratch_layers_multi`
+/// (commit 5ea9050) but not in the single-GPU `forward_scratch_layers` MoE
+/// path, so a fully-MQ6-quantized A3B model would silently regress ~4× on
+/// MoE attention without this warning.
+fn warn_moe_hfq6_slow_path_once(arch: &str, dt: DType) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if dt != DType::HFQ6G256 && dt != DType::MQ6G256 { return; }
+    if !rdna_compute::gemv_dp4a_enabled(arch) { return; }
+    if WARNED.swap(true, Ordering::Relaxed) { return; }
+    eprintln!(
+        "  [warn] MoE attention layer with HFQ6/MQ6 weights on {arch} \
+         falling through to slow per-output GEMV path. \
+         Fused dp4a arm is wired for multi-GPU only \
+         (forward_scratch_layers_multi). See plan v3.2.8 errata in \
+         docs/plans/gfx906-mq6-mq8-port.md for the fix recipe; this \
+         warning is one-time per process."
+    );
+}
+
 // ─── Config ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -6197,6 +6220,7 @@ fn forward_scratch_layers(
                         layer.wqkv.k,
                     )?;
                 } else {
+                    warn_moe_hfq6_slow_path_once(&gpu.arch, dt);
                     weight_gemv_prerotated(gpu, &layer.wqkv, &s.tmp, x_rot, &s.dn_qkv)?;
                     weight_gemv_prerotated(gpu, &layer.wz, &s.tmp, x_rot, &s.dn_z)?;
                     weight_gemv_prerotated(gpu, &layer.w_beta, &s.tmp, x_rot, &s.dn_beta)?;
