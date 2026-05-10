@@ -3054,6 +3054,16 @@ fn main() {
             let expert_mq6 = (use_mq6g256 || use_mq4_mq6exp || (kmap_promote && use_mq4g256)) && supports_g256;
             let expert_hfq6 = (use_hfq6 || (kmap_promote && use_hfq4g256)) && supports_g256;
             let expert_hfq4 = use_hfq4g256 && !kmap_promote && supports_g256;
+            // HFP4G32 / MFP4G32 dispatch for routed MoE experts. Without
+            // these, --format mfp4 silently fell back to MQ4G256 for every
+            // expert tensor, which on Qwen3.6-A3B is the dominant weight
+            // class (256 experts × 40 layers × 3 tensor types per layer)
+            // — making `--format mfp4` mostly equivalent to MQ4 in
+            // practice. The non-expert dispatch (router / shared expert /
+            // attn / norms) at line ~3317 already handled MFP4 correctly;
+            // this brings the expert path in line.
+            let expert_mfp4 = use_mfp4 && supports_g256;
+            let expert_hfp4 = use_hfp4 && supports_g256;
 
             // Parallelize across the 256 expert slices via rayon. Each slice
             // dequant→FWHT→quant→pack is a CPU-bound, self-contained job.
@@ -3063,11 +3073,22 @@ fn main() {
             let parent_owned = parent.to_string();
             let inner_shape_clone = inner_shape.clone();
             let base_owned = base_name.to_string();
+            // For HFP4/MFP4 the per-expert slice is 2D `[m, k]` where
+            // m = inner_shape[0], k = inner_shape[1]. quantize_*_2d
+            // require these as separate args.
+            let inner_m = inner_shape[0] as usize;
+            let inner_k_usize = inner_shape[1] as usize;
             let mut new_tensors: Vec<HfqTensor> = (0..n_experts).into_par_iter().map(|x| {
                 let slice_off = x * inner_bytes;
                 let slice = &raw_data[slice_off..slice_off + inner_bytes];
                 let f32_slice = to_f32(slice, &dtype);
-                let (quantized, qt, gs) = if expert_mq6 {
+                let (quantized, qt, gs) = if expert_mfp4 {
+                    let q = quantize_mfp4g32_2d(&f32_slice, inner_m, inner_k_usize, &signs1, &signs2);
+                    (q, QuantType::MFP4G32, 32u32)
+                } else if expert_hfp4 {
+                    let q = quantize_hfp4g32_2d(&f32_slice, inner_m, inner_k_usize);
+                    (q, QuantType::HFP4G32, 32u32)
+                } else if expert_mq6 {
                     let q = quantize_mq6g256(&f32_slice, &signs1, &signs2);
                     (q, QuantType::MQ6G256, 256u32)
                 } else if expert_hfq6 {
@@ -3094,7 +3115,13 @@ fn main() {
             }).collect();
             quantized_params += inner_n as u64 * n_experts as u64;
             // Single eprintln to summarize the whole expert sweep.
-            let label = if expert_mq6 { "MQ6G256" } else if expert_hfq6 { "HFQ6G256" } else if expert_hfq4 { "HFQ4G256" } else if supports_g256 { "MQ4G256" } else { "HFQ4G128" };
+            let label = if expert_mfp4 { "MFP4G32" }
+                else if expert_hfp4 { "HFP4G32" }
+                else if expert_mq6 { "MQ6G256" }
+                else if expert_hfq6 { "HFQ6G256" }
+                else if expert_hfq4 { "HFQ4G256" }
+                else if supports_g256 { "MQ4G256" }
+                else { "HFQ4G128" };
             let bytes_per = new_tensors.first().map(|t| t.data.len()).unwrap_or(0);
             eprintln!("  {label:>8}: {parent_owned}{{0..{n_experts}}}.{base_owned}.weight {:?} (×{n_experts} experts || {:.1} KB/expert, parallel)",
                 inner_shape, bytes_per as f64 / 1024.0);
