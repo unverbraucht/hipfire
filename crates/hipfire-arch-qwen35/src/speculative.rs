@@ -265,7 +265,7 @@ impl ModelSlot {
     /// tokenizers are compatible via `Tokenizer::is_compatible_with` before
     /// sharing.
     pub fn load_tokenizer(&self) -> Option<Tokenizer> {
-        Tokenizer::from_hfq_metadata(&self.hfq.metadata_json)
+        Tokenizer::from_hfq_metadata(&self.hfq.metadata_json).ok()
     }
 
     /// Single-token forward pass. Writes logits into `self.scratch.logits`.
