@@ -6,25 +6,6 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::fmt;
 
-/// One BPE merge rule, fully resolved to token ids at construction time.
-/// Rank is implicit in the position in `Tokenizer::merges` (rank-ordered).
-///
-/// `left`/`right` are not read on the encoder hot path — pair → rank
-/// lookups go through `Tokenizer::merge_pair_rank` which is keyed on
-/// `(left, right)` directly. The fields are kept for diagnostic
-/// inspection (e.g. printing the merge graph) and to keep the struct
-/// self-documenting at construction sites.
-#[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
-struct MergeRule {
-    /// Token id of the left symbol of the pair.
-    left: u32,
-    /// Token id of the right symbol of the pair.
-    right: u32,
-    /// Token id of the merged symbol (= concat of left.string + right.string).
-    result: u32,
-}
-
 /// Which side of a merge rule failed validation. Used by `MissingMergeOperand`.
 #[derive(Debug, Clone, Copy)]
 pub enum Side {
@@ -104,15 +85,17 @@ pub struct Tokenizer {
     vocab: Vec<String>,
     /// String → token ID (for encoding)
     token_to_id: HashMap<String, u32>,
-    /// BPE merge rules, fully resolved to token ids at construction.
-    /// Rank-ordered; `merges[i]` has rank `i`. Empty for SentencePiece.
+    /// BPE merge results in rank order: `merges[i]` is the merged token id
+    /// for the merge rule at rank `i`. The pair → rank lookup is in
+    /// `merge_pair_rank` (keyed on `(left_id, right_id)`); when a rule
+    /// fires, the encoder writes `merges[rank]` directly. Empty for SP.
     ///
-    /// Replaces the prior `Vec<(String, String)>` keyed by symbol strings.
-    /// Every merge symbol (left, right, and the merged result) is now a
-    /// validated u32 token id, so the encoder operates entirely on
-    /// `Vec<u32>` — no String clones in the heap loop, no silent
-    /// `unwrap_or(0)` fallback in the final walk (#203).
-    merges: Vec<MergeRule>,
+    /// Replaces the prior `Vec<(String, String)>` (and the intermediate
+    /// `Vec<MergeRule { left, right, result }>` in earlier drafts of this
+    /// refactor — `left` and `right` were never read on any path because
+    /// pair lookups already go through `merge_pair_rank`, so storing only
+    /// the result is sufficient and ~3× smaller per entry).
+    merges: Vec<u32>,
     /// `(left_id, right_id) → rank` (= index into `merges`). Built once at
     /// construction. `(u32, u32)` is `Copy` so heap-pair lookups never clone.
     ///
@@ -142,14 +125,15 @@ pub struct Tokenizer {
     is_gpt2_bpe: bool,
 }
 
-/// Resolve a list of `(left_string, right_string)` merge pairs into
-/// `Vec<MergeRule>` + `(left_id, right_id) → rank` lookup, verifying that
-/// every operand and every merged result is present in `token_to_id`.
-/// Returns `Err` on the first missing entry — see #203.
+/// Resolve a list of `(left_string, right_string)` merge pairs into a
+/// rank-ordered `Vec<u32>` of result ids + `(left_id, right_id) → rank`
+/// lookup, verifying that every operand and every merged result is
+/// present in `token_to_id`. Returns `Err` on the first missing entry —
+/// see #203.
 fn resolve_merges(
     merges_strings: &[(String, String)],
     token_to_id: &HashMap<String, u32>,
-) -> Result<(Vec<MergeRule>, HashMap<(u32, u32), u32>), TokenizerError> {
+) -> Result<(Vec<u32>, HashMap<(u32, u32), u32>), TokenizerError> {
     let mut merges = Vec::with_capacity(merges_strings.len());
     let mut merge_pair_rank: HashMap<(u32, u32), u32> =
         HashMap::with_capacity(merges_strings.len());
@@ -183,9 +167,14 @@ fn resolve_merges(
                     expected: result_buf.clone(),
                 }
             })?;
-        merges.push(MergeRule { left, right, result });
-        // First-rank-wins on duplicate pairs (heap pops lowest-rank first
-        // anyway, so a later duplicate would never fire).
+        merges.push(result);
+        // First-rank-wins on duplicate `(left_id, right_id)` pairs:
+        // `entry().or_insert()` keeps the earlier rank. This is correct for
+        // BPE semantics because the encoder's min-heap pops lowest rank
+        // first — a later duplicate would never fire even if we inserted
+        // it. Pathological vocabs with duplicate merge rules thus behave
+        // deterministically (drop the later rule) instead of being
+        // overwritten silently.
         merge_pair_rank.entry((left, right)).or_insert(rank as u32);
     }
     Ok((merges, merge_pair_rank))
@@ -802,7 +791,7 @@ impl Tokenizer {
             // Apply the merge: l absorbs r. The merged token id is a direct
             // index into `merges` (rank-ordered) — no string concat, no
             // HashMap lookup, infallible by construction (#203).
-            syms[l] = merges[rank as usize].result;
+            syms[l] = merges[rank as usize];
             dead[r] = true;
             // Plain `+= 1`: bumps are bounded by N − 1 per slot, N < 2³², so
             // overflow is unreachable. `wrapping_add` would silently un-stale
@@ -833,11 +822,15 @@ impl Tokenizer {
         }
 
         // 7. Walk the linked list collecting live symbol ids. Every slot
-        // holds a validated u32 — no HashMap lookup, no `unwrap_or(0)` — so
-        // the encoder cannot silently emit id 0 for an OOV symbol (#203).
-        // The explicit head scan (`prev == -1 && !dead`) survives any future
-        // invariant breakage that a `debug_assert!` would silently miss in
-        // release.
+        // holds a token id that was validated at construction time:
+        // `byte_to_id` rejected any byte whose char wasn't in vocab,
+        // `resolve_merges` rejected any merge whose result wasn't in
+        // vocab, and the merge loop only writes `merges[rank]` (which is
+        // itself a validated id). The encoder therefore CANNOT emit id 0
+        // for an OOV symbol — the previous `unwrap_or(0)` fallback (#203)
+        // is structurally unreachable now and removed. The explicit head
+        // scan (`prev == -1 && !dead`) survives any future invariant
+        // breakage that a `debug_assert!` would silently miss in release.
         let mut result = Vec::with_capacity(n);
         let head = (0..n).find(|&i| prev[i] == -1 && !dead[i]);
         let mut p: i32 = head.map(|i| i as i32).unwrap_or(-1);
@@ -1059,12 +1052,12 @@ impl Tokenizer {
     /// Build a token-id → merge-rank table by scanning the BPE merges list.
     /// O(n_merges) one-time. Used only by diagnostics; not on the hot path.
     pub fn build_merge_rank_table(&self) -> HashMap<u32, usize> {
-        // Merges are now `MergeRule { left, right, result }` with token-id
-        // fields, so the merged-id is `m.result` directly — no string
-        // concatenation, no `token_to_id` lookup, infallible by construction.
+        // `merges: Vec<u32>` is rank-ordered result ids, so the merged-id
+        // is just `*m` — no string concatenation, no `token_to_id` lookup,
+        // infallible by construction.
         let mut out = HashMap::with_capacity(self.merges.len());
-        for (i, m) in self.merges.iter().enumerate() {
-            out.entry(m.result).or_insert(i);
+        for (i, &result_id) in self.merges.iter().enumerate() {
+            out.entry(result_id).or_insert(i);
         }
         out
     }
@@ -1076,10 +1069,8 @@ impl Tokenizer {
         if s.len() <= 1 {
             return Some(0); // base byte
         }
-        // Linear scan of the rank-ordered `merges` Vec, comparing the
-        // result-id field. No string concat needed — the result id is a
-        // direct field on MergeRule.
-        self.merges.iter().position(|m| m.result == id)
+        // Linear scan of the rank-ordered `merges` Vec for the result id.
+        self.merges.iter().position(|&m| m == id)
     }
 
     fn rank_of(&self, id: u32, table: &HashMap<u32, usize>) -> Option<usize> {
@@ -1628,9 +1619,9 @@ mod consistency_tests {
         assert!(tok.byte_to_id.is_some());
         assert_eq!(tok.merges.len(), 1);
         // Merge resolved to ids: A → 0x41, B → 0x42, AB → 256 (first extra).
-        assert_eq!(tok.merges[0].left, 0x41);
-        assert_eq!(tok.merges[0].right, 0x42);
-        assert_eq!(tok.merges[0].result, 256);
+        // `merges[0]` is the result id; `merge_pair_rank` carries the pair → rank.
+        assert_eq!(tok.merges[0], 256);
+        assert_eq!(tok.merge_pair_rank.get(&(0x41, 0x42)).copied(), Some(0));
     }
 
     #[test]

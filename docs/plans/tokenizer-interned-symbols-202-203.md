@@ -59,9 +59,12 @@ struct MergeRule {
 pub struct Tokenizer {
     vocab: Vec<String>,
     token_to_id: HashMap<String, u32>,
-    /// Rank-ordered, fully resolved. Replaces both `merges: Vec<(String,String)>`
-    /// and `merge_pair_rank: HashMap<(String,String),_>`. Empty for SP tokenizers.
-    merges: Vec<MergeRule>,
+    /// Rank-ordered result ids: `merges[i]` is the merged token id at rank `i`.
+    /// Empty for SP tokenizers. Replaces both the prior `Vec<(String,String)>`
+    /// and the `Vec<MergeRule { left, right, result }>` first draft (the
+    /// left/right fields turned out to be unread on every code path; pair →
+    /// rank lookups go through `merge_pair_rank` directly).
+    merges: Vec<u32>,
     /// (left_id, right_id) -> index into `merges` (= rank).
     /// Built once at construction. `(u32,u32)` is Copy — zero clone cost.
     merge_pair_rank: HashMap<(u32, u32), u32>,
@@ -81,9 +84,9 @@ pub struct Tokenizer {
 - `merge_pair_rank` value is `u32` not `usize` — merge ranks fit in u32 for any
   realistic vocab (~500K merges max), and 4-byte values keep the HashMap
   smaller than 8-byte usize values.
-- `MergeRule` is 12 bytes, `Copy`, no heap. Iterating in rank order is a
-  Vec scan. Diagnostics (`build_merge_rank_table`) become trivial:
-  `for (i, m) in merges.iter().enumerate() { out.entry(m.result).or_insert(i); }`.
+- `merges: Vec<u32>` is 4 bytes per entry, `Copy`, no heap. Iterating in
+  rank order is a Vec scan. Diagnostics (`build_merge_rank_table`) become
+  trivial: `for (i, &id) in merges.iter().enumerate() { out.entry(id).or_insert(i); }`.
 - `byte_to_id: Option<[u32; 256]>` — stored as a fixed array, not a HashMap.
   At 1KB per Tokenizer it's negligible; lookups become a single load.
 - `vocab` and `token_to_id` are unchanged. They're the source of truth for
@@ -226,12 +229,11 @@ fn encode_gpt2_bpe(&self, text: &str) -> Vec<u32> {
 
     let push_pair = |heap: &mut BinaryHeap<_>, syms: &[u32], gen: &[u32], l: usize, r: usize| {
         if let Some(&rank) = merge_pair_rank.get(&(syms[l], syms[r])) {
-            heap.push(Reverse((rank, l as u32, gen[l])));   // 12 bytes per entry
+            heap.push(Reverse((rank, l, gen[l])));          // l stays usize per Q3
         }
     };
 
-    while let Some(Reverse((rank, l_u32, gen_at_push))) = heap.pop() {
-        let l = l_u32 as usize;
+    while let Some(Reverse((rank, l, gen_at_push))) = heap.pop() {
         if dead[l] || gen[l] != gen_at_push { continue; }
         let r = next[l]; if r < 0 { continue; } let r = r as usize;
 
@@ -239,7 +241,7 @@ fn encode_gpt2_bpe(&self, text: &str) -> Vec<u32> {
         // Gen-tag invariant guarantees rank still describes (syms[l], syms[r]).
         debug_assert_eq!(merge_pair_rank.get(&(syms[l], syms[r])), Some(&rank),
             "BPE pq invariant: popped rank must match live pair rank");
-        syms[l] = merges[rank as usize].result;             // O(1) index lookup
+        syms[l] = merges[rank as usize];                    // O(1) Vec<u32> index
         dead[r] = true;
         gen[l] += 1;
 
@@ -262,12 +264,15 @@ fn encode_gpt2_bpe(&self, text: &str) -> Vec<u32> {
 **Key wins:**
 - No `String::clone()` in the hot loop.
 - No `String` allocation/concat for `merged`.
-- No re-hash on heap pop — `merges[rank].result` is a Vec index.
+- No re-hash on heap pop — `merges[rank]` is a `Vec<u32>` index.
 - Final walk emits validated ids — `unwrap_or(0)` is gone, #203 is fixed
   for the BPE path.
 
-**Heap entry size:** `Reverse<(u32, u32, u32)>` = 12 bytes (was 24 bytes with
-`usize` × 3 on 64-bit). Halves heap memory; minor cache-friendliness win.
+**Heap entry size:** `Reverse<(u32, usize, u32)>` = 24 bytes on 64-bit (per Q3
+decision: keep `usize` for `l` to avoid cast noise). Same size as the prior
+`Reverse<(usize, usize, u32)>` — no shrink, but the syms-Vec shrinks 6× from
+`Vec<String>` (24-byte header per entry + heap) to `Vec<u32>` (4 bytes per
+entry inline), which is the structural cache-friendliness win.
 
 ### `encode_sentencepiece`
 
