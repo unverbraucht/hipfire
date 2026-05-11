@@ -276,6 +276,122 @@ Expected smoke-test cases (4 conditions):
 
 If H1 holds (default + reasoning works), the 4-bit-router file becomes a candidate replacement for the existing /local/hipfire/qwen3.6-35b-a3b.mq4, and ee1be8a's Q8-router promotion needs revisiting at the design level (e.g., gate the promotion behind a flag that defaults off until paired with a coherence audit).
 
+## Phase 11 — MFP4 falsifies the quant-quality-gap hypothesis
+
+Phase 10 reframed the root cause as "MQ format quality gap" — the
+prediction being that a better-conditioned 4-bit format would close
+the spiral. MFP4G32 (HFP4G32 + offline FWHT, shipped as PR #225) is
+exactly that better format: E2M1 FP4 + per-32 UE8M0 scales + per-row
+FP16 scale, which gives substantially lower per-weight MSE than MQ4's
+per-256 affine scaling.
+
+**Test:** Re-quantized A3B with `--format mfp4g32` after patching
+`hipfire-quantize/src/main.rs` to dispatch HFP4/MFP4 in the MoE
+3D-stacked expert-split path (commit `3f05b6a` — without this patch
+expert tensors silently fell through to MQ4G256).
+
+Output: `/local/hipfire/qwen3.6-35b-a3b-mfp4.hfq`, 19 GB.
+
+Smoke test on the train-pursuit reasoning prompt (2048 tokens, temp=0):
+
+| Mode | Result |
+|---|---|
+| Default (rmsnorm fix active) | **spiral** — verbatim paragraph block repeating 5+ times after ~400 tokens of correct setup |
+| Workaround (`HIPFIRE_QWEN_MOE_FINAL_NORM_RAW=1`) | **spiral** — "NO WAIT LET ME READ EXACTLY..." block repeats 8+ times |
+
+Note: hipfire's `coherence_probe` at 300 tokens reported all-green
+(`OK (0 hard, 0 soft)`) for the default-mode MFP4 run. The spiral
+became visible only after extending to 2048 tokens. The probe's
+first-128 / last-128 / 3-gram-density detectors did not catch a
+block-attractor whose period exceeds the inspection window. This is a
+detector blind spot worth fixing; it does not change the substantive
+result.
+
+**Phase 10's MQ-format-quality-gap hypothesis is falsified.** MFP4
+materially reduces per-weight quantization noise compared to MQ4
+(matching the format-quality lever Phase 10 prescribed), and the
+spiral persists in both rmsnorm regimes. The attractor is not a
+consequence of MQ4-specific noise characteristics.
+
+## Reframed root cause (revision 2)
+
+The A3B `<think>` reasoning attractor is **not** a quantization-format
+issue at all. The evidence chain:
+
+1. Phase 9 (byte-identical 4-bit-router file) — quantization layout
+   has no effect.
+2. Phase 11 (MFP4 = strictly better per-weight noise) — quantization
+   quality has no effect.
+3. Phase 2 + 7 + 11 — the rmsnorm-scale variable consistently
+   discriminates between coherent and spiral *only when the model
+   would already complete reasoning correctly*. MFP4 spirals even in
+   workaround mode, meaning even the May-6-stable regime fails on this
+   file.
+
+What changed between May-6-stable and MFP4 that persists in the
+workaround regime? The model architecture is unchanged. The norm
+loading is unchanged. The only difference is the dequantization
+arithmetic of expert tensors (E2M1 + UE8M0 g32 + FP16 row vs MQ4G256
+FWHT + per-256 affine).
+
+The remaining viable hypothesis is **H4: A3B is a precision-fragile
+architecture where the spiral lives in the per-token logit
+probability mass distribution, and the regime that masks it is
+narrow.** Specifically:
+
+- The under-scaled norm in the May-6 file happens to produce a logit
+  shape that survives the spiral attractor with MQ4 expert noise.
+- Either correct-scale norms (PR #228 default) OR different expert
+  arithmetic (MFP4) takes the logit shape out of that narrow stable
+  region.
+- The community reports of BF16 reproduction (Qwen issue #145, HF
+  discussion #19) corroborate that this fragility exists upstream of
+  any quantization choice.
+
+The Kaitchup data point (30% → 70% truncation rate at 4-bit) is
+consistent: quantization makes A3B worse but isn't the root cause.
+Their FP16 baseline already truncates 30% of the time.
+
+## What this means for the engine-pass plan (revision 2)
+
+- **Quantization-side fixes are exhausted as a path to A3B coherence.**
+  Byte-identical, MFP4, K-map alternating, no-Q8-router — every
+  layout/format variation we've tried preserves the spiral at correct
+  GemmaRMSNorm scale.
+
+- **The remaining levers are runtime-side:**
+  1. **Sampler intervention.** temp=0 greedy decoding amplifies
+     attractors. Qwen's recommended temp=0.6/top_p=0.95 still spirals
+     on our files; need to test min_p and frequency-penalty
+     interventions specifically against block-attractor patterns.
+  2. **Routing-path precision uplift.** Even though MFP4 didn't close
+     it, the vLLM contract (FP16 router + FP32 topk_weights) remains
+     the most precision-conservative option we haven't tried. The
+     test would be a daemon-side FP16-router code path (engine
+     change), not a quantization change.
+  3. **Block-attractor detection in the daemon.** Add a periodic
+     n-gram-period detector with a much wider window than
+     `coherence_probe` currently uses. When detected, force a sampling
+     reset (insert a low-probability bias toward `</think>` or apply
+     repetition penalty retroactively).
+
+- **Detector blind-spot fix.** Extend `coherence_probe` 3-gram density
+  to scan period-N repetitions up to N≈100, not just consecutive
+  3-grams. This run would have failed the smoke test at 600+ tokens.
+
+- **PR #228 ships with the workaround flag as documented escape
+  hatch.** Unchanged. A3B reasoning users opt out of correct
+  GemmaRMSNorm magnitude until the runtime-side investigation lands.
+
+## Hypothesis status update (revision 2)
+
+| Hypothesis | Verdict |
+|---|---|
+| H1: Q8 router is the bug | **Rejected** (Phase 9) |
+| H2: Multi-variable interaction explained by quant-quality gap | **Rejected** (Phase 11 — MFP4 closes quality gap but not spiral) |
+| H3: A3B fundamentally fragile at temp=0 | **Confirmed** (community reports + matrix outcome) |
+| H4: Spiral lives in logit-shape regime; quantization moves it but doesn't cause it | **Active** — explains all observed outcomes |
+
 ## Engine-pass implications
 
 Regardless of Phase 9 outcome, the investigation has surfaced concrete engine-side issues:
