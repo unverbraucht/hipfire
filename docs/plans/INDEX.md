@@ -121,21 +121,56 @@ Cross-references the format roadmap (Thread 1) — CDNA1 (gfx906) acceleration i
 
 ---
 
-## Topics I'm not currently tracking
+## Thread 8 — Tokenizer hot-path correctness & hardening
 
-To help spot gaps in the investigation index. The user asked specifically about whether there are major topics missing — these are candidates the docs don't cover but might warrant a thread:
+**Master doc:** none — work happens directly in PRs (#201, #202, #203, #226, #229, #230) without a standalone plan doc.
+**Status:** Live. BPE O(N²) → O(N log N) shipped (#201); merge_rank cache shipped (#226); SentencePiece allocator-free scan in flight (#229); interned merge symbols + loud OOV at construction in flight (#230).
+
+The tokenizer has been under sustained attack since #201 found the BPE O(N²) bug that caused minute-long prefill stalls on long prompts. Three follow-up PRs split the residual work along orthogonal axes:
+
+| PR / commit | Subject | Status | Closes |
+|---|---|---|---|
+| #201 (upstream-merged, in tree) | BPE encoder O(N²) → O(N log N) | shipped | — |
+| #226 (merged commit `743e23d`) | BPE `merge_rank` cache on Tokenizer (37× TTFT on long prompts) | shipped | half of #202 |
+| #229 (commit `48d985f`, open as PR) | SentencePiece allocator-free scan + `merge_rank` → `merge_pair_rank` rename + sp_tests module | in flight | remainder of #202 |
+| #230 (commit `8b3b32c`, open as PR) | Interned merge symbols (`Vec<(String,String)>` → `Vec<u32>` rank-ordered ids) + loud OOV (`MissingByteSymbol`/`MissingMergeOperand`/`MissingMergeResult` errors at constructor) | in flight | BPE half of #203 |
+| (commit `350131f`) | Combined review-round addresses (F1/F3/F4/F7/GLM-tok-2/G-tup) | shipped | review follow-ups |
+
+**Open correctness gap explicitly deferred:** the **SentencePiece half of #203** — `encode_sentencepiece`'s single-char fallback silently *dropping* missing chars — is **not addressed** by #230. PR #230's body recommends leaving #203 open until both halves land, or splitting it into a separate SP-specific issue. Likely shape: `encode_strict` returning `Result<Vec<u32>, EncodeError>`.
+
+**Memory note for future agents:** `project_upstream_pr201_bpe.md` in user-memory ("fork is 41 commits behind upstream on BPE fix") is **stale**. The BPE O(N²) fix landed via #226 (merge_rank cache) on this branch; long-prompt prefill should no longer stall in tokenizer.
+
+---
+
+## Thread 9 — Attention numerics correctness & perf
+
+**Master doc:** none — distributed across PRs and inline comments.
+**Status:** Live. PR #222 (open) addresses two issues in `attention_dflash_f32`. The 1-ULP softmax-renorm attractor in `qwen35.rs:1996-2003` is comment-only; period-N block-attractor detection from Thread 2 Phase 11 has no design doc.
+
+| PR / commit | Subject | Status | Impact |
+|---|---|---|---|
+| #222 (open as PR, NOT yet in our tree) | `attention_dflash_f32`: tiled online-softmax + full-workgroup V-accumulation in Phase C | **pending merge** | (1) **Correctness fix at L ≥ 16128** — pre-fix kernel allocates `(L + block_size) * 4` bytes of LDS, blows the 64 KB gfx1100 per-WG limit at L≥16128; crashes hetero PFlash+DFlash at the canonical 16K bench. (2) **+41% kernel time** (130 ms → 77 ms) from full-workgroup V-accumulation in Phase C when nthreads > head_dim (128 lanes idle in the old loop). |
+
+**Why this matters for the rest of the index:**
+- PR #222 is a hard prerequisite for the hetero PFlash+DFlash work in Thread 5 (`hetero-pflash-dflash.prd`). Without it, hetero canonical 16K bench crashes.
+- The attractor work in Thread 2 Phase 11 (period-N block-attractor detection) is a *different* attention-numerics issue at the per-token logit level; PR #222 is a kernel-side LDS/correctness fix at the kv-length level. The two are not redundant.
+- The 1-ULP softmax-renorm attractor (`qwen35.rs:1996-2003`) sits in a third category — quantization-induced softmax precision drift. Currently mitigated by a comment-only sentinel. Should grow a design doc when imatrix calibration (Thread 1 Phase A L5c) lands, because activation-weighted LS may modify the precision profile that the existing mitigation assumes.
+
+---
+
+## Topics still not tracked (candidates for future threads)
+
+After absorbing Threads 8 and 9 above, the remaining gaps:
 
 | Candidate topic | Why it might matter | Where would it live |
 |---|---|---|
-| **Tokenizer correctness / BPE edge cases** | Memory `project_upstream_pr201_bpe.md` flags a known O(N²) tokenizer bug missing from this fork. Could become a thread if a downstream bug surfaces. | `docs/plans/tokenizer-*.md` |
 | **KV-cache quantization audit** | hipfire ships asym3, asym4, q8, fp16, fp32 KV variants. No equivalent "what's missing / next levers" doc exists; it's all in commit messages. | `docs/plans/kv-cache-quant-*.md` |
-| **Attention numerics** | Phase 11 mentions period-N block-attractor detection; the 1-ULP softmax-renorm attractor (`qwen35.rs:1996-2003`) is comment-only. No standalone doc. | `docs/plans/attention-numerics.md` (if it grows) |
-| **Sampler / decoding strategy** | All sampling code is currently kernel-side or in `crates/hipfire-runtime/src/sampler.rs`; no design doc tracks min_p, repetition penalty, mirostat status. | `docs/plans/sampling-strategy.md` (if needed) |
+| **Sampler / decoding strategy** | All sampling code is currently kernel-side or in `crates/hipfire-runtime/src/sampler.rs`; no design doc tracks min_p, repetition penalty, mirostat status. Thread 2 Phase 11's "sampler intervention" lever is also undocumented. | `docs/plans/sampling-strategy.md` (if needed) |
 | **Cross-vendor compute deprecation rationale** | CLAUDE.md says Vulkan/RADV is out of scope (issue #44 closed 2026-04-25). No standalone doc explains the rationale for future contributors. | `docs/plans/cross-vendor-rationale.md` |
 | **Build / packaging / distribution** | No PRD covers the long-term packaging story (cargo dist, deb packages, Docker, etc.). May not be needed in the design tree at all. | `docs/distribution.md` |
 | **Tracing / observability** | hipfire daemon emits JSONL events. No doc tracks the schema, no metrics-format integration plan exists. | `docs/plans/observability.md` (if needed) |
 
-None of these are urgent. The tokenizer one is the most likely to become a real thread if a long-prompt prefill bug actually surfaces and we need to backport upstream PR #201.
+KV-cache audit is the highest-value remaining gap — it directly affects perf *and* coherence (Q8 drift on DeltaNet has its own mitigation in `qwen35.rs` per CLAUDE.md "DeltaNet state: FP32 (MoE model — Q8 drift mitigation)").
 
 ---
 
@@ -154,3 +189,6 @@ None of these are urgent. The tokenizer one is the most likely to become a real 
 - "How do we add Gemma?" → Thread 1 §4.3 (`qwen35-mq4-quality-gap.md`)
 - "Should we calibrate with imatrix?" → Thread 1 Phase A (`qwen35-mq4-quality-gap.md` §5)
 - "When does the format change?" → It doesn't. Thread 1 commits to HFP4 for the next several years; all extension is inside reserved bits.
+- "Why is long-prompt prefill slow?" → Should no longer be — Thread 8 (#226 shipped the BPE `merge_rank` cache, 37× TTFT). If still slow, check PR #229/#230 status.
+- "Why does encoder silently drop chars?" → Thread 8. BPE half closed by #230 (loud OOV); SP half still open in #203.
+- "What does PR #222 do?" → Thread 9. Fixes `attention_dflash_f32` LDS overflow at L ≥ 16128 (crash → correct) + 41% kernel time win. Prerequisite for hetero PFlash+DFlash (Thread 5).
