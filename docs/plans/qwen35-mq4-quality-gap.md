@@ -410,9 +410,18 @@ Order matters because each step's bench harness validates the next.
 
 ### Phase B' — gfx906 kernel port (2–3 weeks, parallel with everything above)
 
+**Prerequisite reading:** `docs/plans/gfx906-moe-kernel-gaps.md` —
+3-way-cross-validated audit identifying 8 existing gaps in the
+gfx906 MoE kernel coverage relative to dense (no dp4a in MoE GEMVs,
+no MMQ port for MoE prefill, no prefetch variant, etc.). 6 of those
+8 gaps map 1:1 onto Phase B' work; the port should close them in
+passing rather than carrying them forward into HFP4.
+
 11. Port the `gemm_hfq4g256_residual_mmq_gfx906_x{8..64}.hip` family to HFP4G32. The dp4a inner loop is byte-identical (per §1.4); only the per-block scale conversion (`v_ldexp_f32` instead of FP32 load) and the LUT-decode (`kvalues_hfp4[n] * sc` instead of `(n - 8) * sc`) change. Projected: 87–95% of stock llama.cpp pp512, vs current HFQ4G256 at 95%.
-12. Port `fused_qkv_hfq4g256_wave64_dp4a.hip` and `fused_gate_up_hfq4g256_wave64_dp4a.hip` (and the qkvza variant) to HFP4G32. Same template diff as above.
-13. Speed-gate: re-run `scripts/probe_commits.sh master HEAD` on Qwen3.5-9B-HFP4 on the gfx906 dev box. Must come in within 10% of HFQ4G256-baseline pp512.
+12. Port `fused_qkv_hfq4g256_wave64_dp4a.hip` and `fused_gate_up_hfq4g256_wave64_dp4a.hip` (and the qkvza variant) to HFP4G32. Same template diff as above. **Add the MoE variants this time** (the audit's Gap 1, 8): `fused_qkvza_hfp4g32_moe_wave64_dp4a.hip` for the preamble, `gemv_hfp4g32_moe_{gate_up,down}_indexed_wave64_dp4a.hip` for the routed experts.
+13. Close audit Gap 2 in the same PR: write `gemm_hfp4g32_residual_mmq_gfx906_moe_x{8..64}.hip` variants for MoE prefill (per-expert sort + tile, standard vLLM/TensorRT pattern). Projected: +50–100% prefill at batch ≥ 16, MoE on parity with dense.
+14. Close audit Gap 3 in the same PR: wave64 variant of `gemv_hfp4g32_residual_sigmoid_scaled_gpu` (shared expert down). ~half-day fix per audit, but should land alongside the family port to avoid leaving 50% lane utilization on the table.
+15. Speed-gate: re-run `scripts/probe_commits.sh master HEAD` on Qwen3.5-9B-HFP4 + Qwen3.6-A3B-MFP4 on the gfx906 dev box. Dense must come in within 10% of HFQ4G256-baseline pp512; MoE must improve on today's scalar-FP wave64 baseline by 5%+ on decode and 50%+ on prefill (the audit's projected impact).
 
 If gfx906 port lands later than Phase A: gfx906 users continue on HFQ4G256 quants (no regression), Phase A's calibrated-MFP4 ships for RDNA3/4 users immediately. The gfx906 retroactively gets the quality lift when the port lands.
 
