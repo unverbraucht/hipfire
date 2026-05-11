@@ -560,9 +560,49 @@ New `crates/hipfire-runtime/examples/imatrix_collect.rs` runs forward pass on ca
 
 Swap `min Σ (w - q)²` for `min Σ act²[i] · (w[i] - q[i])²` in each per-block fit (UE8M0 + FP16 row), using the Step 4 imatrix as the `act²` source. **Run this against all three baselines** (MQ4G256, MFP4G32, HFP4G32-unrotated) so we learn whether calibration disproportionately helps one format. **Empirical target, not predicted target:** KLD-mean on Qwen3.5-9B drops materially vs the corresponding Step 0.5 baseline; the specific number is whatever measurement says — the original "0.20–0.30" projection is now an open question.
 
-**Step 6 (week 6) — L5d: imatrix-driven per-tensor bit allocation.**
+**Step 6 (week 6) — L5d: per-tensor bit allocation. Two parallel paths.**
 
-Use per-tensor `Σ(Act²)` + ZD score (Liu et al. 2024) to pick HFP4G32 / HFP6G32 / Q8 per tensor; bit budget held constant. Replaces hardcoded K-map rule 4/5 with data-driven promotion. Bench across baselines; pick the winner.
+The lever: which tensors deserve more than the default 4-bit precision. Two
+independent ways to make that choice; we should land both and bench.
+
+- **Step 6a — Native (imatrix-derived).** Use per-tensor `Σ(Act²)` + ZD score
+  (Liu et al. 2024) to pick HFP4G32 / HFP6G32 / Q8 per tensor; bit budget
+  held constant. Depends on the Step 4 imatrix sidecar. Replaces hardcoded
+  K-map rule 4/5 with data-driven promotion. *Principled but lead-time
+  bound by Step 4.*
+
+- **Step 6b — UD decompile shortcut.** Open an Unsloth UD-Q4_K_XL / UD-Q4_K_M
+  GGUF for the target model, parse the tensor table, extract Unsloth's
+  per-tensor bit allocation (which tensors got promoted to Q5_K / Q6_K /
+  Q8 / FP16). Map onto the closest hipfire format-family equivalent
+  (HFQ4G256 / MQ6G256 / Q8_F16). Apply as a `--kmap-file` override that
+  lets the quantizer mimic UD's per-tensor choices. *No imatrix dependency
+  — UD has already paid the calibration cost; we just copy their decisions.*
+
+  Implementation: `crates/hipfire-quantize/src/bin/ud_decompile.rs` — opens
+  any GGUF via `gguf_input.rs`, emits a JSON sidecar mapping
+  `{tensor_name → ggml_type → suggested_hipfire_qt}` plus a summary
+  (type-distribution, promoted-tensor list, BPW). The quantizer's existing
+  K-map rule machinery is extended to accept a JSON-driven per-tensor
+  override; the cost is ~2-3 hours dev for the decompile tool and ~1-2 days
+  for the `--kmap-file` ingestion + tests.
+
+  **What this shortcut does NOT give us:** per-channel `Σ act²` values for
+  L5c (activation-weighted LS). Unsloth's chosen scales are the *result* of
+  imatrix-aware LS — the imatrix itself is consumed and not recoverable in
+  any tractable way. So Step 5 (the dominant lever) still needs Step 4's
+  imatrix data.
+
+**Sequencing:** Step 6b can ship before Step 4/5/6a — it has no upstream
+dependency beyond a Unsloth-published GGUF. Run a 5-variant cohort
+(`{calibrated-MQ4, calibrated-MQ4+UD-kmap, calibrated-MFP4,
+calibrated-MFP4+UD-kmap, UD-Q4_K_XL anchor}`) once Step 5 lands. The
+delta between {calibrated-X} and {calibrated-X + UD-kmap} measures how
+much of UD's quality lift is L5d (bit allocation) vs L5c (per-channel
+calibration). If most of UD's edge is L5d, Step 6b alone captures the
+practical win without needing imatrix-driven native L5d (Step 6a). If
+most is L5c, the UD-kmap shortcut is mostly free quality gravy on top
+of the imatrix work.
 
 **Step 7 (week 7) — A3B reasoning smoke + multi-metric decision.**
 

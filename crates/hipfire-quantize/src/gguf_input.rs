@@ -28,7 +28,21 @@ pub enum GgmlType {
     Q5K = 13,
     Q6K = 14,
     Q8K = 15,
+    // IQ family — importance-aware INT quants used by Unsloth's UD recipes.
+    // Block layouts taken from llama.cpp's ggml-common.h:
+    Iq2Xxs = 16,
+    Iq2Xs = 17,
+    Iq3Xxs = 18,
+    Iq1S = 19,
+    Iq4Nl = 20,
+    Iq3S = 21,
+    Iq2S = 22,
+    Iq4Xs = 23,
+    Iq1M = 29,
     BF16 = 30,
+    // TQ family — ternary quants (1.0–2.0 bpw research-grade)
+    Tq1_0 = 34,
+    Tq2_0 = 35,
 }
 
 impl GgmlType {
@@ -48,7 +62,18 @@ impl GgmlType {
             13 => Some(Self::Q5K),
             14 => Some(Self::Q6K),
             15 => Some(Self::Q8K),
+            16 => Some(Self::Iq2Xxs),
+            17 => Some(Self::Iq2Xs),
+            18 => Some(Self::Iq3Xxs),
+            19 => Some(Self::Iq1S),
+            20 => Some(Self::Iq4Nl),
+            21 => Some(Self::Iq3S),
+            22 => Some(Self::Iq2S),
+            23 => Some(Self::Iq4Xs),
+            29 => Some(Self::Iq1M),
             30 => Some(Self::BF16),
+            34 => Some(Self::Tq1_0),
+            35 => Some(Self::Tq2_0),
             _ => None,
         }
     }
@@ -57,7 +82,12 @@ impl GgmlType {
         match self {
             Self::F32 | Self::F16 | Self::BF16 => 1,
             Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 | Self::Q8_0 | Self::Q8_1 => 32,
-            Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K => 256,
+            // IQ4_NL is the lone IQ-family member at 32 elements/block; the
+            // rest of the IQ + K + TQ family are 256.
+            Self::Iq4Nl => 32,
+            Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K
+            | Self::Iq2Xxs | Self::Iq2Xs | Self::Iq3Xxs | Self::Iq1S | Self::Iq3S
+            | Self::Iq2S | Self::Iq4Xs | Self::Iq1M | Self::Tq1_0 | Self::Tq2_0 => 256,
         }
     }
 
@@ -77,6 +107,19 @@ impl GgmlType {
             Self::Q5K => 176,
             Self::Q6K => 210,
             Self::Q8K => 290,
+            // IQ family block byte sizes per llama.cpp ggml-common.h
+            // (each row: name → bytes/block at 256 elements, except IQ4_NL @ 32).
+            Self::Iq2Xxs => 66,    // 2.0625 bpw
+            Self::Iq2Xs => 74,     // 2.3125 bpw
+            Self::Iq3Xxs => 98,    // 3.0625 bpw
+            Self::Iq1S => 50,      // 1.5625 bpw
+            Self::Iq4Nl => 18,     // 4.5 bpw at g=32
+            Self::Iq3S => 110,     // 3.4375 bpw
+            Self::Iq2S => 82,      // 2.5625 bpw
+            Self::Iq4Xs => 136,    // 4.25 bpw — most common UD 4-bit-tier "promoted-down" target
+            Self::Iq1M => 56,      // 1.75 bpw
+            Self::Tq1_0 => 54,     // 1.6875 bpw
+            Self::Tq2_0 => 66,     // 2.0625 bpw
         }
     }
 
