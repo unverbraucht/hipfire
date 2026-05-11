@@ -65,11 +65,96 @@ Multiplied: **L1 × L2 × L3 ≈ 2.6–4.2×.** The commit message's "5–30×" 
 
 So HFP4/MFP4 captured L1+L2+L3 — call this the **"per-weight format quality"** group of levers — but left L4+L5 — the **"per-tensor and data-driven"** group — entirely untouched. That's where Unsloth Dynamic 2.0 lives.
 
-### 1.4 Note on RDNA hardware acceleration
+### 1.4 Hardware acceleration across RDNA and CDNA tiers
 
 HFP4's RDNA-optimal choices (`v_ldexp_f32` for UE8M0 dequant, native FP8 WMMA on gfx1201, V_PERMLANE16 cross-lane broadcasts, VOPD dual-issue) are **not why HFP4 has lower MSE than MQ4**. Those choices make HFP4 *fast* on RDNA3/4. The MSE win comes from L1+L2+L3 — which would also be faster on Hopper / Blackwell, just not as fast as a hardware-native MXFP4 / NVFP4 there.
 
-On gfx906 (our dev box), there is **no specialized HFP4 kernel** — only the generic wave32-oriented path. HFP4/MFP4 on gfx906 is correctness-only; bench numbers from this hardware are meaningful for math but not for production tok/s.
+The harder question: **on old archs like gfx906 (CDNA1) with no WMMA, no MFMA-INT8 support relevant for compute, can HFP4/MFP4 be accelerated well enough to actually use?** This isn't decorative — gfx906 is the dev box, and we already have a mature `gemm_hfq4g256_residual_mmq_gfx906_*.hip` family that reaches **95% of stock llama.cpp** at HFQ4G256 prefill on Qwen3.5-9B. Losing that perf to ship HFP4 would be a regression.
+
+#### gfx906 ISA capability for HFP4
+
+| Capability | gfx906 | Used by HFQ4 today? | Used by HFP4 (proposed)? |
+|---|---|---|---|
+| `V_DOT4_I32_I8` (`__builtin_amdgcn_sdot4`) — 4×INT8→INT32 fused dot | **YES** | Yes (the 95%-of-llama.cpp path) | **Yes — same path** |
+| `V_DOT8_I32_I4` — 8×INT4→INT32 fused dot | **NO** (gfx908+ only) | No | No (not available; not needed) |
+| `V_DOT2_F32_F16` (`__builtin_amdgcn_fdot2`) — 2×FP16→FP32 fused dot | **YES** | Some FP16-fallback kernels | Alternative path (lower throughput) |
+| `V_PK_FMA_F16` / `V_PK_MUL_F16` — packed FP16 ops | **YES** | Yes (epilogue + non-dp4a paths) | Yes (epilogue) |
+| `v_ldexp_f32` — free UE8M0 dequant | **YES** (every RDNA/CDNA tier) | n/a (HFQ4 has no UE8M0) | **Yes** (the whole point of UE8M0) |
+| LDS bandwidth | 60 CU × 8.16 TB/s aggregate (~ 13.6 GB/s per WG) | Yes | Yes |
+| HBM2 bandwidth | 1024 GB/s peak | Yes | Yes |
+| MFMA (FP/INT matrix-fused) | gfx906 has MFMA-FP16 / MFMA-FP32 but **not relevant** because the dot product path goes through INT8, not FP-MFMA | No | No |
+| WMMA | NO (gfx11+ only) | No | No |
+
+The decisive fact: `__builtin_amdgcn_sdot4` is identical on gfx906 and gfx1100. The HFQ4 kernel already gets 95% of llama.cpp using it. The question is whether HFP4's E2M1 element format **forces** a slower path.
+
+#### The FP4 → INT8 → V_DOT4 trick (proven by llama.cpp's MXFP4)
+
+llama.cpp has a working MXFP4 (= OCP E2M1, byte-identical to HFP4's element format) implementation on the **same dp4a infrastructure** used for IQ4_NL, Q4_K, etc. The pattern from `ggml/src/ggml-cuda/mmq.cuh:867`:
+
+```c
+const int aux_q4 = get_int_b1(bxi->qs, kqsx);
+const int2 v = get_int_from_table_16(aux_q4, kvalues_mxfp4);
+// v.x, v.y now contain INT8 LUT-decoded codes
+// ... then standard dp4a accumulation:
+sumi = __dp4a(v.x, y_int.x, sumi);
+sumi = __dp4a(v.y, y_int.y, sumi);
+// per-block UE8M0 scale folded in at scale-collection stage:
+x_df[i] = ggml_cuda_e8m0_to_fp32(bxi->e) * 0.5f;
+```
+
+Where `kvalues_mxfp4 = {0, ±1, ±2, ±3, ±4, ±6, ±8, ±12}` is exactly `2 × E2M1_LUT` in INT8. The 2× factor is folded into the per-block scale at row-finalize.
+
+**This is identical to what HFP4 needs on gfx906.** The MFP4-with-rotation case is even simpler: the FWHT is offline, so the kernel sees plain HFP4G32 bytes and treats them the same. The only kernel-side diff from HFQ4G256 → HFP4G32 on the gfx906 mmq path is:
+
+1. Replace the `(n - 8) * sc` symmetric unpacking with `kvalues_hfp4[n & 0xF] * sc` (one LDS load per nibble — already LDS-cached because we initialize a 16-entry LUT once per block, exactly like the generic HFP4 kernel at `kernels/src/gemv_hfp4g32.hip:38–47`)
+2. Per-block UE8M0 byte instead of per-256 FP32 scale — fold via `v_ldexp_f32` at the block-scale collection point
+3. Per-row FP16 scale: one FP16 multiply at row finalize (currently the FP32 scale × FP16 epilogue path; cost is one `v_pk_mul_f16` per output row, amortized across K)
+
+#### Bandwidth math (gfx906, HFP4G32 vs HFQ4G256 on MMQ)
+
+The actual concern on gfx906 is **scale-load bandwidth**: HFQ4G256 has one FP32 scale + FP32 zero-point per 256 K-elements (8 B / 256 = 0.25 bpw scale overhead). HFP4G32 has UE8M0 per 32 K-elements + 16-byte row header (17 B / 32 + 16/K ≈ 4.25 + 0.025 bpw scale overhead).
+
+Per 256 K-elements:
+- HFQ4G256: 128 B nibbles + 8 B scale = **136 B**
+- HFP4G32: 128 B nibbles + 8 × 1 B UE8M0 = **136 B per group**, plus 16 B / K_row row header (~0.025 bpw)
+
+**Byte-for-byte the same per-256.** HFP4G32's per-row header adds <0.6% on K=2048+ tensors (Qwen3.5-9B `q_proj` row is 2736 B vs MQ4's 2720 B per row — already measured in the HFP4 spec). On gfx906's 1024 GB/s HBM2, this is **negligible**.
+
+The real cost is **8 scale-broadcasts per group** (UE8M0 every 32) vs **1 scale-broadcast per group** (HFQ4 every 256). On the gfx906 mmq kernel, scale broadcast happens via LDS read once per K-iteration of 32 elements anyway — HFQ4 already pays this cost because its per-256 scale must be replicated 8× in LDS for the dp4a tile-stride. **The scale-load topology is identical.** What differs is which byte the LDS holds: an FP32 scale value (HFQ4) vs a UE8M0 byte that goes through one `v_ldexp_f32` op (HFP4). One free instruction per 32 elements.
+
+#### Realistic perf estimate for HFP4G32-gfx906 MMQ kernel
+
+Porting the existing `gemm_hfq4g256_residual_mmq_gfx906_*.hip` family to HFP4G32 (the rotation-free variant; MFP4G32 is the same kernel with offline-rotated weights) requires:
+
+- Replace `(n - 8) * sc` with `kvalues[n] * sc` — same VALU count, +1 LDS read per nibble (covered by LUT in LDS)
+- Replace per-256 FP32 scale load with per-32 UE8M0 + `v_ldexp_f32` — same LDS traffic, +8 VALU ops per group
+- Add per-row FP16 scale at epilogue — 1 `v_pk_mul_f16` per output column, negligible
+- Keep existing nwarps=4, mmq_x ∈ {8..64} runtime dispatch, window streaming, b128 LDS reads, +1 bank-conflict pad — all the techniques the current kernel uses
+
+**Estimated perf vs current HFQ4G256-gfx906 MMQ (95% of llama.cpp):**
+
+| Workload | Current HFQ4G256 | Projected HFP4G32 | Why |
+|---|---|---|---|
+| pp512 prefill | 714 tok/s (95% of stock) | **620–680 tok/s** (87–95% of stock) | +8 VALU ops/group fixed cost; LDS LUT slightly increases LDS pressure; expected ~5–8% throughput hit, no fundamental ceiling change |
+| pp128 prefill | 598 tok/s | **520–580 tok/s** | Same as above |
+| decode tok/s | ~60 tok/s (BW-bound) | **~60 tok/s** (BW-bound) | Identical bytes-per-weight; decode is purely BW-limited |
+
+**Quality lift more than compensates.** A 5–8% prefill regression to get 3–5× lower per-weight MSE (per §1.3) is a clear net win for any user-facing metric — and that's before adding L4 (weighted-LS) which gets us further at zero kernel cost.
+
+If the prefill regression turns out worse than projected, two fallbacks:
+
+1. **Wider tile / coarser K-iter.** The HFQ4 kernel uses 128-K-element iter-K windows. Going to 256-K windows reduces per-group VALU overhead at the cost of larger LDS tile. The current kernel sits at 30.7 KiB/WG (2 WGs/CU); HFP4's added scale ops + LUT raise this to ~32 KiB which is exactly the budget cap — workable but tight. A 256-K window would drop us to 1 WG/CU which historically regresses ~12%. Probably not worth it.
+2. **Adopt llama.cpp's IQ4_XS pattern.** IQ4_XS uses *one super-block of 6-bit scales* per 256 elements (not per-32) — identical scale density to HFQ4G256, with LUT-decoded codes. It's the precise sweet spot for "low-arch + non-uniform 4-bit." This is the **plan B** if HFP4G32 on gfx906 turns out to underperform: reserve a HFP4XSG256 variant (16 codes E2M1 + super-block of per-32 INT6 scales + per-256 super-FP16) using qt=27 or qt=28, identical LDS topology to HFQ4G256.
+
+#### gfx906 verdict
+
+**HFP4G32 / MFP4G32 are realistically accelerable on gfx906**, with an estimated 5–8% prefill regression vs current HFQ4G256 in exchange for 3–5× lower per-weight MSE. The decode path is bandwidth-bound and unchanged. The dp4a inner loop is **byte-identical** between HFQ4 and HFP4 — the LUT-decode trick is proven by llama.cpp's MXFP4 in production on the same dp4a infrastructure.
+
+**Engineering cost:** porting one or two of the existing eight `gemm_hfq4g256_residual_mmq_gfx906_x{8..64}.hip` files to HFP4G32, plus the corresponding `fused_qkv_hfp4g32_wave64_dp4a.hip` and `fused_gate_up_hfp4g32_wave64_dp4a.hip` (mirroring the existing wave64_dp4a kernels). **Estimated 2–3 weeks of focused gfx906 kernel work** by an engineer already familiar with the HFQ4 kernel family (the patterns transfer 1:1).
+
+**Decision implication:** the Phase A roadmap (§5) does *not* need to wait on the gfx906 kernel port — Phase A is quantizer-side only. The gfx906 port is a parallel track that lands when ready. Until it lands, gfx906 users continue using HFQ4G256 / MQ4G256 (no regression vs today). Once it lands, they get the quality lift.
+
+This also means **the format roadmap (§3) is correctly bet on HFP4 even from a gfx906 perspective.** Older archs are not blocked from the quality lever; they pay a small (5–8%) throughput tax for it, and an HFP4XSG256 plan-B variant is available if even that turns out too costly.
 
 ---
 
@@ -323,6 +408,16 @@ Order matters because each step's bench harness validates the next.
 9. HFP6G32 (qt=31) — INT6 + UE8M0 + FP16 row. Promotion target for hot tensors.
 10. HFP8E4M3G32 (qt=27) — Q8-equivalent at 8 bpw. Replaces hardcoded "router/embedding/lm_head → Q8" with a real HFP-family member that has the same row header and dequant convention.
 
+### Phase B' — gfx906 kernel port (2–3 weeks, parallel with everything above)
+
+11. Port the `gemm_hfq4g256_residual_mmq_gfx906_x{8..64}.hip` family to HFP4G32. The dp4a inner loop is byte-identical (per §1.4); only the per-block scale conversion (`v_ldexp_f32` instead of FP32 load) and the LUT-decode (`kvalues_hfp4[n] * sc` instead of `(n - 8) * sc`) change. Projected: 87–95% of stock llama.cpp pp512, vs current HFQ4G256 at 95%.
+12. Port `fused_qkv_hfq4g256_wave64_dp4a.hip` and `fused_gate_up_hfq4g256_wave64_dp4a.hip` (and the qkvza variant) to HFP4G32. Same template diff as above.
+13. Speed-gate: re-run `scripts/probe_commits.sh master HEAD` on Qwen3.5-9B-HFP4 on the gfx906 dev box. Must come in within 10% of HFQ4G256-baseline pp512.
+
+If gfx906 port lands later than Phase A: gfx906 users continue on HFQ4G256 quants (no regression), Phase A's calibrated-MFP4 ships for RDNA3/4 users immediately. The gfx906 retroactively gets the quality lift when the port lands.
+
+If pp512 regression exceeds 10%, fall back to HFP4XSG256 (plan B per §1.4): one super-FP16 + per-32 INT6 scales + 16-code E2M1 LUT, qt=28 or qt=29. Identical LDS topology to HFQ4G256; quality slightly below HFP4G32 (the per-32 INT6 super-block scale is coarser than UE8M0 + FP16 row) but still strictly better than MQ4G256.
+
 ### Phase C — Arch coverage (2–3 weeks, can run in parallel with Phase B)
 
 11. Tensor-class enum + per-arch classifier (§4.2(ii)). Refactor K-map + engine loaders to consume `TensorClass` instead of substring greps.
@@ -347,6 +442,7 @@ The question we set out to answer: *"what's the current problem, and how do we g
 **The strategic posture:** **HFP4 is the format we should commit to for the next several years.** It is:
 - Architecturally extensible (4 rotation modes, 4 reserved IDs, 16 reserved metadata flags, 1 reserved sidecar pointer)
 - RDNA-optimal (UE8M0 → free `v_ldexp`; FP16 row → cheap WMMA epilogue; E2M1 → wire-compatible with future MXFP4 silicon)
+- **CDNA1/gfx906-accelerable** (the dp4a inner loop is byte-identical to HFQ4G256; LUT-decode pattern is proven by llama.cpp MXFP4; projected 87–95% of stock llama.cpp pp512 — see §1.4)
 - Arch-portable (zero per-arch fields in the per-tensor format; arch concerns ride in tensor-class classifier + per-tensor metadata sidecar)
 - Quantization-quality-extensible (all of L4 + L5 closes inside the existing wire format)
 
