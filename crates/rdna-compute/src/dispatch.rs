@@ -6008,6 +6008,28 @@ impl Gpu {
                 qkv_m, z_m, beta_m, alpha_m, k,
             );
         }
+        // gfx906 prefill: chained dense MMQ × 4 (qkv + z + beta + alpha).
+        // Note: beta_m and alpha_m can be small (<128 → less than one
+        // MMQ_Y tile); the MMQ kernel still handles small M correctly
+        // via the row-clamp tail guard, but it leaves output rows in
+        // the same tile underutilized. For now match the HFQ4 qkvza
+        // pattern (line 4823) which has the same property and ships
+        // in production. A tail-kernel optimization would be a
+        // follow-up if profiles show it matters.
+        if self.arch == "gfx906" && batch_size > 1 && should_use_mmq(&self.arch, batch_size) {
+            let xq = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+            let r1 = self.gemm_hfp4g32_mmq_set_gfx906(a_qkv, xq, y_qkv, qkv_m, k, batch_size);
+            let r2 = if r1.is_ok() {
+                self.gemm_hfp4g32_mmq_set_gfx906(a_z, xq, y_z, z_m, k, batch_size)
+            } else { Ok(()) };
+            let r3 = if r2.is_ok() {
+                self.gemm_hfp4g32_mmq_set_gfx906(a_beta, xq, y_beta, beta_m, k, batch_size)
+            } else { Ok(()) };
+            let r4 = if r3.is_ok() {
+                self.gemm_hfp4g32_mmq_set_gfx906(a_alpha, xq, y_alpha, alpha_m, k, batch_size)
+            } else { Ok(()) };
+            return r1.and(r2).and(r3).and(r4);
+        }
         if has_wmma_f16_gfx12(&self.arch) {
             return self.gemm_qkvza_hfp4g32_wmma_gfx12(
                 a_qkv, a_z, a_beta, a_alpha, x,
@@ -6976,14 +6998,26 @@ impl Gpu {
         self.bind_thread()?;
         // gfx906 decode path: use the wave64 dp4a port. Mirrors the
         // HFQ4 routing at `fused_qkv_hfq4g256`:4444 (decode-only).
-        // Batched gfx906 HFP4 prefill for fused QKV is not yet ported
-        // (see /tmp/gfx906_hfp4.md Step 2 — covered by the dense MMQ
-        // family for non-fused projections; fused-prefill is a Phase
-        // B'-follow-up).
         if self.arch == "gfx906" && batch_size == 1 && gemv_dp4a_enabled(&self.arch) {
             return self.fused_qkv_hfp4g32_dp4a(
                 a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k,
             );
+        }
+        // gfx906 prefill path: pre-quantize x to Q8_1 once, then run
+        // the dense HFP4 MMQ kernel 3× (Q, K, V) sharing the scratch.
+        // Mirrors the HFQ4 pattern at line 5249. All three of q_m,
+        // k_m, v_m are well above MMQ_Y=128 on Qwen 9B (4096, 1024,
+        // 1024), so no tail kernel is needed.
+        if self.arch == "gfx906" && batch_size > 1 && should_use_mmq(&self.arch, batch_size) {
+            let xq = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+            let r1 = self.gemm_hfp4g32_mmq_set_gfx906(a_q, xq, y_q, q_m, k, batch_size);
+            let r2 = if r1.is_ok() {
+                self.gemm_hfp4g32_mmq_set_gfx906(a_k, xq, y_k, k_m, k, batch_size)
+            } else { Ok(()) };
+            let r3 = if r2.is_ok() {
+                self.gemm_hfp4g32_mmq_set_gfx906(a_v, xq, y_v, v_m, k, batch_size)
+            } else { Ok(()) };
+            return r1.and(r2).and(r3);
         }
         // FP8 WMMA gate: only at batch sizes where the prefill bench
         // measured ≥1× vs FP16 WMMA. At small batches (decode FA QKV
@@ -7456,12 +7490,23 @@ impl Gpu {
         k: usize, batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        // gfx906 decode path: wave64 dp4a port. Decode-only; batched
-        // prefill on gfx906 currently has no fused HFP4 fast path.
+        // gfx906 decode path: wave64 dp4a port.
         if self.arch == "gfx906" && batch_size == 1 && gemv_dp4a_enabled(&self.arch) {
             return self.fused_gate_up_hfp4g32_dp4a(
                 a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k,
             );
+        }
+        // gfx906 prefill: chained dense MMQ × 2 (gate, up). Q8_1
+        // prequant is shared across both calls (and with the QKV /
+        // wo / w_down chain when ensure_q8_1_mmq_x's cache hits on
+        // the same x pointer within a layer).
+        if self.arch == "gfx906" && batch_size > 1 && should_use_mmq(&self.arch, batch_size) {
+            let xq = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+            let r1 = self.gemm_hfp4g32_mmq_set_gfx906(a_gate, xq, y_gate, gate_m, k, batch_size);
+            let r2 = if r1.is_ok() {
+                self.gemm_hfp4g32_mmq_set_gfx906(a_up, xq, y_up, up_m, k, batch_size)
+            } else { Ok(()) };
+            return r1.and(r2);
         }
         if has_wmma_f16_gfx12(&self.arch) {
             return self.gemm_gate_up_hfp4g32_wmma_gfx12(
@@ -9673,6 +9718,111 @@ impl Gpu {
             &kernel_name,
             [row_tiles as u32, batch_tiles as u32, 1],
             [64, 4, 1], // nwarps=4
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr); b.push_ptr(xq_ptr); b.push_ptr(y_ptr);
+                b.push_i32(m_val); b.push_i32(k_val); b.push_i32(n_val);
+                b.push_i32(add_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// Set-mode (add=0) HFP4 MMQ for gfx906 — sister of
+    /// `gemm_hfq4g256_mmq_set_gfx906`. Takes a pre-quantized Q8_1
+    /// activation pointer so the caller can amortize the prequant
+    /// cost across 2-4 sequential fused outputs (matching the HFQ4
+    /// pattern at `gemm_qkv_hfq4g256:5249`).
+    pub fn gemm_hfp4g32_mmq_set_gfx906(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_q8_ptr: *mut c_void,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let mmq_x = if batch_size <= 8 { 8 }
+            else if batch_size <= 16 { 16 }
+            else if batch_size <= 24 { 24 }
+            else if batch_size <= 32 { 32 }
+            else if batch_size <= 40 { 40 }
+            else if batch_size <= 48 { 48 }
+            else if batch_size <= 56 { 56 }
+            else { 64 };
+
+        let is_full = m % 128 == 0 && batch_size % mmq_x == 0;
+        let base_name = "gemm_hfp4g32_residual_mmq_gfx906";
+        let kernel_name = if is_full {
+            format!("{}_full_set_x{}", base_name, mmq_x)
+        } else {
+            format!("{}_x{}", base_name, mmq_x)
+        };
+
+        let wrapper_src = match mmq_x {
+            8  => kernels::GEMM_HFP4G32_RESIDUAL_MMQ_GFX906_X8_SRC,
+            16 => kernels::GEMM_HFP4G32_RESIDUAL_MMQ_GFX906_X16_SRC,
+            24 => kernels::GEMM_HFP4G32_RESIDUAL_MMQ_GFX906_X24_SRC,
+            32 => kernels::GEMM_HFP4G32_RESIDUAL_MMQ_GFX906_X32_SRC,
+            40 => kernels::GEMM_HFP4G32_RESIDUAL_MMQ_GFX906_X40_SRC,
+            48 => kernels::GEMM_HFP4G32_RESIDUAL_MMQ_GFX906_X48_SRC,
+            56 => kernels::GEMM_HFP4G32_RESIDUAL_MMQ_GFX906_X56_SRC,
+            64 => kernels::GEMM_HFP4G32_RESIDUAL_MMQ_GFX906_X64_SRC,
+            _ => unreachable!(),
+        };
+        let inlined = wrapper_src.replace(
+            "#include \"gemm_hfp4g32_residual_mmq_gfx906_body.cuh\"",
+            kernels::GEMM_HFP4G32_RESIDUAL_MMQ_GFX906_BODY_CUH,
+        );
+
+        self.ensure_kernel(&format!("{}_x{}", base_name, mmq_x), &inlined, &kernel_name)?;
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut xq_ptr = x_q8_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut add_val = 0i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut xq_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+            &mut add_val as *mut _ as *mut c_void,
+        ];
+
+        const MMQ_Y: usize = 128;
+        let x_stride: usize = if mmq_x >= 32 { 40 } else { 33 };
+        const Y_STRIDE: usize = 36;
+        const X_DS_FLOATS: usize = 128 * 4;
+        const LUT_BYTES: usize = 16;
+        let row_tiles = (m + MMQ_Y - 1) / MMQ_Y;
+        let batch_tiles = (batch_size + mmq_x - 1) / mmq_x;
+
+        let shared_mem = (
+            LUT_BYTES
+            + (MMQ_Y * x_stride * 4)
+            + (X_DS_FLOATS * 4)
+            + (mmq_x * Y_STRIDE * 4)
+        ) as u32;
+        debug_assert!(shared_mem as usize <= 32 * 1024,
+            "gfx906 HFP4 MMQ LDS budget exceeded: {} B > 32 KiB", shared_mem);
+
+        let bytes = crate::profile::gemv_hfp4g32_bytes(m, k)
+            + batch_size * m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_hfp4g32_mmq_set_gfx906", bytes);
+        let result = self.launch_maybe_blob(
+            &kernel_name,
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [64, 4, 1],
             shared_mem,
             &mut params,
             || {

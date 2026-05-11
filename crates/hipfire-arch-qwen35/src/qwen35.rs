@@ -3875,6 +3875,14 @@ fn is_batchable_la(dt: DType, arch: &str) -> bool {
             | "gfx1200" | "gfx1201"
         );
 
+    // HFP4G32 / MFP4G32 on gfx906 (CDNA1/Vega 20): the dp4a MMQ kernel
+    // family ships the batched-prefill path here (chained dense MMQ ×
+    // 2-4 for fused projections + dense MMQ for wo/w_down). Mirrors the
+    // HFQ4 routing in dispatch.rs::gemm_qkv_hfq4g256 etc. — same
+    // ensure_q8_1_mmq_x amortization across a layer's projections.
+    let fp4_with_dp4a_gfx906 = matches!(dt, DType::HFP4G32 | DType::MFP4G32)
+        && arch == "gfx906";
+
     // Lloyd-MQ3 (MQ3G256Lloyd) on gfx11: Phase 5 of issue #116 ships the
     // gemm_*_mq3g256_lloyd_wmma family alongside the existing HFQ3 WMMA
     // path; group stride differs (112 B Lloyd vs 104 B HFQ3) so dispatch
@@ -3900,7 +3908,8 @@ fn is_batchable_la(dt: DType, arch: &str) -> bool {
         && matches!(arch, "gfx1200" | "gfx1201")
         && std::env::var("HIPFIRE_LLOYD_GFX12").ok().as_deref() == Some("1");
 
-    mq3_uniform_with_wmma || lloyd_mq3_with_gfx11_wmma || lloyd_mq3_with_gfx12_wmma || fp4_with_wmma
+    mq3_uniform_with_wmma || lloyd_mq3_with_gfx11_wmma || lloyd_mq3_with_gfx12_wmma
+        || fp4_with_wmma || fp4_with_dp4a_gfx906
 }
 
 /// Process one chunk of up to `pbs.max_batch` tokens through the batched
