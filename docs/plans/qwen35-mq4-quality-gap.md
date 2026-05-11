@@ -390,19 +390,66 @@ What it actually takes to add these arches, given the format roadmap above:
 
 This is the ordered roadmap that gets us from where we are (MFP4 ships, A3B spiral exposed, 6.2× KLD gap to Unsloth) to *beating* Unsloth Dynamic 2.0 at the same bpw on RDNA.
 
-### Phase A — Quantizer quality, no format change (4–6 weeks)
+### Phase A — Quantizer quality, no format change (5–7 weeks)
+
+**Framing update (2026-05-12).** Per the rebuttal exchange in `hfp4-fivetide-rebuttal-perspective.md`, the original Phase A had two structural weaknesses:
+
+1. Every step had a per-weight-MSE target. Phase 11 + the fivetide PPL/KLD divergence both showed per-weight MSE is a misleading single yardstick — calibration on a target the bench can't actually measure is calibration on luck.
+2. The original Phase A calibrates on top of MFP4G32 as the assumed baseline. With the PPL/KLD split, the baseline-format choice is empirically open; running each lever on multiple baselines is the cheap way to resolve it.
+
+Two prerequisite steps are added (Step 0 and Step 0.5) and every L4/L5 step gets the same multi-baseline treatment. Net cost: +1 week vs the original 4–6 week estimate. Net benefit: each step ships with evidence about the metric users care about, not just the metric easiest to compute.
 
 Order matters because each step's bench harness validates the next.
 
-1. **(week 1)** L4a — Weighted-LS UE8M0 chooser. Land as quantizer-only patch; existing HFP4 files unchanged byte-format. Bench: MSE on Qwen3.5-9B BF16 reference tensors should drop ~5–7%.
-2. **(week 1.5)** L4b — Weighted-LS FP16 row scale. Bench: combined MSE drops 8–12%.
-3. **(week 2)** L5a — `--tensor-type "regex=quant"` CLI. Mechanism only; no quality change. Ships K-map presets as default `.kmap` configs for Qwen3.5, Qwen3.6, Llama3, Gemma2/3.
-4. **(week 3)** L5b — `imatrix_collect` example. New `crates/hipfire-runtime/examples/imatrix_collect.rs` runs forward pass on calibration corpus and dumps `Σ act²` per linear-layer input dim to sidecar `.imatrix.bin`. Calibration corpus: wikitext-103-test (300k tok) + humaneval prompts (50k tok) + slice of HF datasets multi-turn chat (650k tok) ≈ 1M tokens.
-5. **(week 4)** L5c — Activation-weighted LS in MFP4G32 quantize path. **The dominant lever.** Bench: KLD-mean on Qwen3.5-9B with calibrated MFP4 should drop from 0.876 (current) to **0.20–0.30** (within 1.5× of UD-Q4_K_XL).
-6. **(week 5)** L5d — imatrix-driven per-tensor bit allocation. Use per-tensor `Σ(Act²)` and ZD score to pick HFP4G32 / HFP6G32 / Q8 per tensor; bit budget held constant. Bench: KLD-mean drops another 15–30%.
-7. **(week 6)** Smoke test: re-run train-pursuit reasoning on calibrated MFP4 A3B. **Strong prediction** (low confidence — hedged because Phase 11 already falsified one quant-quality hypothesis): the A3B spiral resolves or moves to a different attractor signature.
+**Step 0 — Bench expansion (3–5 days). Prerequisite for everything below.**
 
-**Expected end state of Phase A:** KLD-mean on Qwen3.5-9B between **0.10 and 0.20** — competitive with or beating UD-Q4_K_XL. PPL within 1–2% of Q4_K_M + imatrix at the same bpw. **All without a wire-format change.**
+Today's `scripts/bench_quant_quality.sh` emits MSE + final-norm sanity + train-pursuit smoke test. That's not enough to distinguish PPL-good-KLD-bad from PPL-bad-KLD-good. Extend the bench to emit, per format variant:
+
+- Per-tensor MSE vs FP16 safetensors reference (already in `quant_quality_mse.rs`)
+- **KLD vs FP16 reference logits** on a held-out corpus (~50k tokens; new — requires a daemon-side option to dump per-token logit distributions and a reference run on the same prompts)
+- **PPL on wikitext-2-test, ctx=2048, asym4 KV** (matches fivetide's methodology so cross-validation is direct)
+- **HumanEval pass@1** (downstream task; closer to what users actually do than wikitext PPL)
+- Train-pursuit reasoning attractor smoke (already in the bench)
+
+Output: single markdown table per quantization variant, suitable for diffing across PRs.
+
+**Step 0.5 — Reproduce fivetide's numbers in-tree (3 days).**
+
+Before optimizing anything, confirm we and fivetide measure the same thing for the same inputs. Quantize Qwen3.5-{0.8B, 4B, 9B} and Qwen3.6-A3B as {MQ4G256, MFP4G32, HFP4G32 unrotated}, run the Step 0 bench on each, compare to fivetide's published 2026-05-11 PPL table + 2026-05-12 KLD note. If the numbers reproduce within bench noise, Phase A baselines are validated. If they diverge, methodology debugging is the next step and Phase A pauses until the source of divergence is found.
+
+This also produces the **multi-baseline reference table** the rest of Phase A is measured against.
+
+**Step 1 (week 2) — L4a: Weighted-LS UE8M0 chooser.**
+
+Land as quantizer-only patch; existing HFP4 files unchanged byte-format. Replace `ceil(log2(block_max / 6.0))` with a small candidate search over `block_e ∈ {e_ideal-1, e_ideal, e_ideal+1}` + brute-force re-rounding minimizing per-block MSE. Bench against Step 0.5 reference: target is *any improvement on KLD-mean or HumanEval pass@1*, not the original "5–7% per-weight MSE drop" — MSE is a leading indicator only.
+
+**Step 2 (week 2.5) — L4b: Weighted-LS FP16 row scale.**
+
+Replace `max_abs(row) / 6.0` with a search for `row_scale_a` minimizing post-block-quantization MSE. Same bench targets as Step 1. Land together with Step 1 if both are independent quantizer-side changes.
+
+**Step 3 (week 3) — L5a: `--tensor-type "regex=quant"` CLI.**
+
+Generalize hardcoded K-map rules to a CLI/config-driven regex matcher; ship K-map presets as default `.kmap` configs for Qwen3.5, Qwen3.6, Llama3, Gemma2/3. **Mechanism only — no quality change expected.** Unblocks A/B experiments without rebuilding the quantizer.
+
+**Step 4 (week 4) — L5b: `imatrix_collect` example.**
+
+New `crates/hipfire-runtime/examples/imatrix_collect.rs` runs forward pass on calibration corpus and dumps `Σ act²` per linear-layer input dim to sidecar `.imatrix.bin`. Calibration corpus: wikitext-103-test (300k tok) + humaneval prompts (50k tok) + slice of HF datasets multi-turn chat (650k tok) ≈ 1M tokens. Mechanism only at this stage; sidecar `.imatrix.bin` is consumed in Step 5.
+
+**Step 5 (week 5) — L5c: Activation-weighted LS in quantize path. The dominant lever.**
+
+Swap `min Σ (w - q)²` for `min Σ act²[i] · (w[i] - q[i])²` in each per-block fit (UE8M0 + FP16 row), using the Step 4 imatrix as the `act²` source. **Run this against all three baselines** (MQ4G256, MFP4G32, HFP4G32-unrotated) so we learn whether calibration disproportionately helps one format. **Empirical target, not predicted target:** KLD-mean on Qwen3.5-9B drops materially vs the corresponding Step 0.5 baseline; the specific number is whatever measurement says — the original "0.20–0.30" projection is now an open question.
+
+**Step 6 (week 6) — L5d: imatrix-driven per-tensor bit allocation.**
+
+Use per-tensor `Σ(Act²)` + ZD score (Liu et al. 2024) to pick HFP4G32 / HFP6G32 / Q8 per tensor; bit budget held constant. Replaces hardcoded K-map rule 4/5 with data-driven promotion. Bench across baselines; pick the winner.
+
+**Step 7 (week 7) — A3B reasoning smoke + multi-metric decision.**
+
+Re-run train-pursuit reasoning on calibrated A3B (best Phase-A configuration from Step 5–6 measurements). **Hedged prediction** (low confidence — Phase 11 already falsified one quant-quality hypothesis for the spiral): either the spiral resolves on the calibrated config, or it doesn't and the residual coherence work moves entirely to runtime-side levers per Thread 2 §"Phase 11 engine-pass implications".
+
+Decision: at this point we have, for each baseline format × calibration combination, a complete (PPL, KLD, HumanEval, attractor) measurement table on Qwen3.5-{0.8B, 4B, 9B} + Qwen3.6-A3B. Pick the default format per arch on evidence, not on the per-weight-MSE story.
+
+**Expected end state of Phase A:** decision made on evidence. The original "Phase A delivers KLD-mean 0.10–0.20" projection was based on per-weight-MSE extrapolation; it should be treated as a hopeful ceiling, not a target. The honest target is "deliver enough data to choose a default with confidence." Multi-format calibrated quants land for whichever model × format combination measures best, with explicit "different default format per arch" tolerated if the data supports it. **All without a wire-format change** — the wire-format extensibility analysis in §3 stands regardless of which element format ends up the winner.
 
 ### Phase B — Format-family fillout (3–4 weeks, can run in parallel with Phase A)
 

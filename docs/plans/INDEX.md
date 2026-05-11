@@ -18,6 +18,8 @@ When a thread completes and ships, move its docs to `docs/investigations/<date>-
 
 The strategic format decision for the next several years. MQ4 → HFP4 (PR #224) → MFP4 (PR #225) closed the per-weight format-quality levers; the remaining gap to Unsloth Dynamic 2.0 is activation-aware calibration (imatrix). **However:** fivetide initially measured +25–94% PPL regression of MFP4G32 vs MQ4G256 on Qwen3.5 dense, and then their own KLD follow-up reversed the picture (FWHT helps E2M1 on KLD). The format roadmap is still useful for organizing engineering work; the strategic conclusion ("commit to HFP4") is suspended pending downstream-task evidence. Phase A (imatrix calibration) is still the right engineering — just on top of a baseline-format question that's empirically open.
 
+**Phase A entry point:** `qwen35-mq4-quality-gap.md` §5 (lines 393+). The 2026-05-12 framing update adds two prerequisite steps (Step 0 — bench expansion to emit MSE + KLD + PPL + HumanEval per format variant; Step 0.5 — reproduce fivetide's PPL + KLD numbers in-tree as the multi-baseline reference table) before any quantizer-side change lands. Each L4/L5 step then runs against three baseline formats (MQ4G256, MFP4G32, HFP4G32-unrotated) rather than assuming MFP4 as the calibration baseline. Net: 5–7 weeks (vs original 4–6) for evidence-based format decision rather than projection-based.
+
 | Doc | Role |
 |---|---|
 | `qwen35-mq4-quality-gap.md` | **Master roadmap** (carries a 2026-05-11 header annotation flagging the rebuttal). Per-lever taxonomy (L1–L5), what HFP4 closed, what's missing, format-extension plan, future-proofing for Gemma / Qwen2.5-VL, gfx906 acceleration analysis, Phase A/B/B'/C/D sequencing. |
