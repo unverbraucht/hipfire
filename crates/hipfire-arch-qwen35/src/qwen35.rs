@@ -691,6 +691,20 @@ fn load_norm_weight_raw(hfq: &HfqFile, gpu: &mut Gpu, name: &str, shape: &[usize
     gpu.upload_f32(&f32_data, shape)
 }
 
+/// Should the MoE final norm fall back to the pre-fix raw load (no `+= 1.0`)?
+///
+/// Default is false (correct GemmaRMSNorm convention for everyone). Setting
+/// `HIPFIRE_QWEN_MOE_FINAL_NORM_RAW=1` opts MoE models back into the
+/// pre-93c015e under-scaled behavior. See `load_weights` (the main load
+/// path) for the rationale block, and `docs/plans/qwen35-moe-rmsnorm-fix.md`
+/// for the full audit trail.
+fn moe_final_norm_raw_fallback(num_experts: usize) -> bool {
+    num_experts > 0
+        && std::env::var("HIPFIRE_QWEN_MOE_FINAL_NORM_RAW")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+}
+
 
 /// Load weight tensor from raw bytes + quant_type (no name lookup needed).
 fn load_weight_tensor_raw(gpu: &Gpu, quant_type: u8, data: &[u8], m: usize, k: usize) -> HipResult<WeightTensor> {
@@ -1233,15 +1247,29 @@ pub fn load_weights(hfq: &mut HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> 
     drop(embd_data); // free source buffer before loading more tensors
 
     eprintln!("  loading output_norm...");
-    // Final output norm: on Qwen3.5/3.6-MoE (A3B, arch_id=6) this tensor is
-    // stored as a raw RMSNorm scale (mean ~+1.6), NOT as deviation-from-0 like
-    // the per-block norms. Applying `w += 1.0` (via `load_norm_weight`) would
-    // over-amplify the pre-lm_head hidden state by ~60%, which on 3.6 MQ4 tips
-    // the model into infinite `<think>` spirals on reasoning prompts (3.5 MQ4
-    // tolerates it but is still subtly wrong). Dense Qwen3.5 0.8B/4B/9B use
-    // the deviation-from-0 convention and require `+=1.0` — they keep their
-    // byte-exact quality-gate baselines unchanged. Gate on num_experts > 0.
-    let output_norm = if config.num_experts > 0 {
+    // GemmaRMSNorm storage convention is uniform across the Qwen3.5+ family:
+    // safetensors store raw `w` (init from zero, can train to any magnitude),
+    // engines apply `(1 + w)` at runtime. Hipfire's `load_norm_weight` bakes
+    // `+= 1.0` at load time so the kernel can stay plain `x * w * rms` —
+    // mathematically equivalent to vLLM's runtime `weight + 1.0` and
+    // llama.cpp's GGUF-conversion-time bake. See
+    // docs/plans/qwen35-moe-rmsnorm-fix.md for the concrete arithmetic trace.
+    //
+    // The earlier `if config.num_experts > 0` fork (commit 1e01c0b) called
+    // `load_norm_weight_raw` for MoE to silence a `<think>` infinite-spiral
+    // on Qwen3.6-A3B reasoning prompts. That under-scaled the MoE final norm
+    // by ~38% (e.g. on 3.6-A3B: stored mean +1.63 → effective scale 1.63
+    // instead of the correct 2.63 = 1 + 1.63 that vLLM/llama.cpp produce).
+    // The spiral is most likely a separate precision bug elsewhere in the
+    // MoE path (expert routing numerics, quantization interaction); reducing
+    // the final-norm scale was a fortuitous magnitude mask, not a fix.
+    //
+    // The fork is removed. If the spiral returns on Qwen3.6-A3B reasoning
+    // prompts, set `HIPFIRE_QWEN_MOE_FINAL_NORM_RAW=1` to fall back to the
+    // old behavior while the underlying MoE precision bug gets a separate
+    // audit. Default is correct convention for everyone.
+    let output_norm = if moe_final_norm_raw_fallback(config.num_experts) {
+        eprintln!("    HIPFIRE_QWEN_MOE_FINAL_NORM_RAW=1: skipping +1 bake on MoE final norm (workaround mode)");
         load_norm_weight_raw(hfq, gpu, "norm.weight", &[config.dim])?
     } else {
         load_norm_weight(hfq, gpu, "norm.weight", &[config.dim])?
@@ -1470,7 +1498,10 @@ fn load_output_into(
     gpu: &mut Gpu,
 ) -> HipResult<(GpuTensor, WeightTensor)> {
     eprintln!("  loading output_norm...");
-    let output_norm = if config.num_experts > 0 {
+    // See the matching block in the main load path for the rationale and
+    // the `HIPFIRE_QWEN_MOE_FINAL_NORM_RAW` env-var fallback.
+    let output_norm = if moe_final_norm_raw_fallback(config.num_experts) {
+        eprintln!("    HIPFIRE_QWEN_MOE_FINAL_NORM_RAW=1: skipping +1 bake on MoE final norm (workaround mode)");
         load_norm_weight_raw(hfq, gpu, "norm.weight", &[config.dim])?
     } else {
         load_norm_weight(hfq, gpu, "norm.weight", &[config.dim])?
