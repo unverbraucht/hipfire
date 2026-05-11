@@ -290,13 +290,110 @@ fn dequant_mq6g256(data: &[u8], n: usize, signs1: &[f32], signs2: &[f32]) -> Vec
     out
 }
 
-fn try_dequant(qt: u8, data: &[u8], n: usize, s1: &[f32], s2: &[f32]) -> Option<Vec<f32>> {
+/// E2M1 LUT — OCP-spec FP4 magnitudes (matches kernels/src/gemv_hfp4g32.hip
+/// and crates/hipfire-quantize/src/main.rs E2M1_LUT). Eight signed
+/// magnitudes; sign bit at position 3.
+const E2M1_LUT: [f32; 16] = [
+    0.0,  0.5,  1.0,  1.5,  2.0,  3.0,  4.0,  6.0,
+    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+];
+
+/// HFP4G32 dequant (qt=21). Per-row layout: 16-B header + (k/32) blocks
+/// × 17 B each. K must be a multiple of 32 (the v1 kernel further
+/// requires k%256==0 but the byte format itself is k%32-aligned).
+///
+/// Header: u16 row_scale_a (f16) + u16 row_scale_b (f16) + u16 block_count
+///         + u8 format_flags + u8 reserved + 8 B reserved.
+/// Per block: u8 block_e (UE8M0) + 16 B nibbles (low=even, high=odd index).
+/// Element value: row_scale_a · 2^(block_e − 127) · E2M1_LUT[nibble].
+///
+/// Note: this honors format_flags bit 0 (rotation present) only at the
+/// MFP4G32 caller — dequant_mfp4g32 calls this then applies inverse FWHT.
+fn dequant_hfp4g32_row(data: &[u8], k: usize, out: &mut Vec<f32>) {
+    let row_scale_a = f16_to_f32(u16::from_le_bytes([data[0], data[1]]));
+    // row_scale_b and format_flags are ignored here — the caller decides
+    // whether to apply inverse rotation based on quant_type (qt=24 = MFP4).
+    let n_blocks = k / 32;
+    let body_off = 16usize;
+    for b in 0..n_blocks {
+        let off = body_off + b * 17;
+        let block_e = data[off] as i32;
+        // 2^(block_e - 127); free `v_ldexp_f32` on RDNA at runtime.
+        let block_scale = ((block_e - 127) as f32).exp2();
+        let sc = row_scale_a * block_scale;
+        for i in 0..16 {
+            let byte = data[off + 1 + i];
+            let lo_nibble = (byte & 0x0F) as usize;
+            let hi_nibble = (byte >> 4) as usize;
+            out.push(sc * E2M1_LUT[lo_nibble]);
+            out.push(sc * E2M1_LUT[hi_nibble]);
+        }
+    }
+}
+
+fn dequant_hfp4g32(data: &[u8], shape: &[u32], n: usize) -> Vec<f32> {
+    // 2D weight: shape = [m, k]. 1D unsupported (the format requires a
+    // per-row header).
+    let (m, k) = match shape.len() {
+        2 => (shape[0] as usize, shape[1] as usize),
+        _ => return Vec::new(),
+    };
+    let row_bytes = 16 + 17 * (k / 32);
+    let mut out = Vec::with_capacity(m * k);
+    for r in 0..m {
+        let row_off = r * row_bytes;
+        if row_off + row_bytes > data.len() { break; }
+        dequant_hfp4g32_row(&data[row_off..row_off + row_bytes], k, &mut out);
+    }
+    out.truncate(n);
+    out
+}
+
+/// MFP4G32 dequant (qt=24). HFP4G32 + offline FWHT-256 rotation.
+/// `k` must additionally be a multiple of 256 because the rotation
+/// signs1/signs2 are fixed-256. Inverse FWHT is forward FWHT with
+/// signs1/signs2 swapped (orthogonal).
+fn dequant_mfp4g32(data: &[u8], shape: &[u32], n: usize, signs1: &[f32], signs2: &[f32]) -> Vec<f32> {
+    let (m, k) = match shape.len() {
+        2 => (shape[0] as usize, shape[1] as usize),
+        _ => return Vec::new(),
+    };
+    if k % 256 != 0 {
+        return Vec::new();
+    }
+    let row_bytes = 16 + 17 * (k / 32);
+    let mut out = Vec::with_capacity(m * k);
+    let mut row_buf: Vec<f32> = Vec::with_capacity(k);
+    for r in 0..m {
+        let row_off = r * row_bytes;
+        if row_off + row_bytes > data.len() { break; }
+        row_buf.clear();
+        dequant_hfp4g32_row(&data[row_off..row_off + row_bytes], k, &mut row_buf);
+        // Inverse FWHT per 256-element segment. Matches the quantizer's
+        // forward pass (gen_fwht_signs(42), gen_fwht_signs(1042)) and
+        // MQ4/MQ6 dequant: pass signs2 first because forward applied
+        // signs2 last.
+        let segs = k / 256;
+        for seg in 0..segs {
+            let mut buf = [0.0f32; 256];
+            buf.copy_from_slice(&row_buf[seg * 256..(seg + 1) * 256]);
+            cpu_fwht_256(&mut buf, signs2, signs1);
+            out.extend_from_slice(&buf);
+        }
+    }
+    out.truncate(n);
+    out
+}
+
+fn try_dequant(qt: u8, data: &[u8], shape: &[u32], n: usize, s1: &[f32], s2: &[f32]) -> Option<Vec<f32>> {
     match qt {
         1 => Some(dequant_f16(data, n)),
         2 => Some(dequant_f32(data, n)),
         3 => Some(dequant_q8_0(data, n)),
         13 => Some(dequant_mq4g256(data, n, s1, s2)),
         15 => Some(dequant_mq6g256(data, n, s1, s2)),
+        21 => Some(dequant_hfp4g32(data, shape, n)),
+        24 => Some(dequant_mfp4g32(data, shape, n, s1, s2)),
         _ => None,
     }
 }
@@ -308,6 +405,8 @@ fn qt_label(qt: u8) -> &'static str {
         3 => "Q8_0",
         13 => "MQ4G256",
         15 => "MQ6G256",
+        21 => "HFP4G32",
+        24 => "MFP4G32",
         _ => "?",
     }
 }
@@ -398,7 +497,7 @@ fn main() {
         }
 
         let (_info, hfq_data) = hfq.tensor_data_vec(&hfq_t.name).expect("read hfq");
-        let hfq_f32 = match try_dequant(hfq_t.quant_type, &hfq_data, n_hfq, &signs1, &signs2) {
+        let hfq_f32 = match try_dequant(hfq_t.quant_type, &hfq_data, &hfq_t.shape, n_hfq, &signs1, &signs2) {
             Some(v) => v,
             None => {
                 *skipped_qt.entry(hfq_t.quant_type).or_insert(0) += 1;
