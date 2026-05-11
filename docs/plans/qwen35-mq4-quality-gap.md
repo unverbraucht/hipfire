@@ -413,6 +413,13 @@ Today's `scripts/bench_quant_quality.sh` emits MSE + final-norm sanity + train-p
 
 Output: single markdown table per quantization variant, suitable for diffing across PRs.
 
+**Status 2026-05-12 — Step 0 partially shipped.** The cohort orchestrator + per-variant artifact layout + 4 of 5 metrics are now in tree:
+
+- `scripts/quant_cohort.sh` — cohort runner; per-variant artifacts land under `benchmarks/quality-baselines/results/YYYY-MM-DD-cohort-<label>/` matching the schema from `docs/plans/issue-113-quant-quality-eval.md` so the chore/113 branch's `kld_reduce.py` can consume them unchanged.
+- `crates/hipfire-runtime/examples/quant_quality_mse.rs` — extended with HFP4G32 (qt=21) and MFP4G32 (qt=24) dequant. Sanity-verified against `/local/hipfire/qwen3.6-35b-a3b-mfp4.hfq` (MFP4G32 mean MSE 1.24e-6, matches PR #225 expectation).
+- `scripts/bench_humaneval_completion.sh` — per-variant completion capture on the 3 in-tree humaneval prompts. Captures completion + tokens_used + finish_reason; pass@1 scoring is a Step 0.5 follow-up that needs sandboxed Python eval.
+- KLD + PPL columns are stubbed in the cohort table (placeholder `(awaits #113)`) — drop-in patch when `chore/113-quant-eval-plan` merges replaces 8 lines of the per-variant loop.
+
 **Step 0.5 — Reproduce fivetide's numbers in-tree (3 days).**
 
 Before optimizing anything, confirm we and fivetide measure the same thing for the same inputs. Quantize Qwen3.5-{0.8B, 4B, 9B} and Qwen3.6-A3B as {MQ4G256, MFP4G32, HFP4G32 unrotated}, run the Step 0 bench on each, compare to fivetide's published 2026-05-11 PPL table + 2026-05-12 KLD note. If the numbers reproduce within bench noise, Phase A baselines are validated. If they diverge, methodology debugging is the next step and Phase A pauses until the source of divergence is found.
@@ -519,7 +526,9 @@ The risk is Phase 11's lesson: the A3B `<think>` spiral was not closed by reduci
 - `crates/hipfire-runtime/src/hfq.rs` — `.hfq` file format reader
 - `crates/hipfire-runtime/examples/quant_quality_mse.rs` — per-tensor MSE harness
 - `crates/hipfire-runtime/examples/compare_hfq.rs` — tensor-by-tensor NRMSE diff
-- `scripts/bench_quant_quality.sh` — combined MSE + smoke triple
+- `scripts/bench_quant_quality.sh` — combined MSE + smoke triple (predecessor to `quant_cohort.sh`)
+- `scripts/quant_cohort.sh` — Phase A Step 0 cohort runner; orchestrates MSE + (KLD stub) + (PPL stub) + HumanEval + reasoning smoke per variant
+- `scripts/bench_humaneval_completion.sh` — per-variant HumanEval prompt completion capture
 
 ### External
 - OCP Microscaling Formats (MX) v1.0 — element format reference for E2M1
