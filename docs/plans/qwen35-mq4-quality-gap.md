@@ -413,18 +413,46 @@ Today's `scripts/bench_quant_quality.sh` emits MSE + final-norm sanity + train-p
 
 Output: single markdown table per quantization variant, suitable for diffing across PRs.
 
-**Status 2026-05-12 — Step 0 partially shipped.** The cohort orchestrator + per-variant artifact layout + 4 of 5 metrics are now in tree:
+**Status 2026-05-12 — Step 0 shipped.** All 5 metrics live after the #113 / #233 / #236 merges plus the MFP4G32 v2 batched WMMA work (#235):
 
-- `scripts/quant_cohort.sh` — cohort runner; per-variant artifacts land under `benchmarks/quality-baselines/results/YYYY-MM-DD-cohort-<label>/` matching the schema from `docs/plans/issue-113-quant-quality-eval.md` so the chore/113 branch's `kld_reduce.py` can consume them unchanged.
+- `scripts/quant_cohort.sh` — cohort runner; orchestrates MSE + KLD + PPL + HumanEval + reasoning smoke per variant. Per-variant artifacts land under `benchmarks/quality-baselines/results/YYYY-MM-DD-cohort-<label>/` matching the canonical #113 schema. KLD/PPL columns now populated via real `eval_hipfire` invocations (CI verified against shipped MQ4 9B kldseq: reduce reproduces commit `cdbf07c`'s 0.876237 to 4 decimal places).
 - `crates/hipfire-runtime/examples/quant_quality_mse.rs` — extended with HFP4G32 (qt=21) and MFP4G32 (qt=24) dequant. Sanity-verified against `/local/hipfire/qwen3.6-35b-a3b-mfp4.hfq` (MFP4G32 mean MSE 1.24e-6, matches PR #225 expectation).
-- `scripts/bench_humaneval_completion.sh` — per-variant completion capture on the 3 in-tree humaneval prompts. Captures completion + tokens_used + finish_reason; pass@1 scoring is a Step 0.5 follow-up that needs sandboxed Python eval.
-- KLD + PPL columns are stubbed in the cohort table (placeholder `(awaits #113)`) — drop-in patch when `chore/113-quant-eval-plan` merges replaces 8 lines of the per-variant loop.
+- `scripts/bench_humaneval_completion.sh` — per-variant completion capture on the 3 in-tree humaneval prompts.
+- `crates/hipfire-runtime/examples/eval_hipfire.rs` — canonical KLD scoring (per #113). Defaults to `--scoring-mode prefill`, which is **~7× faster end-to-end on gfx1100** than per-token mode and produces a different (more accurate) measurement class — see §5.3 of `issue-113-quant-quality-eval.md`.
 
-**Step 0.5 — Reproduce fivetide's numbers in-tree (3 days).**
+**Target arch update 2026-05-12.** Phase A bench cohorts will run on **gfx1100 (7900 XTX) not gfx906**. The reasoning:
 
-Before optimizing anything, confirm we and fivetide measure the same thing for the same inputs. Quantize Qwen3.5-{0.8B, 4B, 9B} and Qwen3.6-A3B as {MQ4G256, MFP4G32, HFP4G32 unrotated}, run the Step 0 bench on each, compare to fivetide's published 2026-05-11 PPL table + 2026-05-12 KLD note. If the numbers reproduce within bench noise, Phase A baselines are validated. If they diverge, methodology debugging is the next step and Phase A pauses until the source of divergence is found.
+- **MFP4 kernels are validated on gfx11+.** Per #225 + #235 (MFP4G32 v2 batched WMMA), the production-quality MFP4 path targets gfx11/gfx12. On gfx906 MFP4 runs through the generic wave32-tier kernel (~50% lane utilization) — fine for math validation, not representative of what users will actually see.
+- **gfx1100 prefill mode delivers 2162 tok/s on 9B-MQ4** (vs 108 tok/s per-token); end-to-end full-slice run ≈55 min instead of 6h32m. A 3-baseline cohort on 9B takes ~3 h instead of ~30 h. Phase A can iterate at a useful cadence.
+- **The format-quality conclusion is per-arch.** Phase 11 already established that gfx906 MFP4 is correctness-only on this hardware. Phase A's job is to determine the right *format + calibration* combination for the arches where users actually run hipfire, which means gfx11+ first. gfx906 catches up via the Phase B' kernel port plan.
+- **Cross-arch sanity checks remain valuable.** A small "did the result reproduce" cohort on gfx906 (1-2 variants, quick-slice 256 chunks ≈ 1.4 h each) is worth running at major milestones to confirm the conclusion isn't arch-specific. Not for every Phase A step.
 
-This also produces the **multi-baseline reference table** the rest of Phase A is measured against.
+The §1.4 gfx906 acceleration analysis is **not invalidated** — it stays as the future-proofing argument for old-arch users post-Phase-B'. It just isn't the right venue to run the Phase A measurement campaign.
+
+**Step 0.5 — Reproduce fivetide's numbers in-tree on gfx1100 (1–2 days at quick-slice; 1 week full slice).**
+
+Before optimizing anything, confirm we and fivetide measure the same thing for the same inputs. Quantize Qwen3.5-{0.8B, 4B, 9B} and Qwen3.6-A3B as {MQ4G256, MFP4G32, HFP4G32 unrotated}, run the Step 0 bench on each, compare to fivetide's published 2026-05-11 PPL table + 2026-05-12 KLD note.
+
+**Run on gfx1100, prefill scoring mode.** Wall budget per cohort:
+
+| Scope | gfx1100 prefill mode | gfx906 per-token (reference only) |
+|---|---|---|
+| 1 model × 1 variant, quick-slice 256 chunks | ~12 min | ~1.4 h |
+| 1 model × 3 baselines, quick-slice | ~40 min | ~4 h |
+| 1 model × 3 baselines, full slice 1175 chunks | ~3 h | ~30 h |
+| 4 models × 3 baselines, full slice | ~12 h | ~5 days |
+
+Iteration cadence on gfx1100 means we can refresh the multi-baseline reference table within a working day. Quick-slice (256 chunks) is the development bench; full-slice locks in commit-worthy results.
+
+**Methodology fixed-points (cannot drift across runs):**
+- `--scoring-mode prefill` (canonical per #113 §5; do NOT mix per-token + prefill rows)
+- `--kv-mode asym3` (matches the shipped MQ4 9B reference at `cdbf07c`)
+- Slice md5 `83b0205a304bf4e52172ecdb05f2e895` (locked corpus; baked into `benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt`)
+- llama.cpp commit `9dcf83552887bb898b4a98a5761361e504e31fc3` for any GGUF-anchor cross-checks
+
+If our numbers reproduce fivetide's within bench noise (~CI width), Phase A baselines are validated. If they diverge, methodology debugging is the next step and Phase A pauses until the source of divergence is found.
+
+This also produces the **multi-baseline reference table** the rest of Phase A is measured against. Note: per-token historical rows from `2026-05-08/per-seq/` are NOT comparable to the new prefill-mode reference (the modes differ ~−6.75% in mean-KLD per §5.3 of the eval plan; they're separate measurement classes).
 
 **Step 1 (week 2) — L4a: Weighted-LS UE8M0 chooser.**
 

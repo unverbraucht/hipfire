@@ -41,10 +41,12 @@
 #                          Reference fetcher: scripts/fetch-eval-refs.sh
 #                          (refs go to benchmarks/quality-baselines/refs/).
 #   --max-chunks N         Cap eval_hipfire to N chunks (full slice is
-#                          1175). 256 chunks ≈ 1.4 h per 9B variant on
-#                          gfx906; full slice ≈ 9-11 h per variant.
-#                          Use for during-development iteration; omit for
-#                          "lock the result" cohorts.
+#                          1175). Wall-time per 9B variant (prefill mode,
+#                          asym3 KV):
+#                            gfx1100: ~12 min at 256 chunks, ~55 min full
+#                            gfx906:  ~1.4 h at 256 chunks, ~9-11 h full
+#                          Use quick-slice for during-development
+#                          iteration; full slice for lock-the-result.
 #   --kv-mode <mode>       q8 | asym2 | asym3 | asym4 (default: asym3)
 #   --scoring-mode <mode>  per-token | prefill (default: prefill, the
 #                          canonical hipfire scoring path per #113)

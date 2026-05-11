@@ -20,6 +20,8 @@ The strategic format decision for the next several years. MQ4 → HFP4 (PR #224)
 
 **Phase A entry point:** `qwen35-mq4-quality-gap.md` §5 (lines 393+). The 2026-05-12 framing update adds two prerequisite steps (Step 0 — bench expansion to emit MSE + KLD + PPL + HumanEval per format variant; Step 0.5 — reproduce fivetide's PPL + KLD numbers in-tree as the multi-baseline reference table) before any quantizer-side change lands. Each L4/L5 step then runs against three baseline formats (MQ4G256, MFP4G32, HFP4G32-unrotated) rather than assuming MFP4 as the calibration baseline. Net: 5–7 weeks (vs original 4–6) for evidence-based format decision rather than projection-based.
 
+**Phase A target arch: gfx1100** (not the gfx906 dev box). MFP4 kernels are validated on gfx11+ (#225 + #235 batched WMMA); gfx1100 prefill mode delivers 2162 tok/s on 9B-MQ4 vs 108 tok/s per-token (~20× kernel, ~7× end-to-end including KLD compute). A full-slice 4-model × 3-baseline cohort takes ~12 h on gfx1100 vs ~5 days on gfx906 — gfx1100 makes Phase A iteration tractable. gfx906 cross-arch sanity checks happen at major milestones via quick-slice (256 chunks).
+
 | Doc | Role |
 |---|---|
 | `qwen35-mq4-quality-gap.md` | **Master roadmap** (carries a 2026-05-11 header annotation flagging the rebuttal). Per-lever taxonomy (L1–L5), what HFP4 closed, what's missing, format-extension plan, future-proofing for Gemma / Qwen2.5-VL, gfx906 acceleration analysis, Phase A/B/B'/C/D sequencing. |
