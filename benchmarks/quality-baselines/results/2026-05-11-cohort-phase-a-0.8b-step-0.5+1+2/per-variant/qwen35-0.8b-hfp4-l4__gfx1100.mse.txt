@@ -1,0 +1,66 @@
+
+tensor                                                                        qt             n           MSE   max_abs_err
+------------------------------------------------------------------------------------------------------------------------
+model.language_model.layers.0.linear_attn.in_proj_a.weight               HFP4G32         16384     1.6897e-5     2.6978e-2
+model.language_model.layers.22.linear_attn.in_proj_a.weight              HFP4G32         16384     1.2062e-5     2.8748e-2
+model.language_model.layers.1.linear_attn.in_proj_a.weight               HFP4G32         16384     1.1122e-5     2.3865e-2
+model.language_model.layers.20.linear_attn.in_proj_a.weight              HFP4G32         16384     9.9143e-6     2.7435e-2
+model.language_model.layers.21.linear_attn.in_proj_a.weight              HFP4G32         16384     9.7391e-6     2.4841e-2
+model.language_model.layers.2.linear_attn.in_proj_a.weight               HFP4G32         16384     9.4172e-6     2.5330e-2
+model.language_model.layers.4.linear_attn.in_proj_a.weight               HFP4G32         16384     8.9414e-6     2.5391e-2
+model.language_model.layers.12.linear_attn.in_proj_a.weight              HFP4G32         16384     8.5173e-6     2.2400e-2
+model.language_model.layers.9.linear_attn.in_proj_a.weight               HFP4G32         16384     8.0300e-6     2.0538e-2
+model.language_model.layers.17.linear_attn.in_proj_a.weight              HFP4G32         16384     7.8547e-6     3.2227e-2
+model.language_model.layers.16.linear_attn.in_proj_a.weight              HFP4G32         16384     7.6519e-6     1.9348e-2
+model.language_model.layers.5.linear_attn.in_proj_a.weight               HFP4G32         16384     6.9818e-6     1.7639e-2
+model.language_model.layers.10.linear_attn.in_proj_a.weight              HFP4G32         16384     6.9729e-6     1.8707e-2
+model.language_model.layers.20.linear_attn.in_proj_qkv.weight            HFP4G32       6291456     6.8389e-6     5.5847e-2
+model.language_model.layers.18.linear_attn.in_proj_qkv.weight            HFP4G32       6291456     6.7231e-6     5.1819e-2
+model.language_model.layers.18.linear_attn.in_proj_a.weight              HFP4G32         16384     6.6371e-6     1.6968e-2
+model.language_model.layers.8.linear_attn.in_proj_a.weight               HFP4G32         16384     6.3725e-6     1.9897e-2
+model.language_model.layers.21.linear_attn.in_proj_qkv.weight            HFP4G32       6291456     6.2802e-6     4.8096e-2
+model.language_model.layers.17.linear_attn.in_proj_qkv.weight            HFP4G32       6291456     6.2308e-6     5.7617e-2
+model.language_model.layers.13.linear_attn.in_proj_a.weight              HFP4G32         16384     6.1999e-6     1.7822e-2
+model.language_model.layers.6.linear_attn.in_proj_a.weight               HFP4G32         16384     6.1550e-6     1.7731e-2
+model.language_model.layers.14.linear_attn.in_proj_a.weight              HFP4G32         16384     6.1104e-6     1.7944e-2
+model.language_model.layers.19.self_attn.v_proj.weight                   HFP4G32        524288     5.5670e-6     3.7842e-2
+model.language_model.layers.16.linear_attn.in_proj_qkv.weight            HFP4G32       6291456     5.4675e-6     4.1504e-2
+model.language_model.layers.22.linear_attn.in_proj_qkv.weight            HFP4G32       6291456     4.8766e-6     4.9805e-2
+model.language_model.layers.3.self_attn.q_proj.weight                    HFP4G32       4194304     4.7083e-6     2.8015e-2
+model.language_model.layers.22.linear_attn.in_proj_b.weight              HFP4G32         16384     4.6507e-6     1.6113e-2
+model.language_model.layers.2.linear_attn.in_proj_z.weight               HFP4G32       2097152     4.5788e-6     2.2156e-2
+model.language_model.layers.23.self_attn.v_proj.weight                   HFP4G32        524288     4.5349e-6     2.5116e-2
+model.language_model.layers.1.linear_attn.in_proj_z.weight               HFP4G32       2097152     4.4133e-6     2.3590e-2
+model.language_model.layers.23.mlp.gate_proj.weight                      HFP4G32       3670016     4.3778e-6     4.9316e-2
+model.language_model.layers.20.linear_attn.in_proj_b.weight              HFP4G32         16384     4.3535e-6     1.5869e-2
+model.language_model.layers.4.linear_attn.in_proj_qkv.weight             HFP4G32       6291456     4.3160e-6     3.9551e-2
+model.language_model.layers.2.linear_attn.in_proj_b.weight               HFP4G32         16384     4.2532e-6     1.7578e-2
+model.language_model.layers.9.linear_attn.in_proj_b.weight               HFP4G32         16384     4.2337e-6     1.8616e-2
+model.language_model.layers.1.linear_attn.in_proj_b.weight               HFP4G32         16384     4.2313e-6     2.0569e-2
+model.language_model.layers.10.linear_attn.in_proj_b.weight              HFP4G32         16384     4.1533e-6     2.0996e-2
+model.language_model.layers.12.linear_attn.in_proj_qkv.weight            HFP4G32       6291456     4.1208e-6     3.7964e-2
+model.language_model.layers.0.linear_attn.in_proj_b.weight               HFP4G32         16384     3.9199e-6     2.0264e-2
+model.language_model.layers.22.linear_attn.in_proj_z.weight              HFP4G32       2097152     3.8992e-6     3.9185e-2
+model.language_model.layers.4.linear_attn.in_proj_z.weight               HFP4G32       2097152     3.8762e-6     2.5269e-2
+model.language_model.layers.21.linear_attn.in_proj_z.weight              HFP4G32       2097152     3.8446e-6     2.5177e-2
+model.language_model.layers.18.mlp.gate_proj.weight                      HFP4G32       3670016     3.8393e-6     3.4424e-2
+model.language_model.layers.5.linear_attn.in_proj_qkv.weight             HFP4G32       6291456     3.8005e-6     3.7048e-2
+model.language_model.layers.14.linear_attn.in_proj_qkv.weight            HFP4G32       6291456     3.7525e-6     3.8086e-2
+model.language_model.layers.22.mlp.gate_proj.weight                      HFP4G32       3670016     3.7426e-6     6.2012e-2
+model.language_model.layers.20.linear_attn.in_proj_z.weight              HFP4G32       2097152     3.7390e-6     2.6184e-2
+model.language_model.layers.13.linear_attn.in_proj_qkv.weight            HFP4G32       6291456     3.6853e-6     3.3569e-2
+model.language_model.layers.0.linear_attn.in_proj_z.weight               HFP4G32       2097152     3.6448e-6     2.8931e-2
+model.language_model.layers.15.self_attn.v_proj.weight                   HFP4G32        524288     3.5907e-6     3.7842e-2
+
+=== Aggregate stats by quant type ===
+qt          tensors    total_params        mean MSE         p99 MSE         max MSE
+-------------------------------------------------------------------------------------
+F16             115           56128       1.4210e-8       1.6737e-7       1.7707e-7
+Q8_0              1       254279680       1.2025e-8       1.2025e-8       1.2025e-8
+HFP4G32         186       497614848       3.0026e-6       1.2062e-5       1.6897e-5
+
+=== Skipped ===
+  filter:           0
+  no safetensors:   0
+  3D expert:        0
+  qt=7:          18 (no dequantizer)
