@@ -182,10 +182,17 @@ V1 (gfx1100 MQ4 full slice, 1175 chunks, 2026-05-11) measured a **−6.75% mean-
 | MQ3 (uniform) | prefill (gfx11 WMMA) | prefill (gfx12 WMMA) | per-token fallback |
 | MQ3-Lloyd | prefill (gfx11) | prefill if `HIPFIRE_LLOYD_GFX12=1` | per-token fallback |
 | MQ4-Lloyd | per-token (issue #182 not yet in batchable set) | per-token | per-token |
-| HFP4G32 | per-token (no GEMM kernel; PR #224 v2 deferred) | per-token | per-token |
-| MFP4G32 | per-token (same kernel family as HFP4G32) | per-token | per-token |
+| HFP4G32 | prefill (gfx11/gfx12 WMMA) | prefill (gfx12 WMMA) | per-token fallback |
+| MFP4G32 | prefill (gfx11/gfx12 WMMA) | prefill (gfx12 WMMA) | per-token fallback |
 
-When HFP4/MFP4 lands a batched WMMA kernel (PR #224 v2), those variants enter the batchable set and inherit prefill scoring automatically.
+PR #235 (Kaden-Schutt, merged 2026-05-11 via commit `37aa9b01`) superseded the
+deferred PR #224 v2 and landed the batched-WMMA prefill kernel family
+(`gemm_qkv_hfp4g32_wmma`, `gemm_qkvza_hfp4g32_wmma`, `gemm_gate_up_hfp4g32_wmma`,
+`gemm_hfp4g32_residual_wmma`) in both gfx11 + gfx12 variants. The runtime gate
+(`llama.rs::is_batchable_la`) and qwen35 arch gate (`qwen35.rs::is_batchable_la`)
+were both flipped to return `true` for `DType::HFP4G32` and `DType::MFP4G32` on
+gfx11+/gfx12. HFP4/MFP4 cohort variants now run in prefill mode by default on
+gfx1100, with the same ~7× end-to-end speedup over per-token that MQ4 enjoys.
 
 ---
 
