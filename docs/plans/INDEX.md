@@ -13,10 +13,10 @@ When a thread completes and ships, move its docs to `docs/investigations/<date>-
 ## Thread 1 — Quantization format roadmap (HFP4 / MFP4 commit) — under review
 
 **Master doc:** `qwen35-mq4-quality-gap.md`
-**Rebuttal:** `hfp4-fivetide-rebuttal-perspective.md` (2026-05-11)
-**Status:** Strategic claim under review. Fivetide's empirical PPL analysis contradicts the per-weight-MSE extrapolation underlying the format roadmap. Phase A (calibration) work is still valid; the *baseline format* it should calibrate on top of is now an open question.
+**Rebuttal + KLD update:** `hfp4-fivetide-rebuttal-perspective.md` (2026-05-11 + 2026-05-12)
+**Status:** Strategic claim under review, pending multi-metric resolution. Fivetide's PPL analysis (2026-05-11) showed MFP4 losing on PPL; their KLD measurement (2026-05-12 update) showed FWHT helps E2M1 on KLD — opposite signal. Neither metric alone is sufficient; downstream task metrics are the next yardsticks.
 
-The strategic format decision for the next several years. MQ4 → HFP4 (PR #224) → MFP4 (PR #225) closed the per-weight format-quality levers; the remaining gap to Unsloth Dynamic 2.0 is activation-aware calibration (imatrix). **However:** fivetide measured +25–94% PPL regression of MFP4G32 vs MQ4G256 on Qwen3.5 dense — the per-weight MSE win doesn't translate to PPL because post-FWHT weight kurtosis is sub-Gaussian (≈2.82) where E2M1's non-uniform codepoints become a liability. The format roadmap is still useful for organizing engineering work; the strategic conclusion ("commit to HFP4") needs re-validation.
+The strategic format decision for the next several years. MQ4 → HFP4 (PR #224) → MFP4 (PR #225) closed the per-weight format-quality levers; the remaining gap to Unsloth Dynamic 2.0 is activation-aware calibration (imatrix). **However:** fivetide initially measured +25–94% PPL regression of MFP4G32 vs MQ4G256 on Qwen3.5 dense, and then their own KLD follow-up reversed the picture (FWHT helps E2M1 on KLD). The format roadmap is still useful for organizing engineering work; the strategic conclusion ("commit to HFP4") is suspended pending downstream-task evidence. Phase A (imatrix calibration) is still the right engineering — just on top of a baseline-format question that's empirically open.
 
 | Doc | Role |
 |---|---|

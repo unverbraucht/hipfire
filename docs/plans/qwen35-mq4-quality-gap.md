@@ -9,7 +9,7 @@ The doc has three movements: (1) the journey MQ4 → HFP4 → MFP4 and the empir
 
 ---
 
-> **⚠ 2026-05-11 update — partial rebuttal of §1.3 and §2.4 claims.** Fivetide's empirical PPL analysis (`docs/plans/hfp4-fivetide-rebuttal-perspective.md`) shows MFP4G32 produces +25–94% worse PPL than MQ4G256 on Qwen3.5 dense models. The per-weight MSE win this doc projects for MFP4 is real but does **not** translate to model quality — post-FWHT weight kurtosis is sub-Gaussian (≈2.82) where E2M1's non-uniform codepoint allocation becomes counterproductive. The strategic recommendation in §6 ("commit to HFP4 for the next several years") is downgraded to "MFP4 may be the wrong default; investigate before committing further." Read the rebuttal doc alongside this one.
+> **⚠ 2026-05-11 / 2026-05-12 update — empirical picture is more nuanced than either §1.3 or §6 claimed.** Fivetide's PPL analysis (`docs/plans/hfp4-fivetide-rebuttal-perspective.md`) initially showed MFP4G32 producing +25–94% worse PPL than MQ4G256 on Qwen3.5 dense (which would have demolished §1.3's MSE-based extrapolation). On 2026-05-12 fivetide added KLD measurements on Qwen3.5-0.8B that **reverse the picture** — FWHT helps E2M1 on KLD, opposite to what PPL showed. The strategic recommendation in §6 ("commit to HFP4 for the next several years") is downgraded to **"format choice pending multi-metric empirical resolution"** — neither MFP4 nor MQ4 has sufficient evidence to be a confident default. The per-weight MSE story in §1.3 was the wrong yardstick; the PPL story alone is the wrong yardstick; KLD + downstream task metrics are the next yardsticks to add. Read the rebuttal doc alongside this one.
 
 ## 1. The journey so far (per-lever noise wins)
 

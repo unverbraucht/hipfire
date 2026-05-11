@@ -1,10 +1,47 @@
 # Perspective on fivetide's HFP4 quality analysis
 
-**Date:** 2026-05-11
+**Date:** 2026-05-11 (KLD update: 2026-05-12)
 **Triggering doc:** `fivetide/hipfire@docs/hfp4-quality-investigation/docs/investigations/2026-05-11-hfp4-quality-analysis.md`
-**Status:** Active engagement. Fivetide's empirical PPL numbers are real and require us to revisit the strategic claim in `qwen35-mq4-quality-gap.md`. This doc is the honest reconciliation, not a defense.
+**Status:** Active engagement, now bidirectional. The PPL story and the KLD story diverge sharply — neither alone is sufficient evidence. The "measure, don't assume" line in the original next-actions list turned out to apply equally to fivetide's PPL-only conclusion and to my MSE-only extrapolation.
 
-## TL;DR
+## 2026-05-12 update — KLD reverses the picture (per fivetide)
+
+Fivetide ran KLD measurement on Qwen3.5-0.8B and reports the picture is **different from PPL** at first look. Specifically: **FWHT helps E2M1 on KLD**, which directly inverts what their PPL data showed and what their kurtosis-driven theoretical argument predicted.
+
+This is significant for three reasons:
+
+1. **Fivetide retracted the "FWHT + E2M1 anti-synergy" framing in real-time** based on KLD data. That's the right way to do this work, and it sharpens rather than weakens their overall investigation — they're now driving the same conclusion I argued in §"On the bigger question: is PPL the right yardstick?" below: PPL is one metric, not the metric, and looking at multiple yardsticks changes the picture.
+
+2. **The kurtosis / Lloyd-Max codebook argument needs reframing, not retraction.** Post-FWHT weight kurtosis really is ~2.82 (sub-Gaussian) and INT4-uniform really does beat E2M1 on per-block reconstruction MSE. Both still measured, both still true. The piece that turned out to be the wrong inference is "therefore E2M1's non-uniformity is a model-quality liability." Distribution shape → optimal codebook is a per-block reconstruction story; KLD measures something downstream that the reconstruction story doesn't capture.
+
+3. **My §"What this means for the format roadmap" downgrade was directionally right but partly for the wrong reason.** I downgraded "commit to HFP4" based on PPL evidence. The actual situation is: PPL is one signal, KLD is a different (and arguably more representative) signal, and they disagree. The honest update is **not** "MFP4 is the wrong default" — it's "MFP4 vs MQ4 is metric-dependent on dense Qwen3.5, and we don't have enough data yet to call it on either side."
+
+### What this changes about everything below
+
+The PPL discussion in §"Where fivetide is right" and §"What this means for the format roadmap" stays as a record of what looked true on 2026-05-11. **The strategic implications are weaker than I framed them** because:
+
+- The "NRMSE paradox" (MFP4 wins per-tensor reconstruction, loses PPL) is real but is now joined by a counter-paradox: **the PPL paradox** — MFP4 loses PPL but apparently doesn't lose KLD. Two metrics, two answers, neither sufficient alone.
+- The Lloyd-Max codebook argument continues to be right *about codebook MSE* and underdetermined *about model quality*. The "kurtosis → uniform optimal" framing is true for the reconstruction problem and not necessarily true for the inference problem.
+- Phase A engineering (imatrix calibration + weighted LS) is **still** the right work, and the bet that calibrated MFP4 beats UD-Q4_K_XL on KLD now has *empirical support* (at least on 0.8B; replication on 9B + A3B remains owed).
+- The "Path A: calibrated MQ4 vs Path B: revised HFP4" framing in §"What this means for the format roadmap" is now better framed as **"calibrate both, measure both KLD and PPL and downstream tasks, decide on evidence."**
+
+### What I'd add to my own §"On the bigger question: is PPL the right yardstick?"
+
+The KLD reversal is a real-time empirical confirmation of that section's argument. I'd extend it now with:
+
+- **PPL and KLD can disagree at the same bpw on the same model with the same format pair.** This isn't a metric-quibble; it's a structural property of how each metric weights different parts of the output distribution. PPL is dominated by the most-confident tokens (where the FP16 reference is sharply peaked); KLD measures distribution-shape preservation across all probabilities. A quant that "blurs" sharp peaks but preserves shape will look worse on PPL and better on KLD.
+- **For hipfire's user use-cases, KLD is plausibly closer to "what users care about" than PPL.** Reasoning, instruction-following, and tool-use depend on the model preserving its probability shape across many low-probability tokens (the ones that carry instruction-following signal). A model that confidently produces wikitext-fluent fluff but loses tool-call shape preservation is PPL-good and KLD-bad. The agentic-coding workflow described in CLAUDE.md is much more KLD-sensitive than PPL-sensitive.
+- **The right next bench is downstream tasks, not just metric-stacking.** Even KLD is a proxy. HumanEval, MMLU, an agentic harness, or LLM-as-judge on real prompts would be more direct evidence than either PPL or KLD.
+
+### Updated honest meta-lesson
+
+My original meta-lesson said "I was too confident in the per-weight-MSE framing." The updated version: **the empirical investigation correctly humbled the MSE story; the PPL data correctly humbled the MFP4 story; the KLD data correctly humbled the PPL story.** None of these metrics is the final word on quantization quality. The right working stance is: every metric tells you about a *projection* of model quality, and shipping a format requires looking at enough projections to triangulate. We don't have enough projections yet to ship either MQ4 or MFP4 with confidence — but we have enough to know that the question is empirically tractable with the engineering we've already planned.
+
+This is good news, not bad. It means the path forward is well-defined: build the multi-metric bench, run the comparisons, decide on evidence. The strategic update to `qwen35-mq4-quality-gap.md` should reflect "format choice pending multi-metric empirical resolution" rather than either "ship HFP4" or "abandon HFP4."
+
+---
+
+## TL;DR (original 2026-05-11 — partially superseded by the KLD update above)
 
 Fivetide presents the strongest empirical case against MFP4G32 I've seen: **+25–94% PPL regression vs MQ4G256 across three Qwen3.5 model sizes**, with a theoretical root-cause story (post-FWHT kurtosis ≈ 2.82 → sub-Gaussian → uniform-optimal → E2M1 non-uniform spacing is counterproductive) and a Lloyd-Max codebook analysis backing it.
 
