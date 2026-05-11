@@ -3152,6 +3152,14 @@ impl Gpu {
     ) -> HipResult<()> {
         assert!(k % 256 == 0, "gemv_hfp4g32 requires K%256==0 in v1, got K={}", k);
         self.bind_thread()?;
+        // gfx906 wave64 dp4a path — replaces the wave32 F32 fallback
+        // (the default `gemv_hfp4g32.hip` is `__launch_bounds__(32, 16)`
+        // and wastes half the wave on a wave64-native arch). Same dp4a
+        // trick as the fused kernels: Q8_1 activations + LUT-decoded
+        // signed INT8 weights + 2× E2M1 LUT folded into scale.
+        if self.arch == "gfx906" && gemv_dp4a_enabled(&self.arch) {
+            return self.gemv_hfp4g32_wave64_dp4a(a_raw, x, y, m, k);
+        }
         // Shape-gated: FP8 dot4 only when M is large enough that it
         // actually wins (FFN shapes). At M < 4096 the fallback wins or
         // ties; uniform-FP8 was net-negative in 9B Qwen 3.5 decode.
@@ -3167,6 +3175,60 @@ impl Gpu {
             return self.gemv_hfp4g32_dot2_gfx11(a_raw, x, y, m, k);
         }
         self.gemv_hfp4g32_fallback(a_raw, x, y, m, k)
+    }
+
+    /// gfx906 wave64 dp4a port of single-output HFP4G32 GEMV. Pre-
+    /// quantizes x to Q8_1 via the shared MMQ scratch, then runs the
+    /// dp4a-based kernel. Sister of `fused_qkv_hfp4g32_dp4a` for the
+    /// 1-output case (e.g. lm_head, single-projection ops on decode).
+    pub fn gemv_hfp4g32_wave64_dp4a(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let xq_ptr = self.ensure_q8_1_mmq_x(x, 1, k)?;
+
+        self.ensure_kernel(
+            "gemv_hfp4g32_wave64_dp4a",
+            kernels::GEMV_HFP4G32_WAVE64_DP4A_SRC,
+            "gemv_hfp4g32_wave64_dp4a",
+        )?;
+
+        let a_ptr = a_raw.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut xq = xq_ptr;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &mut xq as *mut _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+
+        // 2 rows per block (one row per 32-lane warp).
+        let grid_x = ((m as u32) + 1) / 2;
+
+        let bytes = crate::profile::gemv_hfp4g32_bytes(m, k);
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_hfp4g32_wave64_dp4a", bytes);
+        let result = self.launch_maybe_blob(
+            "gemv_hfp4g32_wave64_dp4a",
+            [grid_x, 1, 1], [64, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr); b.push_ptr(xq); b.push_ptr(y_ptr);
+                b.push_i32(m_val); b.push_i32(k_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
     }
 
     /// Direct fallback entry point (F32 mul+fma chain). Useful for
@@ -5937,6 +5999,15 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // gfx906 decode path: wave64 dp4a port for DeltaNet LA
+        // preamble. Mirrors HFQ4 routing at fused_qkvza_hfq4g256:4534.
+        if self.arch == "gfx906" && batch_size == 1 && gemv_dp4a_enabled(&self.arch) {
+            return self.fused_qkvza_hfp4g32_dp4a(
+                a_qkv, a_z, a_beta, a_alpha, x,
+                y_qkv, y_z, y_beta, y_alpha,
+                qkv_m, z_m, beta_m, alpha_m, k,
+            );
+        }
         if has_wmma_f16_gfx12(&self.arch) {
             return self.gemm_qkvza_hfp4g32_wmma_gfx12(
                 a_qkv, a_z, a_beta, a_alpha, x,
@@ -5947,6 +6018,81 @@ impl Gpu {
             a_qkv, a_z, a_beta, a_alpha, x,
             y_qkv, y_z, y_beta, y_alpha,
             qkv_m, z_m, beta_m, alpha_m, k, batch_size)
+    }
+
+    /// gfx906 wave64 dp4a port of fused 4-way HFP4G32 QKVZA preamble.
+    /// Sister of `fused_qkvza_hfq4g256_dp4a`. Decode-only (batch=1).
+    pub fn fused_qkvza_hfp4g32_dp4a(
+        &mut self,
+        a_qkv: &GpuTensor, a_z: &GpuTensor, a_beta: &GpuTensor, a_alpha: &GpuTensor,
+        x: &GpuTensor,
+        y_qkv: &GpuTensor, y_z: &GpuTensor, y_beta: &GpuTensor, y_alpha: &GpuTensor,
+        qkv_m: usize, z_m: usize, beta_m: usize, alpha_m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let xq_ptr = self.ensure_q8_1_mmq_x(x, 1, k)?;
+
+        self.ensure_kernel(
+            "fused_qkvza_hfp4g32_wave64_dp4a",
+            kernels::FUSED_QKVZA_HFP4G32_WAVE64_DP4A_SRC,
+            "fused_qkvza_hfp4g32_wave64_dp4a",
+        )?;
+
+        let aq = a_qkv.buf.as_ptr();
+        let az = a_z.buf.as_ptr();
+        let ab = a_beta.buf.as_ptr();
+        let aa = a_alpha.buf.as_ptr();
+        let yq = y_qkv.buf.as_ptr();
+        let yz = y_z.buf.as_ptr();
+        let yb = y_beta.buf.as_ptr();
+        let ya = y_alpha.buf.as_ptr();
+        let qkv_m_val = qkv_m as i32;
+        let z_m_val = z_m as i32;
+        let beta_m_val = beta_m as i32;
+        let alpha_m_val = alpha_m as i32;
+        let k_val = k as i32;
+        let total = (qkv_m + z_m + beta_m + alpha_m) as u32;
+        let mut xq = xq_ptr;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &aq as *const _ as *mut c_void,
+            &az as *const _ as *mut c_void,
+            &ab as *const _ as *mut c_void,
+            &aa as *const _ as *mut c_void,
+            &mut xq as *mut _ as *mut c_void,
+            &yq as *const _ as *mut c_void,
+            &yz as *const _ as *mut c_void,
+            &yb as *const _ as *mut c_void,
+            &ya as *const _ as *mut c_void,
+            &qkv_m_val as *const _ as *mut c_void,
+            &z_m_val as *const _ as *mut c_void,
+            &beta_m_val as *const _ as *mut c_void,
+            &alpha_m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+
+        let bytes = crate::profile::gemv_hfp4g32_bytes(qkv_m, k)
+                  + crate::profile::gemv_hfp4g32_bytes(z_m, k)
+                  + crate::profile::gemv_hfp4g32_bytes(beta_m, k)
+                  + crate::profile::gemv_hfp4g32_bytes(alpha_m, k);
+        let timer = crate::profile::begin_timer(&self.hip, "fused", "fused_qkvza_hfp4g32_dp4a", bytes);
+        let result = self.launch_maybe_blob(
+            "fused_qkvza_hfp4g32_wave64_dp4a",
+            [(total + 1) / 2, 1, 1], [64, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(aq); b.push_ptr(az); b.push_ptr(ab); b.push_ptr(aa);
+                b.push_ptr(xq);
+                b.push_ptr(yq); b.push_ptr(yz); b.push_ptr(yb); b.push_ptr(ya);
+                b.push_i32(qkv_m_val); b.push_i32(z_m_val);
+                b.push_i32(beta_m_val); b.push_i32(alpha_m_val);
+                b.push_i32(k_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
     }
 
     pub fn gemm_qkvza_hfp4g32_wmma(
@@ -6828,6 +6974,17 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // gfx906 decode path: use the wave64 dp4a port. Mirrors the
+        // HFQ4 routing at `fused_qkv_hfq4g256`:4444 (decode-only).
+        // Batched gfx906 HFP4 prefill for fused QKV is not yet ported
+        // (see /tmp/gfx906_hfp4.md Step 2 — covered by the dense MMQ
+        // family for non-fused projections; fused-prefill is a Phase
+        // B'-follow-up).
+        if self.arch == "gfx906" && batch_size == 1 && gemv_dp4a_enabled(&self.arch) {
+            return self.fused_qkv_hfp4g32_dp4a(
+                a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k,
+            );
+        }
         // FP8 WMMA gate: only at batch sizes where the prefill bench
         // measured ≥1× vs FP16 WMMA. At small batches (decode FA QKV
         // calls this with batch_size=1) the FP8 path measures
@@ -6844,6 +7001,75 @@ impl Gpu {
                 a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
         }
         self.gemm_qkv_hfp4g32_wmma(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size)
+    }
+
+    /// gfx906 wave64 dp4a port of fused 3-way HFP4G32 QKV projection.
+    /// Pre-quantizes x to Q8_1, then runs `fused_qkv_hfp4g32_wave64_dp4a`.
+    /// Decode-only (batch=1). See
+    /// `kernels/src/fused_qkv_hfp4g32_wave64_dp4a.hip` for the math
+    /// derivation. Sister of `fused_qkv_hfq4g256_dp4a`.
+    pub fn fused_qkv_hfp4g32_dp4a(
+        &mut self,
+        a_q: &GpuTensor, a_k: &GpuTensor, a_v: &GpuTensor,
+        x: &GpuTensor,
+        y_q: &GpuTensor, y_k: &GpuTensor, y_v: &GpuTensor,
+        q_m: usize, k_m: usize, v_m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let xq_ptr = self.ensure_q8_1_mmq_x(x, 1, k)?;
+
+        self.ensure_kernel(
+            "fused_qkv_hfp4g32_wave64_dp4a",
+            kernels::FUSED_QKV_HFP4G32_WAVE64_DP4A_SRC,
+            "fused_qkv_hfp4g32_wave64_dp4a",
+        )?;
+
+        let aq = a_q.buf.as_ptr();
+        let ak = a_k.buf.as_ptr();
+        let av = a_v.buf.as_ptr();
+        let yq = y_q.buf.as_ptr();
+        let yk = y_k.buf.as_ptr();
+        let yv = y_v.buf.as_ptr();
+        let q_m_val = q_m as i32;
+        let k_m_val = k_m as i32;
+        let v_m_val = v_m as i32;
+        let k_val = k as i32;
+        let total = (q_m + k_m + v_m) as u32;
+        let mut xq = xq_ptr;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &aq as *const _ as *mut c_void,
+            &ak as *const _ as *mut c_void,
+            &av as *const _ as *mut c_void,
+            &mut xq as *mut _ as *mut c_void,
+            &yq as *const _ as *mut c_void,
+            &yk as *const _ as *mut c_void,
+            &yv as *const _ as *mut c_void,
+            &q_m_val as *const _ as *mut c_void,
+            &k_m_val as *const _ as *mut c_void,
+            &v_m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+
+        let bytes = crate::profile::gemv_hfp4g32_bytes(q_m, k)
+                  + crate::profile::gemv_hfp4g32_bytes(k_m, k)
+                  + crate::profile::gemv_hfp4g32_bytes(v_m, k);
+        let timer = crate::profile::begin_timer(&self.hip, "fused", "fused_qkv_hfp4g32_dp4a", bytes);
+        let result = self.launch_maybe_blob(
+            "fused_qkv_hfp4g32_wave64_dp4a",
+            [(total + 1) / 2, 1, 1], [64, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(aq); b.push_ptr(ak); b.push_ptr(av); b.push_ptr(xq);
+                b.push_ptr(yq); b.push_ptr(yk); b.push_ptr(yv);
+                b.push_i32(q_m_val); b.push_i32(k_m_val);
+                b.push_i32(v_m_val); b.push_i32(k_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
     }
 
     /// gfx11 (RDNA3) variant of `gemm_qkv_hfp4g32`. Direct entry point
@@ -7095,6 +7321,15 @@ impl Gpu {
         m: usize, k: usize, batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // gfx906 dp4a MMQ path — sister of the HFQ4G256 gfx906 MMQ
+        // dispatch (see line 8852 in `gemm_hfq4g256_residual`). Same
+        // batch-size gating; falls through to existing gfx906 GEMV
+        // fallback at small batch via the wave64-path-less arm below.
+        if self.arch == "gfx906" && batch_size > 1
+            && should_use_mmq(&self.arch, batch_size)
+        {
+            return self.gemm_hfp4g32_residual_mmq_gfx906(a, x, y, m, k, batch_size);
+        }
         if has_wmma_f16_gfx12(&self.arch) {
             return self.gemm_hfp4g32_residual_wmma_gfx12(a, x, y, m, k, batch_size);
         }
@@ -7221,11 +7456,76 @@ impl Gpu {
         k: usize, batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // gfx906 decode path: wave64 dp4a port. Decode-only; batched
+        // prefill on gfx906 currently has no fused HFP4 fast path.
+        if self.arch == "gfx906" && batch_size == 1 && gemv_dp4a_enabled(&self.arch) {
+            return self.fused_gate_up_hfp4g32_dp4a(
+                a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k,
+            );
+        }
         if has_wmma_f16_gfx12(&self.arch) {
             return self.gemm_gate_up_hfp4g32_wmma_gfx12(
                 a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size);
         }
         self.gemm_gate_up_hfp4g32_wmma(a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size)
+    }
+
+    /// gfx906 wave64 dp4a port of fused 2-way HFP4G32 gate+up. Sister
+    /// of `fused_gate_up_hfq4g256_dp4a`. Decode-only (batch=1).
+    pub fn fused_gate_up_hfp4g32_dp4a(
+        &mut self,
+        a_gate: &GpuTensor, a_up: &GpuTensor,
+        x: &GpuTensor,
+        y_gate: &GpuTensor, y_up: &GpuTensor,
+        gate_m: usize, up_m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let xq_ptr = self.ensure_q8_1_mmq_x(x, 1, k)?;
+
+        self.ensure_kernel(
+            "fused_gate_up_hfp4g32_wave64_dp4a",
+            kernels::FUSED_GATE_UP_HFP4G32_WAVE64_DP4A_SRC,
+            "fused_gate_up_hfp4g32_wave64_dp4a",
+        )?;
+
+        let ag = a_gate.buf.as_ptr();
+        let au = a_up.buf.as_ptr();
+        let yg = y_gate.buf.as_ptr();
+        let yu = y_up.buf.as_ptr();
+        let gate_m_val = gate_m as i32;
+        let up_m_val = up_m as i32;
+        let k_val = k as i32;
+        let total = (gate_m + up_m) as u32;
+        let mut xq = xq_ptr;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &ag as *const _ as *mut c_void,
+            &au as *const _ as *mut c_void,
+            &mut xq as *mut _ as *mut c_void,
+            &yg as *const _ as *mut c_void,
+            &yu as *const _ as *mut c_void,
+            &gate_m_val as *const _ as *mut c_void,
+            &up_m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+
+        let bytes = crate::profile::gemv_hfp4g32_bytes(gate_m, k)
+                  + crate::profile::gemv_hfp4g32_bytes(up_m, k);
+        let timer = crate::profile::begin_timer(&self.hip, "fused", "fused_gate_up_hfp4g32_dp4a", bytes);
+        let result = self.launch_maybe_blob(
+            "fused_gate_up_hfp4g32_wave64_dp4a",
+            [(total + 1) / 2, 1, 1], [64, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ag); b.push_ptr(au); b.push_ptr(xq);
+                b.push_ptr(yg); b.push_ptr(yu);
+                b.push_i32(gate_m_val); b.push_i32(up_m_val); b.push_i32(k_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
     }
 
     pub fn gemm_gate_up_hfp4g32_wmma(
@@ -9242,6 +9542,130 @@ impl Gpu {
             "gfx906 MMQ LDS budget exceeded: {} B > 32 KiB", shared_mem);
 
         let bytes = crate::profile::gemv_hfq4g256_bytes(m, k)
+            + batch_size * k
+            + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", base_name, bytes);
+        let result = self.launch_maybe_blob(
+            &kernel_name,
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [64, 4, 1], // nwarps=4
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr); b.push_ptr(xq_ptr); b.push_ptr(y_ptr);
+                b.push_i32(m_val); b.push_i32(k_val); b.push_i32(n_val);
+                b.push_i32(add_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// HFP4-G32 sister of `gemm_hfq4g256_residual_mmq_gfx906`. Port
+    /// per /tmp/gfx906_hfp4.md: same Option-C streaming topology, same
+    /// `_x{8..64}` family, same Q8_1 activation pre-quantize. The only
+    /// differences are inside the body — LUT-decoded E2M1, UE8M0 per-32
+    /// scale, FP16 row scale folded at load. LDS budget rises +1 KiB
+    /// (x_dm[128] f32×2 → x_ds[128×4] f32) but stays ≤ 32 KiB → 2
+    /// WGs/CU preserved.
+    pub fn gemm_hfp4g32_residual_mmq_gfx906(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let x_q8_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+
+        if self.mmq_diag_quantize_only {
+            let _ = x_q8_ptr;
+            // No FP16 HFP4 wave64 path on gfx906 (yet); fall through
+            // to the existing HFP4 fallback for diagnostic isolation.
+            return self.gemv_hfp4g32_fallback(a_raw, x, y, m, k);
+        }
+
+        let mmq_x = if batch_size <= 8 { 8 }
+            else if batch_size <= 16 { 16 }
+            else if batch_size <= 24 { 24 }
+            else if batch_size <= 32 { 32 }
+            else if batch_size <= 40 { 40 }
+            else if batch_size <= 48 { 48 }
+            else if batch_size <= 56 { 56 }
+            else { 64 };
+
+        let is_full = m % 128 == 0 && batch_size % mmq_x == 0;
+        let base_name = "gemm_hfp4g32_residual_mmq_gfx906";
+        let kernel_name = if is_full {
+            format!("{}_full_add_x{}", base_name, mmq_x)
+        } else {
+            format!("{}_x{}", base_name, mmq_x)
+        };
+
+        let wrapper_src = match mmq_x {
+            8  => kernels::GEMM_HFP4G32_RESIDUAL_MMQ_GFX906_X8_SRC,
+            16 => kernels::GEMM_HFP4G32_RESIDUAL_MMQ_GFX906_X16_SRC,
+            24 => kernels::GEMM_HFP4G32_RESIDUAL_MMQ_GFX906_X24_SRC,
+            32 => kernels::GEMM_HFP4G32_RESIDUAL_MMQ_GFX906_X32_SRC,
+            40 => kernels::GEMM_HFP4G32_RESIDUAL_MMQ_GFX906_X40_SRC,
+            48 => kernels::GEMM_HFP4G32_RESIDUAL_MMQ_GFX906_X48_SRC,
+            56 => kernels::GEMM_HFP4G32_RESIDUAL_MMQ_GFX906_X56_SRC,
+            64 => kernels::GEMM_HFP4G32_RESIDUAL_MMQ_GFX906_X64_SRC,
+            _ => unreachable!(),
+        };
+        let inlined = wrapper_src.replace(
+            "#include \"gemm_hfp4g32_residual_mmq_gfx906_body.cuh\"",
+            kernels::GEMM_HFP4G32_RESIDUAL_MMQ_GFX906_BODY_CUH,
+        );
+
+        self.ensure_kernel(&format!("{}_x{}", base_name, mmq_x), &inlined, &kernel_name)?;
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut xq_ptr = x_q8_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut add_val = 1i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut xq_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+            &mut add_val as *mut _ as *mut c_void,
+        ];
+
+        // HFP4 streaming topology — KEEP IN SYNC WITH body.cuh:
+        //   lut  : 16 B (LDS LUT prepended — see body.cuh PERF CRITICAL)
+        //   x_qs : MMQ_Y * x_stride ints (x_stride: 40 if mmq_x≥32 else 33)
+        //   x_ds : MMQ_Y * 4 floats           (per-sub-block scale, resident-per-window)
+        //   tile_y: mmq_x * Y_STRIDE ints
+        // b128 cliff is mmq_x≥32 for HFP4 (vs HFQ4's ≥64) — heavier LUT
+        // unpack benefits from b128 LDS issue rate sooner. See body.cuh.
+        const MMQ_Y: usize = 128;
+        let x_stride: usize = if mmq_x >= 32 { 40 } else { 33 };
+        const Y_STRIDE: usize = 36;
+        const X_DS_FLOATS: usize = 128 * 4;
+        const LUT_BYTES: usize = 16;
+        let row_tiles = (m + MMQ_Y - 1) / MMQ_Y;
+        let batch_tiles = (batch_size + mmq_x - 1) / mmq_x;
+
+        let shared_mem = (
+            LUT_BYTES
+            + (MMQ_Y * x_stride * 4)
+            + (X_DS_FLOATS * 4)
+            + (mmq_x * Y_STRIDE * 4)
+        ) as u32;
+        debug_assert!(shared_mem as usize <= 32 * 1024,
+            "gfx906 HFP4 MMQ LDS budget exceeded: {} B > 32 KiB", shared_mem);
+
+        let bytes = crate::profile::gemv_hfp4g32_bytes(m, k)
             + batch_size * k
             + batch_size * m * 4 * 2;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", base_name, bytes);

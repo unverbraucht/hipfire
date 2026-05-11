@@ -508,6 +508,33 @@ pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_X40_SRC: &str = include_str!("../../
 pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_X48_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq_gfx906_x48.hip");
 pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_X56_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq_gfx906_x56.hip");
 pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_X64_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq_gfx906_x64.hip");
+// gfx906 HFP4G32 MMQ kernel — port of HFQ4G256 MMQ family with the
+// three diffs from docs/quant-formats/hfp4.md and /tmp/gfx906_hfp4.md:
+//   - LUT-decoded E2M1 ↔ INT8 (replaces (n-8) symmetric INT4 unpack)
+//   - UE8M0 per-32 block scale (v_ldexp_f32) replaces FP32 per-256 scale
+//   - FP16 row scale folded at scale-collection (no zp; signed-symmetric)
+// LDS budget at mmq_x=64: 31,744 B ≤ 32 KiB → 2 WGs/CU preserved.
+pub const GEMM_HFP4G32_RESIDUAL_MMQ_GFX906_BODY_CUH: &str = include_str!("../../../kernels/src/gemm_hfp4g32_residual_mmq_gfx906_body.cuh");
+pub const GEMM_HFP4G32_RESIDUAL_MMQ_GFX906_X8_SRC:  &str = include_str!("../../../kernels/src/gemm_hfp4g32_residual_mmq_gfx906_x8.hip");
+pub const GEMM_HFP4G32_RESIDUAL_MMQ_GFX906_X16_SRC: &str = include_str!("../../../kernels/src/gemm_hfp4g32_residual_mmq_gfx906_x16.hip");
+pub const GEMM_HFP4G32_RESIDUAL_MMQ_GFX906_X24_SRC: &str = include_str!("../../../kernels/src/gemm_hfp4g32_residual_mmq_gfx906_x24.hip");
+pub const GEMM_HFP4G32_RESIDUAL_MMQ_GFX906_X32_SRC: &str = include_str!("../../../kernels/src/gemm_hfp4g32_residual_mmq_gfx906_x32.hip");
+pub const GEMM_HFP4G32_RESIDUAL_MMQ_GFX906_X40_SRC: &str = include_str!("../../../kernels/src/gemm_hfp4g32_residual_mmq_gfx906_x40.hip");
+pub const GEMM_HFP4G32_RESIDUAL_MMQ_GFX906_X48_SRC: &str = include_str!("../../../kernels/src/gemm_hfp4g32_residual_mmq_gfx906_x48.hip");
+pub const GEMM_HFP4G32_RESIDUAL_MMQ_GFX906_X56_SRC: &str = include_str!("../../../kernels/src/gemm_hfp4g32_residual_mmq_gfx906_x56.hip");
+pub const GEMM_HFP4G32_RESIDUAL_MMQ_GFX906_X64_SRC: &str = include_str!("../../../kernels/src/gemm_hfp4g32_residual_mmq_gfx906_x64.hip");
+// HFP4G32 wave64 dp4a fused decode-path kernels (gfx906 / CDNA wave64).
+// Sister of the fused_*_hfq4g256_wave64_dp4a family — same lane mapping,
+// LUT-decode instead of (n-8) symmetric INT4 unpack. See
+// kernels/src/fused_gate_up_hfp4g32_wave64_dp4a.hip for the derivation.
+pub const FUSED_GATE_UP_HFP4G32_WAVE64_DP4A_SRC: &str = include_str!("../../../kernels/src/fused_gate_up_hfp4g32_wave64_dp4a.hip");
+pub const FUSED_QKV_HFP4G32_WAVE64_DP4A_SRC:     &str = include_str!("../../../kernels/src/fused_qkv_hfp4g32_wave64_dp4a.hip");
+pub const FUSED_QKVZA_HFP4G32_WAVE64_DP4A_SRC:   &str = include_str!("../../../kernels/src/fused_qkvza_hfp4g32_wave64_dp4a.hip");
+// Single-output wave64 dp4a HFP4G32 GEMV — peer of the fused kernels
+// above, used by lm_head and any other single-row HFP4 GEMV on gfx906
+// decode. Replaces the wave32 F32 scalar fallback `gemv_hfp4g32.hip`
+// that wastes half the wave on gfx906.
+pub const GEMV_HFP4G32_WAVE64_DP4A_SRC: &str = include_str!("../../../kernels/src/gemv_hfp4g32_wave64_dp4a.hip");
 pub const GEMM_MW16_RESIDUAL_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_mw16_residual_wmma.hip");
 pub const DEQUANT_HFQ4G256_TO_F16_SRC: &str = include_str!("../../../kernels/src/dequant_hfq4g256_to_f16.hip");
 pub const GEMM_GATE_UP_HFQ4G256_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma.hip");
