@@ -23,7 +23,8 @@
 #     └── result-table.md.in-progress   # written as we go, renamed on success
 #
 # Usage:
-#   scripts/quant_cohort.sh <cohort-label> <bf16-ref-dir> <variant-spec.tsv>
+#   scripts/quant_cohort.sh <cohort-label> <bf16-ref-dir> <variant-spec.tsv> \
+#       [--kldref <path>] [--max-chunks N] [--kv-mode <mode>] [--scoring-mode <mode>]
 #
 # variant-spec.tsv format (tab-separated; one row per variant):
 #   <variant-name>  <hfq-path>  <arch>
@@ -32,27 +33,69 @@
 #   qwen35-9b-mfp4         /local/hipfire/qwen3.5-9b.mfp4        gfx906
 #   qwen35-9b-hfp4         /local/hipfire/qwen3.5-9b.hfp4        gfx906
 #
+# Optional flags:
+#   --kldref <path>        Path to .kldref.bin BF16 reference for the
+#                          model family. If set, KLD column populates via
+#                          eval_hipfire. If unset, KLD column shows
+#                          "(no-kldref)" and only MSE/smoke/HE run.
+#                          Reference fetcher: scripts/fetch-eval-refs.sh
+#                          (refs go to benchmarks/quality-baselines/refs/).
+#   --max-chunks N         Cap eval_hipfire to N chunks (full slice is
+#                          1175). 256 chunks ≈ 1.4 h per 9B variant on
+#                          gfx906; full slice ≈ 9-11 h per variant.
+#                          Use for during-development iteration; omit for
+#                          "lock the result" cohorts.
+#   --kv-mode <mode>       q8 | asym2 | asym3 | asym4 (default: asym3)
+#   --scoring-mode <mode>  per-token | prefill (default: prefill, the
+#                          canonical hipfire scoring path per #113)
+#
 # Example invocation:
 #   scripts/quant_cohort.sh \
 #     phase-a-step-0-baselines \
 #     /home/kread/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots/SNAP \
-#     /tmp/cohort_baselines.tsv
+#     /tmp/cohort_baselines.tsv \
+#     --kldref benchmarks/quality-baselines/refs/qwen3.5-9b-bf16.kldref.bin \
+#     --max-chunks 256
 
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
 if [ $# -lt 3 ]; then
-    echo "usage: $0 <cohort-label> <bf16-ref-dir-or-file> <variant-spec.tsv>"
+    echo "usage: $0 <cohort-label> <bf16-ref-dir-or-file> <variant-spec.tsv> [flags...]"
     echo
     echo "variant-spec.tsv format (TAB-separated):"
     echo "  <variant-name>\t<hfq-path>\t<arch>"
+    echo
+    echo "Optional flags: --kldref PATH, --max-chunks N, --kv-mode MODE, --scoring-mode MODE"
     exit 2
 fi
 
 LABEL="$1"
 ST_DIR="$2"
 SPEC="$3"
+shift 3
+
+# Optional flags.
+KLDREF=""
+MAX_CHUNKS=""
+KV_MODE="asym3"
+SCORING_MODE="prefill"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --kldref)      KLDREF="$2"; shift 2 ;;
+        --max-chunks)  MAX_CHUNKS="$2"; shift 2 ;;
+        --kv-mode)     KV_MODE="$2"; shift 2 ;;
+        --scoring-mode) SCORING_MODE="$2"; shift 2 ;;
+        *) echo "error: unknown flag: $1"; exit 2 ;;
+    esac
+done
+
+if [ -n "$KLDREF" ] && [ ! -f "$KLDREF" ]; then
+    echo "error: --kldref path not found: $KLDREF"
+    echo "       run scripts/fetch-eval-refs.sh to download (needs huggingface_hub in .venv)"
+    exit 1
+fi
 
 if [ ! -e "$ST_DIR" ]; then
     echo "error: bf16 reference dir/file not found: $ST_DIR"
@@ -102,20 +145,36 @@ print(f'  cohort with {len(manifest[\"variants\"])} variants')
 # Build prerequisites once.
 echo "Building prerequisites..."
 cargo build --release --example quant_quality_mse --quiet 2>&1 | tail -3
+if [ -n "$KLDREF" ]; then
+    cargo build --release --example eval_hipfire --features deltanet --quiet 2>&1 | tail -3
+fi
 
 PROGRESS="${COHORT_DIR}/result-table.md.in-progress"
+KLD_DESC=""
+if [ -n "$KLDREF" ]; then
+    KLDREF_BASENAME=$(basename "$KLDREF")
+    if [ -n "$MAX_CHUNKS" ]; then
+        KLD_DESC="**KLD ref:** \`${KLDREF_BASENAME}\` (max_chunks=${MAX_CHUNKS}; quick-slice)"
+    else
+        KLD_DESC="**KLD ref:** \`${KLDREF_BASENAME}\` (full slice 1175 chunks)"
+    fi
+else
+    KLD_DESC="**KLD ref:** not provided — KLD column will show \`(no-kldref)\`"
+fi
 {
     echo "# Cohort: ${LABEL}"
     echo
     echo "**Date:** ${DATE}"
     echo "**Host:** ${HOSTNAME}"
     echo "**Git:** ${GIT_BRANCH} @ ${GIT_HEAD:0:8}"
-    echo "**BF16 ref:** \`${ST_DIR}\`"
+    echo "**BF16 ref (safetensors / MSE):** \`${ST_DIR}\`"
+    echo "${KLD_DESC}"
+    echo "**KV mode:** ${KV_MODE} · **Scoring mode:** ${SCORING_MODE}"
     echo
     echo "## Per-variant metrics"
     echo
-    echo "| Variant | Arch | MSE mean (4-bit qts) | KLD mean | KLD p99 | PPL | HE tokens (sum) | Smoke (default) | Smoke (workaround) |"
-    echo "|---|---|---:|---:|---:|---:|---:|---|---|"
+    echo "| Variant | Arch | MSE mean (4-bit qts) | KLD mean ± CI | KLD p99 | PPL | HE tokens (sum) | Smoke (default) | Smoke (workaround) |"
+    echo "|---|---|---:|---|---:|---:|---:|---|---|"
 } > "$PROGRESS"
 
 # Spiral-detection prompt (matches existing bench_quant_quality.sh; intentionally
@@ -170,23 +229,103 @@ else:
     print(f'{avg:.2e}')
 ")
 
-    # ─── 2. KLD / PPL — STUB ────────────────────────────────────────────
-    # When chore/113-quant-eval-plan merges, this section runs:
-    #
-    #   ./target/release/examples/eval_hipfire \
-    #       --model "$HFQ_PATH" \
-    #       --ref "${BF16_REF_KLDREF}" \
-    #       --output "${PV}.kldseq" \
-    #       --kv-mode asym3
-    #
-    #   then kld_reduce.py to extract slice-mean + p99 + PPL.
-    #
-    # Until then, emit a placeholder and a TODO comment in the per-variant dir.
-    KLD_MEAN="(awaits #113)"
+    # ─── 2. KLD / PPL — eval_hipfire ────────────────────────────────────
+    KLD_MEAN="(no-kldref)"
     KLD_P99="—"
     PPL_VAL="—"
-    echo "(awaits chore/113-quant-eval-plan merge — eval_hipfire not yet in tree)" > "${PV}.kld-todo.txt"
-    echo "  [2/4] KLD / PPL: STUB (awaits eval_hipfire from #113)"
+    if [ -n "$KLDREF" ]; then
+        echo "  [2/4] KLD / PPL via eval_hipfire (kv-mode=${KV_MODE}, scoring=${SCORING_MODE}, max_chunks=${MAX_CHUNKS:-full})..."
+
+        # Build invocation. eval_hipfire writes HFKSEQ to ${PV}.kldseq;
+        # kld_reduce.py converts to row-level mean/CI/p99/PPL.
+        EVAL_ARGS=(
+            --model "$HFQ_PATH"
+            --ref "$KLDREF"
+            --output "${PV}.kldseq"
+            --kv-mode "$KV_MODE"
+            --scoring-mode "$SCORING_MODE"
+        )
+        if [ -n "$MAX_CHUNKS" ]; then
+            EVAL_ARGS+=(--max-chunks "$MAX_CHUNKS")
+        fi
+
+        # GPU lock — eval_hipfire takes hours; coordinate with other jobs.
+        if [ -f "scripts/gpu-lock.sh" ]; then
+            source scripts/gpu-lock.sh
+            gpu_acquire "quant_cohort-${LABEL}-${VARIANT}" 2>&1 | tail -1 || true
+        fi
+
+        EVAL_START=$(date +%s)
+        if ./target/release/examples/eval_hipfire "${EVAL_ARGS[@]}" \
+                > "${PV}.eval.log" 2>&1; then
+            EVAL_OK=1
+        else
+            EVAL_OK=0
+            echo "    eval_hipfire FAILED (log: ${PV}.eval.log)"
+        fi
+        EVAL_WALL=$(( $(date +%s) - EVAL_START ))
+        echo "    eval_hipfire wall: ${EVAL_WALL}s"
+
+        if [ -f "scripts/gpu-lock.sh" ]; then
+            gpu_release "quant_cohort-${LABEL}-${VARIANT}" 2>&1 | tail -1 || true
+        fi
+
+        if [ "$EVAL_OK" = "1" ] && [ -f "${PV}.kldseq" ]; then
+            # Reduce single .kldseq file via the inline reducer pattern.
+            # We can't use kld_reduce.py's directory-walking interface
+            # for one file, so we call the Python read_per_seq_kld helper
+            # directly. kldref_format.py lives in harness/.
+            #
+            # Use the repo's .venv/bin/python3 (per scripts/fetch-eval-refs.sh
+            # convention) so numpy is available without polluting system
+            # Python. Falls back to python3 if .venv isn't set up.
+            if [ -x ".venv/bin/python3" ]; then
+                REDUCE_PY=".venv/bin/python3"
+            else
+                REDUCE_PY="python3"
+                echo "    (warning: .venv/bin/python3 not found; falling back to system python3)"
+                echo "    (set up:  python3 -m venv .venv && .venv/bin/pip install numpy)"
+            fi
+            REDUCE_OUT=$("$REDUCE_PY" -c "
+import sys, json
+from pathlib import Path
+sys.path.insert(0, 'benchmarks/quality-baselines/harness')
+from kldref_format import read_per_seq_kld
+import numpy as np
+
+path = Path('${PV}.kldseq')
+means, p99s, nlls = read_per_seq_kld(path)
+means_arr = np.asarray(means, dtype=np.float64)
+p99s_arr = np.asarray(p99s, dtype=np.float64)
+nlls_arr = np.asarray(nlls, dtype=np.float64)
+
+# Bootstrap 95% CI on slice-mean.
+rng = np.random.default_rng(0)
+idx = rng.integers(0, len(means_arr), size=(10_000, len(means_arr)))
+boot_means = means_arr[idx].mean(axis=1)
+ci_lo = float(np.percentile(boot_means, 2.5))
+ci_hi = float(np.percentile(boot_means, 97.5))
+
+slice_mean = float(means_arr.mean())
+p99 = float(np.percentile(p99s_arr, 99))
+finite_nll = nlls_arr[np.isfinite(nlls_arr)]
+ppl = float(np.exp(finite_nll.mean())) if finite_nll.size else float('nan')
+
+# Output as TSV for shell consumption.
+print(f'{slice_mean:.4f}\t{ci_lo:.4f}\t{ci_hi:.4f}\t{p99:.3f}\t{ppl:.3f}')
+" 2>"${PV}.reduce.err" || echo "err err err err err")
+            IFS=$'\t' read -r SM CI_LO CI_HI P99 PPL <<< "$REDUCE_OUT"
+            if [ "$SM" != "err" ]; then
+                KLD_MEAN="${SM} (CI ${CI_LO}-${CI_HI})"
+                KLD_P99="${P99}"
+                PPL_VAL="${PPL}"
+            else
+                echo "    reduce failed (err log: ${PV}.reduce.err)"
+            fi
+        fi
+    else
+        echo "  [2/4] KLD / PPL: skipped (no --kldref provided)"
+    fi
 
     # ─── 3. HumanEval completion capture ──────────────────────────────
     echo "  [3/4] HumanEval prompts..."
@@ -286,7 +425,9 @@ done < "$SPEC"
     echo "## Notes"
     echo
     echo "- **MSE mean (4-bit qts):** average per-tensor MSE across MQ4G256 / HFP4G32 / MFP4G32 tensors (excluding Q8/F16-promoted tensors). Lower is better for raw reconstruction. **Not a model-quality signal alone** — see \`docs/plans/hfp4-fivetide-rebuttal-perspective.md\`."
-    echo "- **KLD / PPL:** stub today. Filled in once \`chore/113-quant-eval-plan\` merges (eval_hipfire + kldref + slice corpus)."
+    echo "- **KLD mean ± CI:** slice-mean KLD vs the BF16 reference logits, with 95% bootstrap CI. From \`eval_hipfire\` (#113 infrastructure). Lower is better. Shows \`(no-kldref)\` when --kldref wasn't passed."
+    echo "- **KLD p99:** 99th-percentile of per-sequence p99 KLD values. Catches tail-distribution divergence that the slice mean misses (the case fivetide's PPL vs KLD disagreement surfaced)."
+    echo "- **PPL:** exp(mean NLL) across all scored tokens. Wikitext-2-test slice (1175 chunks, n_ctx=2048, slice md5 \`83b0205a\`; or fewer if --max-chunks was used)."
     echo "- **HE tokens (sum):** sum of completion tokens across in-tree humaneval prompts (3 prompts). Sanity signal for 'model produces non-zero output on code prompts'; pass@1 scoring is a follow-up."
     echo "- **Smoke:** train-pursuit reasoning attractor check at temp=0, max_tokens=400. \`SPIRAL\` = empty content after \`<think>\` strip; \`COHERENT_<N>c\` = N chars of reasoning; \`PARTIAL_<N>c\` = N chars but suspiciously short."
 } >> "$PROGRESS"
