@@ -647,23 +647,58 @@ impl Tokenizer {
     }
 
     /// SentencePiece greedy encoding: prepend ▁ for spaces, longest-match lookup.
+    ///
+    /// Each suffix trial is a `&str` slice of `sp_text` keyed against
+    /// `token_to_id` (HashMap's `Borrow<str>` impl matches `String` keys
+    /// against `&str` lookups by hash). The previous impl built a
+    /// `Vec<char>` and reallocated a `String` per trial — same iteration
+    /// shape, but allocator-heavy on long prompts.
+    ///
+    /// Algorithmic shape (unchanged from the pre-rewrite code): for each
+    /// position `pos` we scan `end` from `n_chars` down to `pos+1`,
+    /// stopping at the first vocab match (greedy longest). The loop has
+    /// no `max_token_len` cap — typical inputs `break` early once a
+    /// match is found, but worst-case unmatchable suffixes are O(N²)
+    /// HashMap lookups. Capping by a precomputed `max_token_chars`
+    /// would fix this and is tracked as a follow-up; this PR is scoped
+    /// to allocator pressure only.
+    ///
+    /// Note: the single-char fallback silently *drops* missing chars
+    /// (cf. #203) — different failure mode from `encode_gpt2_bpe`'s
+    /// `unwrap_or(0)`. Fix is a separate concern from this PR.
     fn encode_sentencepiece(&self, text: &str) -> Vec<u32> {
         let mut tokens = Vec::new();
-        // SentencePiece convention: spaces become ▁, start of text gets ▁
-        let sp_text = text.replace(' ', "\u{2581}");
-        let sp_text = format!("\u{2581}{}", sp_text);
+        // SentencePiece convention: spaces become ▁, start of text gets ▁.
+        // Single-pass build: the prior `text.replace(...)` + `format!(...)`
+        // allocated twice; iterating chars and pushing into a pre-sized
+        // String allocates once. ▁ is 3 bytes UTF-8, so the worst case
+        // (all-space input) needs `text.len() * 3 + 3` bytes; typical
+        // inputs fit in the lower-bound hint and the String grows only
+        // if needed.
+        let mut sp_text = String::with_capacity(text.len() + 3);
+        sp_text.push('\u{2581}');
+        for ch in text.chars() {
+            sp_text.push(if ch == ' ' { '\u{2581}' } else { ch });
+        }
 
-        let chars: Vec<char> = sp_text.chars().collect();
-        let mut pos = 0;
+        // Char-boundary byte offsets. `boundaries[i]` is the byte index of
+        // char `i`; the trailing entry is `sp_text.len()` so `boundaries[end]`
+        // is always a valid slice endpoint, including `end == n_chars`.
+        let mut boundaries: Vec<usize> = Vec::with_capacity(sp_text.len() + 1);
+        for (i, _) in sp_text.char_indices() {
+            boundaries.push(i);
+        }
+        boundaries.push(sp_text.len());
+        let n_chars = boundaries.len() - 1;
 
-        while pos < chars.len() {
-            // Greedy longest match from vocabulary
+        let mut pos = 0usize;
+        while pos < n_chars {
+            // Greedy longest match from vocabulary (high-`end` first).
             let mut best_len = 0;
             let mut best_id = 0u32;
-
-            for end in (pos + 1..=chars.len()).rev() {
-                let candidate: String = chars[pos..end].iter().collect();
-                if let Some(&id) = self.token_to_id.get(&candidate) {
+            for end in (pos + 1..=n_chars).rev() {
+                let candidate = &sp_text[boundaries[pos]..boundaries[end]];
+                if let Some(&id) = self.token_to_id.get(candidate) {
                     best_len = end - pos;
                     best_id = id;
                     break;
@@ -671,9 +706,10 @@ impl Tokenizer {
             }
 
             if best_len == 0 {
-                // Single character fallback — look up the byte
-                let ch = chars[pos];
-                if let Some(&id) = self.token_to_id.get(&ch.to_string()) {
+                // Single-character fallback — look up the byte slice for
+                // the one char at `pos`. Silently skips unknown chars.
+                let ch_slice = &sp_text[boundaries[pos]..boundaries[pos + 1]];
+                if let Some(&id) = self.token_to_id.get(ch_slice) {
                     tokens.push(id);
                 }
                 pos += 1;
@@ -734,7 +770,11 @@ impl Tokenizer {
         }
 
         // 2. Pre-built merge rank map keyed on (left_id, right_id). u32
-        // pairs are `Copy` so heap-pair lookups never clone.
+        // pairs are `Copy` so heap-pair lookups never clone. Cached on the
+        // Tokenizer so we don't pay the O(M) build cost per encode call
+        // (was ~50ms per encode for Qwen3+ with ~150K merges; the daemon
+        // makes 9+ encode calls per request for chat-template scaffolding,
+        // so the per-call rebuild added ~450ms to TTFT for short prompts).
         let merge_pair_rank = &self.merge_pair_rank;
         let merges = &self.merges;
 
@@ -763,6 +803,7 @@ impl Tokenizer {
         for i in 0..n - 1 {
             push_pair(&mut heap, &syms, &gen, i, i + 1);
         }
+
 
         // 6. Main merge loop. Each pop is O(log N); validation is O(1);
         // splice is O(1); two pushes are O(log N). Total O(N log N).
@@ -1637,6 +1678,82 @@ mod consistency_tests {
             }
             other => panic!("expected MetadataMissing, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod sp_tests {
+    //! Tests for `encode_sentencepiece`. Added alongside the
+    //! `Vec<char>` + per-trial `String::collect()` → boundary-offset
+    //! + `&str` slice rewrite from #229. The four cases below cover
+    //! the boundary-vec correctness contract (off-by-one between
+    //! char index and byte offset, multi-byte UTF-8, and the
+    //! `best_len == 0` fallback branch).
+
+    use super::*;
+
+    /// Build a synthetic SentencePiece Tokenizer from a vocab list.
+    /// `is_gpt2_bpe = false` selects the SentencePiece encode path.
+    /// No merges (SP doesn't use them), no byte_to_id (SP doesn't
+    /// require byte-level coverage).
+    fn synth_sp(vocab: &[&str]) -> Tokenizer {
+        let vocab: Vec<String> = vocab.iter().map(|s| s.to_string()).collect();
+        let token_to_id: HashMap<String, u32> = vocab
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.clone(), i as u32))
+            .collect();
+        Tokenizer {
+            vocab,
+            token_to_id,
+            merges: Vec::new(),
+            merge_pair_rank: HashMap::new(),
+            byte_to_id: None,
+            special_tokens: Vec::new(),
+            bos_id: 0,
+            eos_id: 0,
+            eot_id: None,
+            is_gpt2_bpe: false,
+        }
+    }
+
+    #[test]
+    fn sp_encode_longest_match_ascii() {
+        // Vocab has the full "▁hello" plus shorter prefixes. sp_text is
+        // "▁hello"; greedy starts at end=6 (full string) and matches
+        // immediately → single token.
+        let tok = synth_sp(&["\u{2581}hello", "\u{2581}", "h", "e", "l", "o"]);
+        assert_eq!(tok.encode_sentencepiece("hello"), vec![0]);
+    }
+
+    #[test]
+    fn sp_encode_multibyte_char() {
+        // 4-byte UTF-8 emoji 🦀 (U+1F980). sp_text = "▁🦀" (3 + 4 = 7
+        // bytes, 2 chars). boundaries = [0, 3, 7]. Vocab has "▁" and
+        // "🦀" individually but not the pair. Expected: [0, 1].
+        // Guards `boundaries[pos]..boundaries[end]` against off-by-one
+        // when char span ≠ byte span.
+        let tok = synth_sp(&["\u{2581}", "\u{1F980}"]);
+        assert_eq!(tok.encode_sentencepiece("\u{1F980}"), vec![0, 1]);
+    }
+
+    #[test]
+    fn sp_encode_unmatched_fallback() {
+        // sp_text = "▁ab"; vocab has "▁" and "a" but not "b". The "b"
+        // position drives `best_len == 0`; the fallback slice
+        // `boundaries[pos]..boundaries[pos+1]` looks up "b", which is
+        // also absent, and the position is silently skipped.
+        let tok = synth_sp(&["\u{2581}", "a"]);
+        assert_eq!(tok.encode_sentencepiece("ab"), vec![0, 1]);
+    }
+
+    #[test]
+    fn sp_encode_space_substitution() {
+        // Spaces become ▁. "hello world" → "▁hello▁world" → matches
+        // "▁hello" (id 0) then "▁world" (id 1). Verifies the single-pass
+        // `sp_text` build correctly substitutes spaces.
+        let tok = synth_sp(&["\u{2581}hello", "\u{2581}world"]);
+        assert_eq!(tok.encode_sentencepiece("hello world"), vec![0, 1]);
     }
 }
 
