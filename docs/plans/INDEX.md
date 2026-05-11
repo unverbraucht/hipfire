@@ -10,18 +10,20 @@ When a thread completes and ships, move its docs to `docs/investigations/<date>-
 
 ---
 
-## Thread 1 — Quantization format roadmap (HFP4 / MFP4 commit)
+## Thread 1 — Quantization format roadmap (HFP4 / MFP4 commit) — under review
 
 **Master doc:** `qwen35-mq4-quality-gap.md`
-**Status:** Design complete; Phase A (calibration) and Phase B' (gfx906 kernel port) pending implementation.
+**Rebuttal:** `hfp4-fivetide-rebuttal-perspective.md` (2026-05-11)
+**Status:** Strategic claim under review. Fivetide's empirical PPL analysis contradicts the per-weight-MSE extrapolation underlying the format roadmap. Phase A (calibration) work is still valid; the *baseline format* it should calibrate on top of is now an open question.
 
-The strategic format decision for the next several years. MQ4 → HFP4 (PR #224) → MFP4 (PR #225) closed the per-weight format-quality levers; the remaining gap to Unsloth Dynamic 2.0 is activation-aware calibration (imatrix). Phase A closes the calibration gap inside the existing HFP4 wire format. Phase B' is the parallel gfx906 kernel port that prevents regression for old-arch users.
+The strategic format decision for the next several years. MQ4 → HFP4 (PR #224) → MFP4 (PR #225) closed the per-weight format-quality levers; the remaining gap to Unsloth Dynamic 2.0 is activation-aware calibration (imatrix). **However:** fivetide measured +25–94% PPL regression of MFP4G32 vs MQ4G256 on Qwen3.5 dense — the per-weight MSE win doesn't translate to PPL because post-FWHT weight kurtosis is sub-Gaussian (≈2.82) where E2M1's non-uniform codepoints become a liability. The format roadmap is still useful for organizing engineering work; the strategic conclusion ("commit to HFP4") needs re-validation.
 
 | Doc | Role |
 |---|---|
-| `qwen35-mq4-quality-gap.md` | **Master roadmap.** Per-lever taxonomy (L1–L5), what HFP4 closed, what's missing, format-extension plan, future-proofing for Gemma / Qwen2.5-VL, gfx906 acceleration analysis, Phase A/B/B'/C/D sequencing. |
-| `gfx906-moe-kernel-gaps.md` | **Prerequisite for Phase B'.** 3-way-cross-validated audit of 8 gaps in gfx906 MoE kernel coverage vs the dense path. 6 of 8 carry forward 1:1 into HFP4 — Phase B' should fold them in. |
-| `qwen35-gguf-moe-bridge.md` | GGUF → hipfire MoE pipeline gaps. Unmerged patches for multi-shard loader + arch_id mapping + 3D expert split. Needed when L5a regex CLI wants to A/B safetensors vs GGUF source paths. |
+| `qwen35-mq4-quality-gap.md` | **Master roadmap** (carries a 2026-05-11 header annotation flagging the rebuttal). Per-lever taxonomy (L1–L5), what HFP4 closed, what's missing, format-extension plan, future-proofing for Gemma / Qwen2.5-VL, gfx906 acceleration analysis, Phase A/B/B'/C/D sequencing. |
+| `hfp4-fivetide-rebuttal-perspective.md` | **Empirical rebuttal.** Fivetide's PPL data, the kurtosis / Lloyd-Max codebook analysis showing INT4-uniform beats E2M1 at g=32 on post-FWHT weights, methodology gaps in fivetide's analysis, honest meta-lesson on per-weight-MSE vs model-quality, concrete next-actions for measurement-driven resolution. |
+| `gfx906-moe-kernel-gaps.md` | Phase B' prerequisite (dropped in priority while format question is under review). 3-way-cross-validated audit of 8 gaps in gfx906 MoE kernel coverage vs the dense path. |
+| `qwen35-gguf-moe-bridge.md` | GGUF → hipfire MoE pipeline gaps. Unmerged patches for multi-shard loader + arch_id mapping + 3D expert split. |
 
 **Adjacent context:** `mq-sub4bit-prd.md`, `mq-sub4bit-roadmap.prd`, `mq-sub4bit-research-queue.md`, `mq3-rounding-out-precompute-leverage.prd`, `mq3-lloyd-wmma-prefill.md`, `mq-lloyd-batched-prefill-followup.md`, `PR-115-*.md` — earlier sub-4-bit research that informed the HFP4 design but predates it.
 

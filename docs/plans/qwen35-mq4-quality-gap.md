@@ -9,6 +9,8 @@ The doc has three movements: (1) the journey MQ4 → HFP4 → MFP4 and the empir
 
 ---
 
+> **⚠ 2026-05-11 update — partial rebuttal of §1.3 and §2.4 claims.** Fivetide's empirical PPL analysis (`docs/plans/hfp4-fivetide-rebuttal-perspective.md`) shows MFP4G32 produces +25–94% worse PPL than MQ4G256 on Qwen3.5 dense models. The per-weight MSE win this doc projects for MFP4 is real but does **not** translate to model quality — post-FWHT weight kurtosis is sub-Gaussian (≈2.82) where E2M1's non-uniform codepoint allocation becomes counterproductive. The strategic recommendation in §6 ("commit to HFP4 for the next several years") is downgraded to "MFP4 may be the wrong default; investigate before committing further." Read the rebuttal doc alongside this one.
+
 ## 1. The journey so far (per-lever noise wins)
 
 ### 1.1 Hipfire quantization-quality levers — taxonomy
