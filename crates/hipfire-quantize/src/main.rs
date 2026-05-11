@@ -13,6 +13,29 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+// Phase A L4 levers — quantizer-side weighted-LS scale fitting. Default off so
+// the wire format is unchanged byte-for-byte; the bench-against-baseline
+// comparison stays valid. See docs/plans/qwen35-mq4-quality-gap.md §5 Phase A
+// Step 1+2 for the lever taxonomy and the predicted MSE wins.
+//
+// L4A: per-block UE8M0 chooser — replaces ceil(log2(block_max / 6.0)) with a
+//   candidate search over {e_ideal-1, e_ideal, e_ideal+1}, picking the
+//   exponent that minimizes per-block reconstruction MSE in normalized space.
+//   Trade-off is the classic "tighter scale = better precision below max,
+//   but clipping above"; the search makes the choice data-driven per block.
+//
+// L4B: per-row FP16 row_scale_a chooser — replaces max_abs(row) / 6.0 with a
+//   candidate search over a small set of divisors. Each candidate re-runs the
+//   per-block quantization for the row and tallies total SSE. Picks the row
+//   scale that minimizes total row-level reconstruction error.
+//
+// Atomics are set once in main() before rayon's parallel pool kicks in; relaxed
+// ordering is fine because the quantize functions only read them and the value
+// never changes mid-run.
+static L4A_ENABLED: AtomicBool = AtomicBool::new(false);
+static L4B_ENABLED: AtomicBool = AtomicBool::new(false);
 
 // ─── Safetensors Parser ─────────────────────────────────────────────────────
 
@@ -671,21 +694,107 @@ fn e2m1_round(x: f32) -> u8 {
     best_idx
 }
 
-/// Quantize one row of K FP32 weights to HFP4G32 byte format.
+/// Compute the "ceil(log2)" ideal block exponent — the smallest UE8M0 value
+/// that covers `block_max_normalized` without clipping.
 ///
-/// K must be a multiple of 32 (hipfire model dims always satisfy this).
-/// Returns 16-B header + (K/32) × 17-B blocks = 16 + 17 * (K/32) bytes.
-fn quantize_hfp4g32_row(row: &[f32]) -> Vec<u8> {
-    assert!(row.len() % 32 == 0, "HFP4G32 requires K%32 == 0, got K={}", row.len());
+/// This is the existing min-max chooser (block_max_normalized = block_max_abs *
+/// inv_row_scale, where inv_row_scale = 6.0 / row_max_abs). Pulled out as a
+/// helper so the L4A weighted-LS path can use it as the centerpoint for the
+/// candidate search.
+#[inline]
+fn hfp4_block_e_ideal(block_max_normalized: f32) -> u8 {
+    if block_max_normalized > 0.0 {
+        let log_ratio = (block_max_normalized / 6.0).log2();
+        let e_signed = log_ratio.ceil() as i32 + 127;
+        e_signed.clamp(0, 254) as u8
+    } else {
+        0u8 // empty block — smallest scale, all nibbles round to 0
+    }
+}
+
+/// Pack one HFP4G32 block (32 elements, already pre-scaled by inv_row_scale) at
+/// a given UE8M0 block exponent. Returns the 16-byte nibble payload and the
+/// per-block sum-of-squared-errors in normalized space (i.e., as if row_scale_a
+/// were 1.0; multiply by row_scale_a² for absolute SSE).
+///
+/// The caller is responsible for picking `block_e`. For the default min-max
+/// path, that's `hfp4_block_e_ideal(block_max_normalized)`; for the L4A path,
+/// it's the winner of a candidate search.
+#[inline]
+fn hfp4_pack_block_at_e(block_normalized: &[f32], block_e: u8) -> ([u8; 16], f32) {
+    debug_assert_eq!(block_normalized.len(), 32);
+    let block_scale_factor = ((block_e as i32 - 127) as f32).exp2();
+    let inv_block_scale = if block_scale_factor > 0.0 { 1.0 / block_scale_factor } else { 0.0 };
+    let mut packed = [0u8; 16];
+    let mut sse = 0.0f32;
+    for i in 0..16 {
+        let lo = block_normalized[2 * i] * inv_block_scale;
+        let hi = block_normalized[2 * i + 1] * inv_block_scale;
+        let lo_nibble = e2m1_round(lo);
+        let hi_nibble = e2m1_round(hi);
+        packed[i] = (lo_nibble & 0x0F) | ((hi_nibble & 0x0F) << 4);
+        // Reconstruction error in normalized space. block_normalized[i] is the
+        // input post-row-scale; E2M1_LUT[nibble] * block_scale_factor is the
+        // pre-row-scale reconstruction. Both are normalized.
+        let lo_recon = E2M1_LUT[lo_nibble as usize] * block_scale_factor;
+        let hi_recon = E2M1_LUT[hi_nibble as usize] * block_scale_factor;
+        sse += (lo_recon - block_normalized[2 * i]).powi(2)
+             + (hi_recon - block_normalized[2 * i + 1]).powi(2);
+    }
+    (packed, sse)
+}
+
+/// L4A: pick the UE8M0 exponent that minimizes per-block reconstruction MSE
+/// over the 3-candidate set {e_ideal-1, e_ideal, e_ideal+1}, where e_ideal is
+/// the existing ceil(log2) chooser. Falls back to e_ideal if L4A is off.
+///
+/// Trade-off:
+///   - e_ideal-1: tighter spacing, BUT block_max clips to 6 × 2^(e-1-127).
+///                Clipped elements take up to 50% step error; non-clipped
+///                elements get 2× better precision.
+///   - e_ideal:   guaranteed no clipping; baseline precision.
+///   - e_ideal+1: looser spacing, no clipping; all elements at 0.5× precision.
+///
+/// MSE minimization picks the right point on this trade-off per block. For
+/// blocks where a few large outliers dominate the row's distribution but the
+/// bulk of weights are small, e_ideal-1 usually wins (accept clip on outliers,
+/// gain precision on bulk). For uniform blocks, e_ideal usually wins.
+#[inline]
+fn hfp4_choose_block_e_l4a(block_normalized: &[f32]) -> u8 {
+    let block_max_normalized = block_normalized.iter().cloned().fold(0.0f32, |m, v| m.max(v.abs()));
+    let e_ideal = hfp4_block_e_ideal(block_max_normalized);
+    if !L4A_ENABLED.load(Ordering::Relaxed) || block_max_normalized == 0.0 {
+        return e_ideal;
+    }
+    let e_min = e_ideal.saturating_sub(1);
+    let e_max = ((e_ideal as i32 + 1).min(254)) as u8;
+    let mut best_e = e_ideal;
+    let mut best_sse = f32::INFINITY;
+    let mut e = e_min;
+    loop {
+        let (_packed, sse) = hfp4_pack_block_at_e(block_normalized, e);
+        if sse < best_sse {
+            best_sse = sse;
+            best_e = e;
+        }
+        if e == e_max { break; }
+        e += 1;
+    }
+    best_e
+}
+
+/// Pack a full HFP4G32 row given a fixed `row_scale_a` choice. Returns the
+/// row-bytes plus total row SSE in absolute (post-row-scale) space.
+///
+/// Factored out so the L4B path can call this once per row_scale_a candidate
+/// and pick the row scale that minimizes total row error. Honors L4A internally
+/// when picking each block's UE8M0 exponent.
+fn pack_hfp4g32_row_with_scale(row: &[f32], row_scale_a: f32) -> (Vec<u8>, f32) {
     let k = row.len();
     let n_blocks = k / 32;
     let row_bytes = 16 + n_blocks * 17;
     let mut out = vec![0u8; row_bytes];
-
-    // Per-row FP16 second-level scale: row_scale_a = max_abs(row) / 6.0  (E2M1 max = 6.0).
-    let row_max_abs = row.iter().cloned().fold(0.0f32, |m, v| m.max(v.abs()));
-    let row_scale_a = if row_max_abs > 0.0 { row_max_abs / 6.0 } else { 1.0 };
-    let inv_row_scale = if row_max_abs > 0.0 { 1.0 / row_scale_a } else { 0.0 };
+    let inv_row_scale = if row_scale_a > 0.0 { 1.0 / row_scale_a } else { 0.0 };
 
     // Header.
     out[0..2].copy_from_slice(&f32_to_f16(row_scale_a).to_le_bytes());
@@ -693,50 +802,76 @@ fn quantize_hfp4g32_row(row: &[f32]) -> Vec<u8> {
     out[4..6].copy_from_slice(&(n_blocks as u16).to_le_bytes()); // block_count
     out[6] = 0u8;                                              // format_flags = 0 (no rotation)
     out[7] = 0u8;                                              // reserved
-    // out[8..16] reserved zeros (already zeroed by vec![0u8; ...])
 
-    // Per-block payload.
+    let mut total_sse_normalized = 0.0f32;
+
+    // Per-block payload. Pre-allocate the normalized-block buffer once.
+    let mut block_normalized = [0.0f32; 32];
     for b in 0..n_blocks {
         let block_start = b * 32;
-        let block = &row[block_start..block_start + 32];
+        for i in 0..32 {
+            block_normalized[i] = row[block_start + i] * inv_row_scale;
+        }
+        // Pick UE8M0 exponent — either L4A weighted-LS or existing ceil(log2).
+        let block_e = hfp4_choose_block_e_l4a(&block_normalized);
+        let (packed, sse_norm) = hfp4_pack_block_at_e(&block_normalized, block_e);
+        total_sse_normalized += sse_norm;
 
-        // Normalize block by row scale.
-        // block_max_normalized in units of [-6.0, +6.0] (because row_scale_a = max_abs/6.0).
-        // Pick UE8M0 block exponent so block fits cleanly into E2M1 lattice [-6, +6].
-        let block_max_abs = block.iter().cloned().fold(0.0f32, |m, v| m.max(v.abs()));
-        let block_max_normalized = block_max_abs * inv_row_scale;
-
-        // Choose smallest UE8M0 exponent that covers block_max_normalized without clipping:
-        //   6 * 2^(e - 127) ≥ block_max_normalized   →   e ≥ ceil(log2(block_max_normalized / 6)) + 127
-        // ceil (not round) prevents clipping; the precision cost is bounded by 1 bit at the top
-        // of the block. Clamp to UE8M0 range [0, 254] (255 = NaN, reserved per OCP spec).
-        let block_e: u8 = if block_max_normalized > 0.0 {
-            let log_ratio = (block_max_normalized / 6.0).log2();
-            let e_signed = log_ratio.ceil() as i32 + 127;
-            e_signed.clamp(0, 254) as u8
-        } else {
-            0u8 // empty block — smallest scale, all nibbles round to 0
-        };
-
-        let block_scale = (block_e as i32 - 127) as f32;
-        let block_scale_factor = block_scale.exp2(); // 2^(block_e - 127)
-        let inv_block_scale = if block_scale_factor > 0.0 { 1.0 / block_scale_factor } else { 0.0 };
-
-        // Block payload offset in the row buffer.
         let payload_off = 16 + b * 17;
         out[payload_off] = block_e;
-
-        // Pack 32 elements as 16 bytes, low nibble = even index, high nibble = odd index.
-        for i in 0..16 {
-            let lo = block[2 * i] * inv_row_scale * inv_block_scale;
-            let hi = block[2 * i + 1] * inv_row_scale * inv_block_scale;
-            let lo_nibble = e2m1_round(lo);
-            let hi_nibble = e2m1_round(hi);
-            out[payload_off + 1 + i] = (lo_nibble & 0x0F) | ((hi_nibble & 0x0F) << 4);
-        }
+        out[payload_off + 1..payload_off + 17].copy_from_slice(&packed);
     }
 
-    out
+    // Total SSE in absolute space is normalized SSE × row_scale_a².
+    // For row-scale-candidate comparison (L4B), the scaling matters because
+    // different row_scale_a values produce different absolute errors.
+    let total_sse_absolute = total_sse_normalized * row_scale_a * row_scale_a;
+    (out, total_sse_absolute)
+}
+
+/// Quantize one row of K FP32 weights to HFP4G32 byte format.
+///
+/// K must be a multiple of 32 (hipfire model dims always satisfy this).
+/// Returns 16-B header + (K/32) × 17-B blocks = 16 + 17 * (K/32) bytes.
+///
+/// Internally honors L4A (per-block UE8M0 weighted-LS) and L4B (per-row
+/// row_scale_a weighted-LS) when the corresponding atomics are set. Default
+/// path is byte-equivalent to the pre-L4 implementation.
+fn quantize_hfp4g32_row(row: &[f32]) -> Vec<u8> {
+    assert!(row.len() % 32 == 0, "HFP4G32 requires K%32 == 0, got K={}", row.len());
+
+    let row_max_abs = row.iter().cloned().fold(0.0f32, |m, v| m.max(v.abs()));
+    let base_scale = if row_max_abs > 0.0 { row_max_abs / 6.0 } else { 1.0 };
+
+    if !L4B_ENABLED.load(Ordering::Relaxed) || row_max_abs == 0.0 {
+        // Default path (and L4A-only path): row_scale_a = max_abs / 6.0.
+        let (bytes, _sse) = pack_hfp4g32_row_with_scale(row, base_scale);
+        return bytes;
+    }
+
+    // L4B: candidate search over a small set of row-scale divisors. A tighter
+    // row scale (smaller divisor → larger row_scale_a → smaller normalized
+    // values) puts the row's max into the lower-precision interior of the
+    // E2M1 lattice; a looser row scale stays at the lattice top with full
+    // precision but clips less. The search picks the row scale that minimizes
+    // total row SSE under the block-level (L4A or default) packing.
+    //
+    // The divisor set is centered on the canonical 6.0 (≡ no change) with a
+    // ±10% window. Five candidates × ~1024 blocks per typical 4096×4096 row
+    // ≈ 5K block-packs/row, which adds ~3-4× the existing quantize cost.
+    // Acceptable: 9B HFP4 baseline quantize wall is ~2 min, L4B ≈ 8-10 min.
+    const ROW_SCALE_DIVISORS: [f32; 5] = [5.5, 5.75, 6.0, 6.25, 6.5];
+    let mut best_bytes: Vec<u8> = Vec::new();
+    let mut best_sse = f32::INFINITY;
+    for &divisor in &ROW_SCALE_DIVISORS {
+        let candidate_scale = row_max_abs / divisor;
+        let (bytes, sse) = pack_hfp4g32_row_with_scale(row, candidate_scale);
+        if sse < best_sse {
+            best_sse = sse;
+            best_bytes = bytes;
+        }
+    }
+    best_bytes
 }
 
 /// Quantize a row-major 2D weight tensor of shape `[m, k]` to HFP4G32.
@@ -2730,6 +2865,21 @@ fn main() {
     let use_mfp4 = format == "mfp4" || format == "mfp4g32" || format == "mf4p";
     let q8_router_flag = args.iter().any(|a| a == "--q8-router");
     let no_kmap = args.iter().any(|a| a == "--no-kmap" || a == "--uniform");
+
+    // ── Phase A L4 levers (Step 1 + Step 2 of qwen35-mq4-quality-gap.md §5) ──
+    // --l4a: per-block UE8M0 weighted-LS chooser
+    // --l4b: per-row FP16 row_scale_a weighted-LS chooser
+    // --l4 : both (shorthand)
+    // All currently only affect HFP4G32 / MFP4G32 quantization. MQ4 has its own
+    // L4 lever (FP32 scale + ZP weighted-LS) not yet implemented — Step 1c/2c.
+    let l4_all = args.iter().any(|a| a == "--l4");
+    let l4a = l4_all || args.iter().any(|a| a == "--l4a");
+    let l4b = l4_all || args.iter().any(|a| a == "--l4b");
+    L4A_ENABLED.store(l4a, Ordering::Relaxed);
+    L4B_ENABLED.store(l4b, Ordering::Relaxed);
+    if l4a || l4b {
+        eprintln!("L4 levers: l4a={l4a} (per-block UE8M0 weighted-LS) l4b={l4b} (per-row FP16 row_scale_a weighted-LS)");
+    }
     // K-map gate: applies to MoE models by default. Dense models opt in
     // via --kmap-dense (the K-map dense PPL effect is mixed: regression at
     // short context, win at long context — see benchmarks/results/
