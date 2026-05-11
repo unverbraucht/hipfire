@@ -158,6 +158,92 @@ If the prefill regression turns out worse than projected, two fallbacks:
 
 This also means **the format roadmap (§3) is correctly bet on HFP4 even from a gfx906 perspective.** Older archs are not blocked from the quality lever; they pay a small (5–8%) throughput tax for it, and an HFP4XSG256 plan-B variant is available if even that turns out too costly.
 
+### 1.5 What the 9B cohort actually measured (2026-05-11) — sharpening the strategic picture
+
+The Phase A Step 0.5 cohort (`benchmarks/quality-baselines/results/2026-05-11-cohort-phase-a-step-0.5/`) ran the three baselines `{MQ4G256, HFP4G32 unrotated, MFP4G32}` on Qwen3.5-9B at quick-slice (256 chunks) under canonical methodology (prefill mode, asym3 KV, gfx1100). Result:
+
+| variant | MSE mean (4-bit qts aggregate) | KLD vs BF16 | PPL | Δ vs MQ4 |
+|---|---:|---:|---:|:---|
+| MQ4G256 | 6.62e-6 | 0.8084 | 15.16 | reference |
+| HFP4G32 (unrotated) | 3.15e-6 | 0.9763 | 18.68 | KLD +20.8%, PPL +23.2% |
+| MFP4G32 | **2.98e-6** | **1.1116** | **21.02** | KLD +37.5%, PPL +38.6% |
+
+At first read, this looked like a clean reproduction of fivetide's "NRMSE paradox": MFP4 wins per-weight reconstruction (2.98e-6, half of MQ4's 6.62e-6) and loses model quality (worst KLD, worst PPL).
+
+**On closer inspection (E2 + E5 sanity-check pair, no GPU), the paradox is not a paradox.** Two findings change the interpretation:
+
+#### 1.5.1 The aggregate MSE win for MFP4 is a measurement artifact
+
+The cohort's "MSE mean (4-bit qts)" averages over each variant's 4-bit-quantized tensors. But MQ4 quantizes **273 tensors** as MQ4G256, while HFP4/MFP4 quantize only **249** as HFP4G32/MFP4G32. The 24-tensor difference is precisely the LinearAttention `conv1d.weight` tensors (each `[8192, 1, 4]` = 32 768 params).
+
+The quantizer routes these defensively: HFP4G32 wire format requires `K % 256 == 0` (the gemv kernel constraint at `crates/hipfire-quantize/src/main.rs:753`), and conv1d has K=4. So in HFP4/MFP4 they fall back to **HFQ4G128** (per-128 INT4 + FP16 scale, no rotation, no ZP) — a different format that **does not appear in the "4-bit qts" aggregate row.**
+
+In MQ4 the same conv1d tensors are forced through MQ4G256 (group-256 + FWHT) and produce **mass-weighted MSE 4.84e-5** — the worst class in the model by a factor of 8×. They single-handedly drag MQ4's aggregate from "actual value" up to 6.62e-6. Strip them out and MQ4's aggregate over the 249 common tensors falls to about **4.6e-6** (rough recompute from the per-class table).
+
+So the apples-to-apples per-tensor MSE comparison on the *same 249 tensors* is closer to:
+- MQ4: ~4.6e-6
+- HFP4: 3.15e-6  
+- MFP4: 2.98e-6
+
+MFP4 still wins per-tensor MSE on this subset, but the win is **~35% (4.6 vs 2.98)**, not the **2.2×** (6.6 vs 2.98) the cohort table suggested. The conv1d routing inflated the gap.
+
+#### 1.5.2 Per-class MFP4-vs-MQ4 ratios are nearly constant at 1.14-1.15× on dominant-mass weights
+
+Restricting to **matched tensors** (same tensor name, same K-dim) across MQ4 and MFP4 in the top-50-worst-MSE pool, the MFP4/MQ4 ratio across heterogeneous classes is:
+
+| class | matched-tensor count | MFP4/MQ4 per-tensor MSE ratio |
+|---|---:|---:|
+| `self_attn.q_proj` | 1 | 1.14× |
+| `self_attn.v_proj` | 4 | 1.15× |
+| `self_attn.o_proj` | 3 | 1.15× |
+| `linear_attn.in_proj_qkv` | 5 | 1.14× |
+
+A **near-constant 1.14-1.15× across four heterogeneous tensor classes** is the signature of a format characteristic — not a quantizer bug. A bug would produce outliers or per-class variance. A consistent multiplier across types says: E2M1 + UE8M0 + FP16-row is fundamentally ~14% noisier than INT4 + FP32-affine at g=256 on these tensor classes.
+
+The aggregate MSE win for MFP4 came from **conv1d routing alone**, not from L1+L2 format superiority on the dominant-mass weights. On the weights that actually matter for forward-pass output (attn + MLP projections), **MFP4 is ~14% worse per-tensor MSE than MQ4**.
+
+#### 1.5.3 What this does to the §1.3 framing
+
+§1.3 estimated `L1 × L2 × L3 ≈ 2.6–4.2× MSE win` for MFP4 over MQ4. The cohort says: on like-for-like tensors, MFP4 is **1/1.14 ≈ 0.88× MSE win** — i.e., a **per-tensor MSE *loss***, not a win. The lever analysis predicted multiplicative wins; the data shows L1 (E2M1 vs INT4) is a per-tensor *regression* on post-FWHT weights at g=32. L2 (per-32 UE8M0 + FP16-row) doesn't compensate; L3 (rotation, shared between MQ4 and MFP4) is neutral on the comparison.
+
+This isn't a small correction — it inverts the §1.3 strategic claim. The "L1+L2+L3 captured" framing predicted MFP4 was the better baseline format. The data says MQ4 is the better baseline format, and MFP4 made things worse on both per-tensor MSE *and* model quality.
+
+#### 1.5.4 Decomposing the +38% PPL gap
+
+If MFP4 is ~14% worse per-tensor MSE on dominant weights, and ~38% worse on PPL, the rest of the gap comes from **noise-shape mismatch**:
+
+| component | est. contribution | mechanism |
+|---|---|---|
+| Per-tensor MSE deficit on dominant weights | ~14 percentage points | E2M1 codebook fits sub-Gaussian rotated weights ~14% worse than INT4-with-ZP at g=256. The Lloyd-Max distortion analysis in fivetide's doc §3 predicts this directly: post-FWHT kurtosis ≈ 2.82 (sub-Gaussian), and on sub-Gaussian distributions, uniform-INT4 is closer to Lloyd-Max optimal than log-spaced E2M1. |
+| Noise-shape mismatch | ~24 percentage points | E2M1 errors cluster near zero (log-spacing has tightest codepoints near zero), creating systematic perturbation that doesn't average out through the transformer stack. INT4 errors are uniformly distributed on a sub-Gaussian distribution, look Gaussian to downstream layers, average out as noise rather than bias. The exact decomposition is approximate but matches the fivetide-rebuttal mechanism. |
+
+Both components are **real format effects**, not bugs. The cohort's bug-hunt pair (E2 + E5) ruled out:
+- Localized broken tensors (no MFP4 outliers)
+- Wrong-class quantization (only conv1d differs, and it's *better* in MFP4's routing)
+- Per-class variance (1.14× is uniform across classes — bug-shaped patterns would have variance)
+- Catastrophic kernel-path or activation-rotation issues (forward pass produces coherent text; coherence-gate ran clean at PR #235 merge)
+
+#### 1.5.5 Strategic implications
+
+The "NRMSE paradox" in §"hfp4-fivetide-rebuttal-perspective.md" was framed as: *MFP4 wins per-weight MSE but loses model quality, demonstrating that MSE doesn't predict quality.* The cohort says: **once you control for the conv1d routing confound, MFP4 doesn't even win per-weight MSE on dominant weights.** It loses on both axes. The framing of "MFP4's format wins, but in a way that's invisible to model quality" — sharpened — is closer to: **MFP4's format engineering went in the wrong direction on every measurable axis once you fix the comparison.**
+
+This **strengthens** the Path A bet (calibrated-MQ4) from the rebuttal doc:
+
+- Path A (imatrix-calibrated MQ4G256) — adds the missing L4+L5 levers to the format that has both better per-tensor MSE AND better model quality on dominant weights. Calibration is added on top of a winning baseline.
+- Path B (imatrix-calibrated MFP4G32 with FP16 block scale + ZP) — adds L4+L5 on top of a format that starts ~14% per-tensor MSE worse on dominant weights AND ~38% PPL worse. Calibration would have to overcome both deficits *plus* close the residual gap to UD-Q4_K_XL.
+
+The §2.4 prediction "we sit a couple levers behind Unsloth at equal bpw" was built on the assumption that MFP4 was already a wash with Q4_K_M on per-tensor quality. The cohort says MFP4 is *behind* MQ4 on per-tensor quality, and MQ4 was already behind Q4_0 on per-tensor quality (§1.2: ~2× MSE vs Q4_0). The cumulative pre-calibration deficit vs Q4_K_M may be larger than §2.2's per-lever estimates implied.
+
+The Phase A roadmap (§5) is unchanged in structure — Steps 4+5 (imatrix collect + activation-weighted LS) are still the right next work. What changes is the format the calibration eventually rides on. The cohort suggests calibrated-MQ4 should be the explicit primary track, with calibrated-MFP4 as a secondary measurement to confirm the format-level disadvantage doesn't reverse under calibration.
+
+#### 1.5.6 Method caveat for future cohorts
+
+The conv1d routing confound discovered here is a methodology lesson, not a cohort bug. Future cohorts should either:
+- Force *all variants* to use the same quantization scheme for tensors that violate the wire-format alignment constraint (e.g. extend HFP4G32 to support K=4 via padding, or force MQ4 to route conv1d through HFQ4G128 too), or
+- Report aggregate MSE both with and without conv1d (the structural-confound tensors) so the comparison is unambiguous.
+
+The cohort table's "MSE mean (4-bit qts)" column is **misleading** under the current implementation when comparing across variants with different wire-format alignment requirements. Recommend renaming to "MSE mean (variant's primary 4-bit qt)" with an asterisked footnote about which tensors fall in the comparison.
+
 ---
 
 ## 2. What's still missing vs imatrix-calibrated dynamic GGUFs
