@@ -40,6 +40,7 @@ fn main() {
     let mut ref_path: Option<PathBuf> = None;
     let mut out_path: Option<PathBuf> = None;
     let mut chunk: usize = 0;
+    let mut kv_mode: String = "q8".to_string();
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -47,8 +48,17 @@ fn main() {
             "--ref" => { ref_path = Some(PathBuf::from(&argv[i + 1])); i += 2; }
             "--out" => { out_path = Some(PathBuf::from(&argv[i + 1])); i += 2; }
             "--chunk" => { chunk = argv[i + 1].parse().expect("--chunk"); i += 2; }
+            "--kv-mode" => {
+                let v = argv[i + 1].clone();
+                if !matches!(v.as_str(), "q8" | "asym2" | "asym3" | "asym4" | "fp32") {
+                    eprintln!("--kv-mode must be one of: q8 asym2 asym3 asym4 fp32 (got {v})");
+                    std::process::exit(1);
+                }
+                kv_mode = v;
+                i += 2;
+            }
             "-h" | "--help" => {
-                eprintln!("Usage: dump_qwen35_hidden_states --model <hfq> --ref <kldref> --chunk N --out <path>");
+                eprintln!("Usage: dump_qwen35_hidden_states --model <hfq> --ref <kldref> --chunk N --out <path> [--kv-mode q8|asym3|fp32]");
                 std::process::exit(0);
             }
             other => { eprintln!("unknown arg: {other}"); std::process::exit(1); }
@@ -64,7 +74,7 @@ fn main() {
     unsafe {
         std::env::set_var("HIPFIRE_NORMALIZE_PROMPT", "0");
         std::env::set_var("HIPFIRE_GRAPH", "0");
-        std::env::set_var("HIPFIRE_KV_MODE", "q8");
+        std::env::set_var("HIPFIRE_KV_MODE", &kv_mode);
     }
 
     // -------- read tokens from ref --------
@@ -105,9 +115,24 @@ fn main() {
 
     // -------- KV cache + DeltaNet state + scratch --------
     let kv_max = n_ctx + 16;
-    let mut kv_cache = KvCache::new_gpu_q8(
-        &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_max,
-    ).expect("kv cache");
+    let mut kv_cache = match kv_mode.as_str() {
+        "q8" => KvCache::new_gpu_q8(
+            &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_max,
+        ).expect("kv cache q8"),
+        "asym3" => KvCache::new_gpu_asym3(
+            &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_max,
+        ).expect("kv cache asym3"),
+        "asym4" => KvCache::new_gpu_asym4(
+            &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_max,
+        ).expect("kv cache asym4"),
+        "asym2" => KvCache::new_gpu_asym2(
+            &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_max,
+        ).expect("kv cache asym2"),
+        "fp32" => KvCache::new_gpu(
+            &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_max,
+        ).expect("kv cache fp32"),
+        other => panic!("unknown --kv-mode: {other}"),
+    };
     let scratch = Qwen35Scratch::new(&mut gpu, &config, 64).expect("scratch");
     let mut dn_state = DeltaNetState::new(&mut gpu, &config).expect("dn state");
 
