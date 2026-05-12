@@ -318,16 +318,26 @@ def main():
     print(f"\n[1/4] Loading tokenizer + model...")
     t0 = time.time()
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=False)
+    # device_map="auto" → HF/accelerate uses meta tensors, skipping the
+    # random-init step that would otherwise allocate the full model in
+    # GPU memory before safetensors weights replace them. Critical for
+    # 9B on 20 GB VRAM where the init buffer alone exceeds capacity.
+    # Offloads layers that don't fit to CPU automatically.
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
         dtype=dtype,
-        device_map=args.device if args.device == "cuda" else None,
+        device_map="auto" if args.device == "cuda" else None,
+        low_cpu_mem_usage=True,
         trust_remote_code=False,
     )
     if args.device != "cuda":
         model = model.to(args.device)
     model.eval()
     print(f"      loaded in {time.time() - t0:.1f}s")
+    if args.device == "cuda" and torch.cuda.is_available():
+        print(f"      VRAM in use: "
+              f"{torch.cuda.memory_allocated() / 1e9:.2f}/"
+              f"{torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
 
     print(f"\n[2/4] Registering Hessian hooks on GPTQ-target Linear modules...")
     # HF's AutoModelForCausalLM flattens multimodal submodules (e.g. Qwen3.5's
