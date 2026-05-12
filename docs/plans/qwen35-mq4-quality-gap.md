@@ -907,6 +907,36 @@ Promotion-path remainder:
   - Coherence-gate before considering this load-bearing on shipped quants (gate currently shows a pre-existing daemon SIGSEGV on shutdown — unrelated to the flip but blocks the gate from passing; needs a separate investigation).
   - Cohort re-bench: every previous Q3.5 quality-eval result was sitting on a ~0.4 nat pedestal that's now gone. `KLD(MQ4) − KLD(Q8)` deltas may need rebaselining; the Q8 control row in each cohort already isolates the 4-bit-attributable component, but headline absolute KLDs need the new floor.
 
+**Step c follow-ups — DeltaNet residual probes (2026-05-12 evening).**
+
+With the RoPE fix in place, the residual ~0.08 floor on Q3.5-0.8B per-token kv-q8 is now localized to the LinearAttention layers. The post-fix per-layer profile shows LA layers 4-6 jumping from rel_L2 0.09 → 0.17 within 3 layers (each LA adds ~0.02-0.05). Three follow-on probes (~30 min each):
+
+Probe c.1 — **FP32 KV ablation (RULED OUT).** Re-ran the per-layer dump with `--kv-mode fp32` (no KV quantization), halfsplit RoPE default. Compared to `--kv-mode q8`:
+
+  | Layer | type | q8-KV rel_L2 | fp32-KV rel_L2 | Δ |
+  |---|---|---:|---:|---:|
+  | 3 | FA | 0.087 | 0.087 | 0 |
+  | 4 | LA | 0.140 | 0.129 | -0.011 |
+  | 7 | FA | 0.157 | 0.140 | -0.017 |
+  | 23 | FA | 0.189 | 0.190 | +0.001 |
+
+  KV quant adds ~0.02 nats of cumulative mid-stack drift but does NOT explain the layer-4 LA jump. Not the source.
+
+Probe c.2 — **Per-position drift profile (LOCALIZES to recurrent state accumulation).** `scripts/compare_layer_positions.py` breaks per-layer drift down by position bucket. For layer 4 (worst LA):
+
+  | pos bucket | mean rel_L2 |
+  |---|---:|
+  | 0..127     | 0.064 |
+  | 384..512   | 0.122 |
+  | 896..1024  | 0.146 |
+  | 1024..1151 | 0.153 |
+  | 1664..1792 | 0.188 (peak) |
+  | 1920..2047 | 0.163 |
+
+  LA drift **grows monotonically through position 1500+** (peaks at 0.19 around position 1700). For comparison, layer 3 (FA) and layer 0 (first LA, small RMS input) both saturate around position ~400 and stay flat. The "growing with position index" signature is consistent with **DeltaNet's recurrent state accumulating per-position ULP-level error** that does not cancel. Each state update is bit-precise in fp32, but the cumulative drift over 2048 position-steps lands at ~0.05–0.15 rel_L2 depending on state magnitude.
+
+Probe c.3 — **fp64 internal state in `gated_delta_net_f32`** (the natural test of c.2's hypothesis): pending. Patch the kernel to compute the kv-reduction + state update in fp64 (state remains f32 in storage, math promotes), env-gate via `HIPFIRE_DELTANET_F64=1`, re-dump. If the position-growth curve in layer 4 flattens, recurrent precision is the source and a permanent fix is warranted (cost: ~2-3× kernel wall, ~5-10% per-token decode regression depending on LA-layer share).
+
 Raw per-layer dumps at `/data/cache/hipfire/q3.5-0.8b-{hf,hipfire}-hidden-chunk0.bin` (not committed, 192 MB each); the comparator output is reproducible from the scripts in `scripts/dump_hf_hidden_states.py`, `scripts/compare_hidden_states.py`, and the new example binary.
 
 **Cross-engine sanity check (Step B, 2026-05-12 evening) — confirms Step A is well-posed.**
