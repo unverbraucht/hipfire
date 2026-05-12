@@ -12,7 +12,6 @@
 pub mod arch;
 pub mod eval_common;
 pub mod gguf;
-pub mod hessian_io;
 pub mod hfq;
 pub mod llama;
 pub mod loop_guard;
