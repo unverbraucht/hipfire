@@ -3,7 +3,9 @@
 **Status:** plan, pre-implementation (revised after adversarial review).
 **Date:** 2026-05-12 (v2 incorporates findings from `gptq_plan_rev_claude.md`, `gptq_plan_rev_gemini.md`, `gptq_plan_rev_glm5.md`, consolidated in `gptq_plan_rev_synthesis.md`).
 **Predecessor:** Stage A (AWQ on MQ4) — shipped + validated at commit `6594709d`. 9B measured at −32.6% above-floor KLD vs mq4-base, −5.0% PPL. Stage B is designed to STACK on Stage A, not replace it.
-**Predicted lever value (revised):** +5-15% additional KLD-above-floor reduction (NOT the 15-25% PPL improvement the literature reports for GPTQ-on-RTN — AWQ already captured much of that lever). Stacks with AWQ's per-channel pre-scaling.
+**Predicted lever value (revised):** +5–15% additional KLD-above-floor reduction (NOT the 15-25% PPL improvement the literature reports for GPTQ-on-RTN — AWQ already captured much of that lever). On the measured 9B baseline (mq4-awq KLD 0.7373, above-floor 0.164 nats), that maps to **0.008–0.025 nats absolute KLD reduction → predicted post-Stage-B KLD 0.713–0.730**. Stacks with AWQ's per-channel pre-scaling.
+
+**Honest framing on the small predicted lift.** The expected 0.008–0.025 nat absolute improvement is small in isolation — only 2–6× larger than measurement CI (~0.004 at 512 chunks on 9B). Stage B's primary value isn't the MQ4 lift; it's that **~70% of Stage B's LOC carries forward unchanged into Stage C (MR-GPTQ on MFP4)**, where the predicted lift is much larger (paper reports +3.9pp recovery from MR-GPTQ over plain GPTQ on MXFP4 — 3.4× more lift than plain GPTQ contributes). Stage B is best framed as "build + validate the GPTQ infrastructure on the simpler MQ4 format before adding MR-GPTQ's MFP4-specific extensions." See §8 for the reuse breakdown.
 **Wire format:** no changes. Same `.hfq` MQ4G256 quant_type 13 blocks. Stage B only changes the *content* of the quantized values, not the format.
 
 ---
@@ -16,7 +18,7 @@ Three independent adversarial reviews surfaced 21 issues across math, infrastruc
 - **Architecture fix:** `imatrix_collect.rs` is a llama.cpp subprocess wrapper — cannot be extended for Hessian collection. v2 introduces a new Python script (`scripts/collect_hessian.py`) using HF transformers for the calibration forward pass.
 - **Algorithm additions:** WEIGHT-mode actorder (free quality lever), FP64 Cholesky via `faer` crate, max condition number cap with fallback to plain MQ4, explicit asymmetric per-element quantize formula.
 - **Scope changes:** GPTQ now covers ALL MQ4G256 tensors, not just AWQ-eligible ones (non-AWQ tensors get a separate Hessian without `/s`).
-- **Estimate revisions:** wall time 10-12 days (was 7), LOC ~1500-2000 Rust + ~100 Python (was 850), predicted 9B post-Stage-B KLD 0.70-0.74 (was 0.62-0.66).
+- **Estimate revisions:** wall time 10-12 days (was 7), LOC ~1500-2000 Rust + ~100 Python (was 850), predicted 9B post-Stage-B KLD **0.71–0.73** (was 0.62-0.66 in v1; the upper end of an earlier 0.70–0.74 range was inconsistent with the §2.3 table and would have represented a regression).
 - **Rejected:** my N2 (block_size=256) — both Gemini and GLM5 disagreed. Keep block_size=128 per GPTQ paper. The Cholesky tile size is independent of the MQ4 quantization grid.
 
 Full validation/rejection trace per finding: `docs/plans/gptq_plan_rev_synthesis.md`.
@@ -312,7 +314,50 @@ No changes to: runtime crates (no kernel changes), wire format (no `.hfq` schema
 
 ---
 
-## 7. References
+## 7. Stage B → Stage C reuse analysis
+
+MR-GPTQ (Stage C) algorithmically extends plain GPTQ (Stage B) with three additions: E8M0 range mapping (Appendix H of the paper), MSE-optimized grid alternating optimization (outer loop wrapping the GPTQ column update), and optional block-wise Hadamard size flexibility (hipfire fixes this at FWHT-256, so we don't need that knob). The shared infrastructure dominates the implementation cost:
+
+| Component | Reuse from Stage B → Stage C |
+|---|---|
+| Python Hessian collector (`scripts/collect_hessian.py`) | **100%** — Hessian format is element-format-agnostic |
+| `hessian_io.rs` Rust reader | **100%** |
+| FP64 Cholesky via `faer` + adaptive damping + condition cap | **100%** |
+| Column-sequential OBS update (the "GPTQ core") | **100%** — algorithm is identical |
+| WEIGHT-mode actorder | **100%** — same concept |
+| AWQ-Hessian basis transform `diag(1/s) · H · diag(1/s)` | **100%** if Stage C composes with AWQ (default plan) |
+| FWHT-similarity transform `R · H · R^T` | **100%** — hipfire MFP4G32 keeps the per-256 FWHT |
+| CLI flags scaffolding (`--gptq*` family) | **~90%** — flag names extend, behavior parameterized by format |
+| Per-element quantize step | **~30%** — Stage B does INT4 + (scale, min_val); Stage C does FP4 E2M1 + UE8M0 per-32 + FP16 row |
+| E8M0 range mapping | **0%** — net new in Stage C |
+| MSE-optimized grid alternating optimization (outer loop) | **0%** — net new in Stage C |
+| Unit tests (Cholesky, actorder, asymmetric quant, AWQ-stack) | **~70%** — toy-model + Hessian + actorder tests reuse; per-format tests are new |
+
+**LOC budget split:**
+
+| Path | Total LOC | Stage-B-specific | Stage-C-specific | Foundation (shared) |
+|---|---:|---:|---:|---:|
+| Stage B (this plan, MQ4-only) | ~1500-2000 | ~200-300 | — | ~1200-1700 |
+| Stage C only (skip B, MFP4 from scratch) | ~2100-3000 | — | ~600-1000 | ~1500-2000 |
+| Stage B + Stage C combined | ~2100-3000 | ~200-300 | ~600-1000 | ~1300-1700 |
+
+**Wall-time interpretation:**
+
+- Stage B alone: 12 days, ~9 days of which is foundation work for Stage C.
+- Stage C alone (skip B): ~12-14 days, since 70% of Stage B is foundation that Stage C also needs.
+- Stage B + Stage C sequential: ~12 + ~7-10 = ~19-22 days total.
+
+**Calendar tradeoff:**
+
+- Skipping Stage B saves only ~7 days vs doing both, but loses (a) the cleaner debug path (simpler MQ4 format first, validate the GPTQ machinery, then add MR-GPTQ extensions), and (b) a measured Stage B data point on dense Qwen3.5-9B.
+- Stage B's small predicted lift (0.008–0.025 nat KLD on 9B) is the cost of using Stage B as a validation milestone. The actual quality payoff is concentrated in Stage C.
+- Both stages also unblock potential future levers (e.g., AWQ-aware kernels for `o_proj` / `out_proj` / `down_proj` per `awq_bug_hunt_glm5.md` §Fix Option B), which would also reuse the GPTQ infrastructure.
+
+**Recommendation:** sequence Stage B → Stage C. The marginal cost of Stage B (~3 days truly MQ4-specific + ~9 days of foundation that would have been written anyway for Stage C) is worth the validated debug path and the empirical data point. Skip Stage B only if calendar pressure forces a single-stage commitment AND there's strong prior evidence that MFP4-specific algorithm bugs won't compound with GPTQ infrastructure bugs (no such prior exists today).
+
+---
+
+## 8. References
 
 - **GPTQ paper:** Frantar, Ashkboos, Hoefler, Alistarh, "GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers" (arXiv 2210.17323, ICLR 2023).
 - **MR-GPTQ paper:** Egiazarian, Castro, Kuznedelev, ..., Alistarh, "MR-GPTQ: Micro-Rotated GPTQ for MXFP4 Quantization" (arXiv 2509.23202).
@@ -324,9 +369,6 @@ No changes to: runtime crates (no kernel changes), wire format (no `.hfq` schema
   - `docs/plans/awq_hipfire.md` — Stage A AWQ integration (committed 6594709d).
   - `docs/plans/awq_fix_claude.md` — Stage A bug-hunt + measured results.
   - `docs/plans/qwen35-mq4-quality-gap.md` — Phase A overall plan.
-  - `docs/plans/gptq_plan_rev_claude.md` — first-round Claude adversarial review.
-  - `gptq_plan_rev_gemini.md` — Gemini adversarial review.
-  - `gptq_plan_rev_glm5.md` — GLM-5 adversarial review.
-  - `docs/plans/gptq_plan_rev_synthesis.md` — three-review validation/rejection consolidation.
+  - `docs/plans/gptq_plan_rev_synthesis.md` — three-review validation/rejection consolidation (working tree only; uncommitted reference).
   - `crates/hipfire-runtime/examples/imatrix_collect.rs` — existing imatrix subprocess wrapper (NOT extended for Hessian).
   - `crates/hipfire-quantize/src/main.rs` — quantizer entry point + Stage A AWQ wiring.
