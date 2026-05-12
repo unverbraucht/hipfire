@@ -786,6 +786,17 @@ Test #1 — Qwen3 plain (no DeltaNet, no Q/K/V bias) discriminator (**STRONG SIG
 
 **Where the next-step work should focus** is now clear: localize the DeltaNet forward-pass divergence. Per-layer hidden-state KLD against an HF transformers reference on a single chunk (Step 2 of the original plan, plus per-layer instrumentation) should pin down which of the 18-24 LA layers contribute most, and whether the drift is a Δrule / FWHT / state-update / mixing-fraction precision issue. The LayerNorm precision hypothesis (#3) and Q8 V-cache rotation hypothesis (#5) are still on the table for the smaller residual but are now lower-priority — the bulk of the floor lives in DeltaNet.
 
+**Cross-engine sanity check (Step B, 2026-05-12 evening) — confirms Step A is well-posed.**
+Before starting per-layer instrumentation, validated that the BF16 reference itself is consistent across engines. Ran `scripts/cross_engine_check.py` — extracts chunk-0 tokens from `qwen3.5-0.8b-bf16.kldref.bin` (built by llama.cpp), runs the same 2048 tokens through HF transformers BF16 on CPU, computes the per-position KL divergence between llama.cpp's stored top-K distribution and HF's distribution on the same chunk.
+
+| Direction | Mean KLD (chunk 0, 1023 positions) | Max |
+|---|---:|---:|
+| KL(llama.cpp || HF transformers) | 0.000669 | 0.0056 |
+| KL(HF transformers || llama.cpp) | 0.003287 | 0.0266 |
+| Symmetric mean                   | **0.001978** | — |
+
+llama.cpp and HF transformers BF16 agree on Qwen3.5-0.8B chunk-0 to within ~0.002 nats. Hipfire's matched-arch floor (Q3.5-0.8B q8f16 per-token kv-q8 n=20) is 0.4945 — **~250× larger than the cross-engine baseline**. The drift is not "two engines reasonably differ on a complex architecture"; it's a real hipfire-specific implementation gap relative to a reproducible ground truth. Step A (per-layer hidden-state KLD vs HF oracle) is therefore well-posed: there is a target to chase, and a fix is in principle obtainable.
+
 **Sequencing summary:**
 
 | stage | status (2026-05-12 PM) | wall budget | gates | strategic priority |
