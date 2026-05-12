@@ -1213,6 +1213,13 @@ pub const GATED_NORM_SRC: &str = include_str!("../../../kernels/src/gated_norm.h
 #[cfg(feature = "deltanet")]
 pub const GATED_DELTA_NET_SRC: &str = include_str!("../../../kernels/src/gated_delta_net.hip");
 
+/// FP64-accumulating variant for engine-drift floor probe c.2 — promotes the
+/// internal state tile to double across the per-token loop. Storage in/out
+/// stays fp32. Wired via `HIPFIRE_DELTANET_F64=1`. See
+/// docs/plans/qwen35-mq4-quality-gap.md §"Step c follow-ups".
+#[cfg(feature = "deltanet")]
+pub const GATED_DELTA_NET_F64ACC_SRC: &str = include_str!("../../../kernels/src/gated_delta_net_f64acc.hip");
+
 
 /// GDN Q8 — tiled LDS + warp-shuffle. Dequant tile into LDS, recurrence, requant back.
 /// Tile = TILE_ROWS × 128 × 4B = 4KB. Same tiling as FP32 variant.

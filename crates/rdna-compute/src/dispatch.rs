@@ -16243,8 +16243,19 @@ impl Gpu {
         n_tokens: usize, n_heads: usize, head_dim: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel("gated_delta_net", kernels::GATED_DELTA_NET_SRC, "gated_delta_net_f32")?;
-        let func = &self.functions["gated_delta_net_f32"];
+        // Probe c.2 (engine-drift floor): HIPFIRE_DELTANET_F64=1 swaps the
+        // fp32-accumulating recurrence for an fp64-accumulating variant. Same
+        // input/output dtypes (fp32). Used to test whether DeltaNet recurrent
+        // state precision contributes to the residual ~0.08 KLD on Q3.5
+        // models. See docs/plans/qwen35-mq4-quality-gap.md §"Step c follow-ups".
+        let f64_acc = std::env::var("HIPFIRE_DELTANET_F64").ok().as_deref() == Some("1");
+        let (cache_key, src, entry) = if f64_acc {
+            ("gated_delta_net_f64acc", kernels::GATED_DELTA_NET_F64ACC_SRC, "gated_delta_net_f64acc")
+        } else {
+            ("gated_delta_net", kernels::GATED_DELTA_NET_SRC, "gated_delta_net_f32")
+        };
+        self.ensure_kernel(cache_key, src, entry)?;
+        let func = &self.functions[entry];
         let mut qp = q.buf.as_ptr();
         let mut kp = k.buf.as_ptr();
         let mut vp = v.buf.as_ptr();

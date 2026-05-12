@@ -935,7 +935,19 @@ Probe c.2 — **Per-position drift profile (LOCALIZES to recurrent state accumul
 
   LA drift **grows monotonically through position 1500+** (peaks at 0.19 around position 1700). For comparison, layer 3 (FA) and layer 0 (first LA, small RMS input) both saturate around position ~400 and stay flat. The "growing with position index" signature is consistent with **DeltaNet's recurrent state accumulating per-position ULP-level error** that does not cancel. Each state update is bit-precise in fp32, but the cumulative drift over 2048 position-steps lands at ~0.05–0.15 rel_L2 depending on state magnitude.
 
-Probe c.3 — **fp64 internal state in `gated_delta_net_f32`** (the natural test of c.2's hypothesis): pending. Patch the kernel to compute the kv-reduction + state update in fp64 (state remains f32 in storage, math promotes), env-gate via `HIPFIRE_DELTANET_F64=1`, re-dump. If the position-growth curve in layer 4 flattens, recurrent precision is the source and a permanent fix is warranted (cost: ~2-3× kernel wall, ~5-10% per-token decode regression depending on LA-layer share).
+Probe c.3 — **fp64 internal state in `gated_delta_net_f32`** (RULED OUT). Added `kernels/src/gated_delta_net_f64acc.hip` (full fp64 internal state tile + fp64 kv-reduction + fp64 update), wired via `HIPFIRE_DELTANET_F64=1`. Re-ran the per-layer + per-position comparison — output is BYTE-IDENTICAL to the fp32 run. Layer 4 rel_L2 still 0.140 mean, still grows 0.064 → 0.188 across positions. fp32 accumulation is plenty precise for this recurrence; promoting to fp64 changes nothing.
+
+Reframing: the growing-with-position drift is NOT from recurrent precision. It's from **drift in the inputs to the DeltaNet block** that the (faithful) recurrence amplifies position-by-position. Each upstream op feeding `gated_delta_net_f32` is a candidate source:
+  - `fused_rmsnorm_mq_rotate` — norm + FWHT rotation of the input residual
+  - `weight_gemv` projections (Q8) to wqkv / wz / w_beta / w_alpha
+  - `fused_sigmoid_alpha_gate` — sigmoid β + gated α transforms
+  - `conv1d_silu_split` — causal conv1d + SiLU + split into q_raw/k_raw/v
+  - `fused_qk_l2_norm_scale` — Q/K L2 norm + Q-scale
+  - `repeat_interleave_qk` — GQA expansion when n_key < n_value heads
+
+Next probe should dump Q/K/V/g/β at the DeltaNet block boundary from both engines and pin down which input carries the drift. That's a separate session of work — more invasive than the env-gated kernel-swap pattern of probes c.1-c.3.
+
+**Net result of Step c probes**: the residual ~0.08 KLD on Q3.5-0.8B is not KV-quant (probe c.1), not RoPE (already fixed), and not DeltaNet recurrent precision (probe c.3). It's distributed input drift across the LA-block's upstream pipeline. Less actionable than the RoPE fix; likely needs accumulator audits in 3-4 of the upstream kernels OR a higher-precision quantize (the Q8 weights themselves may carry ~0.05-0.10 nats of noise that the recurrence amplifies). Tabling for now; the floor at 0.08 nats on Q3.5-0.8B is already at the same order as the plain-Qwen3 baseline (0.0098 on Q3-0.6B) — Q3-Q3.5 family disambiguation is intact for quality-eval purposes after the RoPE fix.
 
 Raw per-layer dumps at `/data/cache/hipfire/q3.5-0.8b-{hf,hipfire}-hidden-chunk0.bin` (not committed, 192 MB each); the comparator output is reproducible from the scripts in `scripts/dump_hf_hidden_states.py`, `scripts/compare_hidden_states.py`, and the new example binary.
 
