@@ -667,13 +667,36 @@ What ships:
 
 Predicted lever value: +15-25% PPL improvement on top of RTN. Composes additively with AWQ.
 
-**Stage C — Step 6b kmap ingestion (~1-2 days). Cheap orthogonal lever.**
+**Stage C — MR-GPTQ on MFP4 (~2-3 weeks, reuses Stage B GPTQ scaffolding). The paper-validated MXFP4 recipe.**
 
-Already have the UD-Q4_K_XL kmap artifact for 9B (commit `679bff46`). Implement the `--kmap-file` CLI flag in the quantizer that overrides the hardcoded K-map rules with a JSON-driven per-tensor allocation. Apply Unsloth's per-tensor promotion choices to hipfire format equivalents. Bench in matrix with Stages A + B.
+Direct port of MR-GPTQ (Egiazarian, Castro, Kuznedelev, …, Alistarh — arXiv 2509.23202v3) to hipfire's MFP4G32 wire format. The paper specifically targets MXFP4 — which IS our MFP4G32 (E2M1 codes + UE8M0 per-32 scales). Three algorithmic pieces:
 
-**Stage D — MQ4K wire format prototype (~5-7 weeks). DEFERRED.**
+1. **GPTQ** — column-by-column Hessian-aware quantization (shared with Stage B)
+2. **E8M0 range mapping (Appendix H of the paper)** — MR-GPTQ's key differentiator. UE8M0 has dynamic range 2^-127 to 2^127 but real weight distributions occupy ~2^-20 to 2^20. Mapping the wide E8M0 range to a useful data range improves accuracy substantially.
+3. **MSE-optimized grids** — alternating optimization between block scales and per-tensor scales.
 
-Only fires if Stages A + B + C don't close the bpw-matched gap to UD-Q3_K_XL meaningfully (target: 60%+ of the gap closed). Tracked in `docs/plans/mq4v2-format-proposal.md` with Stage 1 / Stage 2 / Stage 3 sub-decomposition.
+Plus static activation reordering and optional block-wise Hadamard size flexibility (k ∈ {16, 32, 64, 128} as alternatives to our existing FWHT-256).
+
+What MR-GPTQ measured on MXFP4 (Llama-3.1-8B):
+- RTN: 87.83% recovery vs FP16
+- Vanilla GPTQ: 89.47% recovery (+1.6pp)
+- **MR-GPTQ: 93.31% recovery (+5.5pp over RTN)**
+
+Vanilla GPTQ alone doesn't help MXFP4 much — the format-specific pieces (E8M0 range mapping + MSE grids) are the differentiator. Our existing FWHT-256 rotation is the same class as their k=16-128 Hadamards.
+
+**Why this matters strategically**: the paper's existence reframes our Step 5a + §1.5 cohort findings. Both we (rotation-flatness math) and the paper (small-group neutralizes outlier mitigation) predict that per-block weighted-LS calibration fails on MFP4 — confirmed empirically. MR-GPTQ is the WORKING recipe for the format we already have. If we replicate ~93% recovery on Qwen3.5-9B-MFP4, we revive the §6 "HFP4 is the format for several years" strategic posture that the cohort findings had suspended.
+
+**Why this might make MQ4K (Stage E) unnecessary**: MR-GPTQ says the existing MFP4G32 wire format isn't broken — the calibration was. The whole MQ4K argument rests on "MFP4G32 underperforms because it lacks Q4_K's per-32 sub-scaling." MR-GPTQ shows MXFP4 can approach NVFP4 accuracy without sub-scaling, just with the right calibration recipe.
+
+Detail in `mq4v2-format-proposal.md` §6.5.
+
+**Stage D — Step 6b kmap ingestion (~1-2 days). Cheap orthogonal lever.**
+
+Already have the UD-Q4_K_XL kmap artifact for 9B (commit `679bff46`). Implement the `--kmap-file` CLI flag in the quantizer that overrides the hardcoded K-map rules with a JSON-driven per-tensor allocation. Apply Unsloth's per-tensor promotion choices to hipfire format equivalents. Bench in matrix with Stages A + B + C.
+
+**Stage E — MQ4K wire format prototype (~5-7 weeks). DEFERRED.**
+
+Only fires if Stages A + B + C + D don't close the bpw-matched gap to UD-Q3_K_XL meaningfully (target: 60%+ of the gap closed). Tracked in `docs/plans/mq4v2-format-proposal.md` with Stage 1 / Stage 2 / Stage 3 sub-decomposition.
 
 **Stage 0 prerequisite (in flight as of 2026-05-12) — Hipfire Q8 baseline cohort (~30 min wall).**
 
@@ -686,10 +709,11 @@ This unblocks meaningful interpretation of every subsequent calibration measurem
 | stage | wall budget | gates | strategic priority |
 |---|---|---|---|
 | Stage 0 (Q8 floor cohort) | ~30 min | none | critical: required interpretation prerequisite |
-| Stage A (AWQ) | ~1.5-2 weeks | Stage 0 | **highest** — cheapest path to a meaningful quality win |
-| Stage B (GPTQ) | ~2 weeks | optional after Stage A | high — stacks additively |
-| Stage C (UD kmap) | ~1-2 days | independent of A/B | medium — small effort, orthogonal lever |
-| Stage D (MQ4K) | ~5-7 weeks | DEFERRED, gated on A+B+C | only if needed |
+| Stage A (AWQ on MQ4) | ~1.5-2 weeks | Stage 0 | **highest** — cheapest path; AWQ works at MQ4's g=256 (per-block large-group) |
+| Stage B (GPTQ on MQ4) | ~2 weeks | optional after Stage A | high — stacks additively; builds Hessian collector for Stage C |
+| **Stage C (MR-GPTQ on MFP4)** | **~2-3 weeks** | after Stage B (shares scaffolding) | **paper-validated for MFP4** — might make Stage E unnecessary |
+| Stage D (UD kmap) | ~1-2 days | independent of A/B/C | medium — small effort, orthogonal lever |
+| Stage E (MQ4K wire format) | ~5-7 weeks | DEFERRED, gated on A+B+C+D | only if calibration on existing formats falls short |
 
 **What the Steps 1-7 work above bought us even though the pivot reframes the plan:** the infrastructure to MEASURE all of this is in place — `quant_cohort.sh`, `eval_hipfire`, `imatrix_collect`, `ud_decompile`, BF16 kldref files for 9B and 0.8B. The bench loop is ~25 minutes per cohort variant on 9B. Stage A AWQ can iterate against measurement at that cadence, which is the engineering velocity needed to actually validate a calibration lever empirically (not just predict its impact from a lever-decomposition spreadsheet).
 

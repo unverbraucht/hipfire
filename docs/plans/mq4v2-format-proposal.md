@@ -313,6 +313,91 @@ Once we know the floor, Stage 1's decision is:
 - MQ4K bench result M
 - closure: (0.808 - M) / (0.808 - F) → fraction of closable gap MQ4K achieved
 
+## 6.5 MR-GPTQ (Egiazarian et al 2509.23202) — the external technique that might make this whole proposal unnecessary
+
+After this proposal was first drafted, a deep-cross-check pulled in
+"Bridging the Gap Between Promise and Performance for Microscaling FP4
+Quantization" (Egiazarian, Castro, Kuznedelev, …, Alistarh — IST-DASLab,
+RedHat, Neural Magic, ETH; arXiv 2509.23202v3). The paper targets MXFP4
+specifically — which **IS** hipfire's MFP4G32 wire format (E2M1 codes +
+UE8M0 per-32 scales).
+
+### 6.5.1 What MR-GPTQ does
+
+MR-GPTQ = Micro-Rotated-GPTQ. Three modifications to vanilla GPTQ:
+
+1. **MSE-optimized grids** — alternating optimization between block scales and per-tensor scales to minimize reconstruction error.
+2. **Static activation reordering** — weight column reordering based on Hessian diagonal applied *before* GPTQ inference, avoiding the 10-20% runtime penalty of dynamic activation reordering.
+3. **Fused online rotations** — block-wise Hadamard transforms at k ∈ {16, 32, 64, 128}. Pre-fused into weights as Q(W·H_k); applied online to activations via a custom Triton kernel.
+
+Plus a **format-specific fix in Appendix H**: E8M0/UE8M0 has dynamic range 2^-127 to 2^127, but real weight distributions occupy maybe 2^-20 to 2^20. Mapping the wide E8M0 range to a useful data range improves accuracy substantially — *"mapping the excessively large E8M0 range into data range that significantly improves performance"*.
+
+### 6.5.2 What the paper measured on MXFP4 (= hipfire MFP4G32)
+
+Llama-3.1-8B, MXFP4, average over MMLU+GSM8K+HellaSwag+WinoGrande:
+
+| Method | Avg | Recovery vs FP16 |
+|---|---:|---:|
+| RTN (min-max) | 69.32 | 87.83% |
+| RTN + Hadamard | 70.45 | 89.26% (+1.4pp) |
+| Vanilla GPTQ | 70.62 | 89.47% (+1.6pp) |
+| **MR-GPTQ** | **73.65** | **93.31% (+5.5pp)** |
+
+The signal: **vanilla GPTQ alone barely beats RTN on MXFP4** (+0.17 absolute); Hadamard alone gives similar lift (+1.13); MR-GPTQ combined gives +4.33 over RTN. **Most of MR-GPTQ's value is in the format-specific pieces** (Appendix H E8M0 fix + MSE-grid alternating optimization), not in GPTQ-vs-RTN itself.
+
+### 6.5.3 Why MR-GPTQ fits hipfire's MFP4G32 almost perfectly
+
+| MR-GPTQ component | hipfire MFP4G32 equivalent | status |
+|---|---|---|
+| E2M1 codes | E2M1 codes | ✅ identical |
+| UE8M0 / E8M0 per-32 scales | UE8M0 per-32 scales | ✅ identical |
+| Block-wise Hadamard (k=16-128) | FWHT-256 offline rotation | ✅ same class, just k=256 (potential variant: k=32/64/128 at quantize time) |
+| GPTQ algorithm | not implemented (Stage B planned) | ⏸️ |
+| **E8M0 range mapping (Appendix H)** | **not implemented** — the key MR-GPTQ differentiator | ❌ |
+| MSE-optimized grids | not implemented | ❌ |
+| Static activation reordering | not implemented | ❌ |
+
+We have **most of the ingredients**. The missing pieces are the *algorithmic* recipe, not new wire-format inventions.
+
+### 6.5.4 The paper's "outlier mitigation neutralized at small group size" finding
+
+The paper specifically notes: *"NVFP4's small group size provably neutralizes traditional outlier mitigation techniques."* NVFP4 uses g=16, MXFP4 uses g=32, hipfire MQ4 uses g=256.
+
+This **structurally explains** our Step 5a + §1.5 cohort findings:
+
+| format | hipfire group | outlier-mitigation lever |
+|---|---|---|
+| MQ4 (rotated, g=256) | large | AWQ-style outlier mitigation WORKS — what Stage A targets |
+| HFP4 (unrotated, g=32) | small | Degraded — our 0.8B HFP4-L4-L5c got -9% KLD (partial win) |
+| MFP4 (rotated, g=32) | small | Neutralized — our 9B MFP4-L4-L5c got +8% KLD (regression) |
+
+Both we (rotation-flatness math argument) and the paper (small-group-neutralizes-outlier-mitigation argument) predict the SAME outcome: per-block weighted-LS calibration on MFP4 doesn't work. Two independent reasons converging on the same result.
+
+### 6.5.5 Implication for this MQ4K proposal
+
+**MR-GPTQ on MFP4 might make MQ4K (and this entire proposal) unnecessary.**
+
+The whole MQ4K argument rests on "hipfire's MFP4G32 wire format underperforms because it lacks Q4_K's per-32 sub-scaling." MR-GPTQ says: with the right calibration recipe (specifically the Appendix H E8M0 fix), MXFP4 / MFP4G32 can approach NVFP4 accuracy — which already beats Q4_K_M-class quants at the same bpw.
+
+Translation: **the format isn't broken; the calibration is**. If we apply MR-GPTQ's recipe to our existing MFP4G32 wire format (keeping FWHT-256 rotation), we might hit ~93% recovery on Qwen3.5-9B — same level the paper measured on Llama-3.1-8B. That would close the bpw-matched gap to UD-Q4_K_XL **without any wire format change**.
+
+This **revives the original §6 "HFP4 is the format we commit to" strategic posture** from `qwen35-mq4-quality-gap.md` — the cohort findings had suspended it; MR-GPTQ provides the mechanism to actually deliver on the original projection.
+
+### 6.5.6 Updated decision tree
+
+| stage | scope | wall budget | gates |
+|---|---|---|---|
+| Stage 0 (Q8 floor cohort) | engine-drift floor | ~30 min | none |
+| Stage A (AWQ on MQ4) | per-channel outlier mitigation — large-group format | ~1.5-2 wks | Stage 0 |
+| Stage B (GPTQ on MQ4) | Hessian-aware sequential quantization | ~2 wks | Stage A optional |
+| **Stage C (MR-GPTQ on MFP4)** | **paper-validated recipe specifically for MXFP4 / MFP4G32** | **~2-3 wks (reuses Stage B GPTQ scaffolding)** | after B (shares Hessian collector) |
+| Stage D (UD kmap ingestion) | orthogonal per-tensor allocation | ~1-2 days | independent |
+| **Stage E (MQ4K wire format)** | this proposal | **~5-7 wks** | DEFERRED, **only if Stages A+B+C+D fall short of UD-Q3_K_XL parity** |
+
+**Most likely path forward**: Stage A AWQ on MQ4 first (cheapest); if not enough, Stage C MR-GPTQ on MFP4 (paper-validated recipe for our existing format); if STILL not enough, this MQ4K proposal becomes the fallback.
+
+The cool aspect: **Stages A and C target DIFFERENT formats** (MQ4 vs MFP4), so both can land independently and hipfire ends up shipping the better of the two as the default. The proposal Stage E (MQ4K) is the contingency if neither calibration approach is enough.
+
 ## 7. Alternative considered — sidecar approach
 
 Instead of a new wire format, ship per-32 sub-scales as a sidecar file:
