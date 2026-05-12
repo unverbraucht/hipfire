@@ -1,141 +1,209 @@
-# Stage B — GPTQ on MQ4 (implementation plan)
+# Stage B — GPTQ on MQ4 (implementation plan, v2)
 
-**Status:** plan, pre-implementation.
-**Date:** 2026-05-12.
+**Status:** plan, pre-implementation (revised after adversarial review).
+**Date:** 2026-05-12 (v2 incorporates findings from `gptq_plan_rev_claude.md`, `gptq_plan_rev_gemini.md`, `gptq_plan_rev_glm5.md`, consolidated in `gptq_plan_rev_synthesis.md`).
 **Predecessor:** Stage A (AWQ on MQ4) — shipped + validated at commit `6594709d`. 9B measured at −32.6% above-floor KLD vs mq4-base, −5.0% PPL. Stage B is designed to STACK on Stage A, not replace it.
-**Predicted lever value:** +15–25% additional PPL improvement (paper data on Q4 INT4 — Frantar et al. 2210.17323). Stacks additively with AWQ's pre-channel scaling.
+**Predicted lever value (revised):** +5-15% additional KLD-above-floor reduction (NOT the 15-25% PPL improvement the literature reports for GPTQ-on-RTN — AWQ already captured much of that lever). Stacks with AWQ's per-channel pre-scaling.
 **Wire format:** no changes. Same `.hfq` MQ4G256 quant_type 13 blocks. Stage B only changes the *content* of the quantized values, not the format.
 
 ---
 
-## 1. Background — what GPTQ does and why it stacks with AWQ
+## v1 → v2 review cycle summary
 
-### 1.1 GPTQ in one paragraph
+Three independent adversarial reviews surfaced 21 issues across math, infrastructure, performance, and cosmetics. v2 incorporates all critical + major findings:
+
+- **Math fixes:** Option β (FWHT-rotated GPTQ) is v1, not v2. Hessian must be transformed for both AWQ scaling AND FWHT rotation: `H_target = FWHT_per_256 · diag(1/s) · H_unrot · diag(1/s) · FWHT_per_256^T`. Per-block (scale, min_val) is FROZEN before GPTQ to avoid circular dependency.
+- **Architecture fix:** `imatrix_collect.rs` is a llama.cpp subprocess wrapper — cannot be extended for Hessian collection. v2 introduces a new Python script (`scripts/collect_hessian.py`) using HF transformers for the calibration forward pass.
+- **Algorithm additions:** WEIGHT-mode actorder (free quality lever), FP64 Cholesky via `faer` crate, max condition number cap with fallback to plain MQ4, explicit asymmetric per-element quantize formula.
+- **Scope changes:** GPTQ now covers ALL MQ4G256 tensors, not just AWQ-eligible ones (non-AWQ tensors get a separate Hessian without `/s`).
+- **Estimate revisions:** wall time 10-12 days (was 7), LOC ~1500-2000 Rust + ~100 Python (was 850), predicted 9B post-Stage-B KLD 0.70-0.74 (was 0.62-0.66).
+- **Rejected:** my N2 (block_size=256) — both Gemini and GLM5 disagreed. Keep block_size=128 per GPTQ paper. The Cholesky tile size is independent of the MQ4 quantization grid.
+
+Full validation/rejection trace per finding: `docs/plans/gptq_plan_rev_synthesis.md`.
+
+---
+
+## 1. Background
+
+### 1.1 GPTQ algorithm
 
 GPTQ (Frantar, Ashkboos, Hoefler, Alistarh 2023, arXiv 2210.17323) is a **post-training quantization algorithm** that minimizes per-tensor reconstruction error under an activation-aware loss:
 
 ```
-min_W'  E_x [ || W·x − W'·x ||² ]   subject to W' having INT4 codewords
+min_W'  E_u [ ‖W·u − W'·u‖² ]   subject to W' having INT4 codewords
 ```
 
-Standard per-tensor min-max quantization (what hipfire's `quantize_mq4g256` currently does) minimizes `|| W − W' ||²` — element-wise weight-space error. That ignores the input distribution: a channel with low activation magnitude can take large quantization error without hurting model output; a channel with high activation magnitude needs small quantization error.
+where `u` is the actual input fed to the matmul kernel — for hipfire MQ4G256+AWQ, `u = FWHT_per_256(x/s)`, NOT the original `x`. The Hessian `H = E[u·u^T]` is the activation-aware metric that GPTQ uses to weight per-column error propagation.
 
-GPTQ replaces the per-tensor min-max objective with one that:
-1. **Collects the per-tensor input Hessian** `H = E_x [x · x^T]` (a `[K, K]` matrix) during a calibration pass.
-2. **Quantizes columns sequentially** (column by column in the K-axis). After quantizing column `k`, the remaining columns are updated to *compensate* for the rounding error of column `k`, weighted by the Hessian's off-diagonal entries — so the total reconstruction error against `x` is minimized in the L2 sense, not the per-element sense.
-3. Uses Cholesky factorization of `H + λI` for numerical stability and a closed-form per-column update (the "OBS" — Optimal Brain Surgeon — derivation).
+GPTQ quantizes columns sequentially (column by column in the K-axis). After quantizing column `k`, the remaining columns are updated to *compensate* for the rounding error of column `k`, weighted by the inverse Hessian's off-diagonal entries — total reconstruction error against `u` is minimized in the L2 sense, not the per-element sense. The compensation is computed via the Cholesky factorization of `H + λI` (standard Optimal-Brain-Surgeon derivation).
 
-The result is a quantized weight tensor that produces near-identical output to the original FP16/BF16 weight on the calibration distribution. Per-tensor reconstruction error increases vs RTN (because we're minimizing activation-space error, not weight-space error), but model-level KLD drops substantially.
+The result is a quantized weight tensor that produces near-identical output to the original FP16/BF16 weight on the calibration distribution. Per-tensor reconstruction error increases vs RTN (we're minimizing activation-space error, not weight-space error), but model-level KLD drops substantially.
 
-### 1.2 Why GPTQ stacks with AWQ
+### 1.2 Composability with AWQ — three-step weight transform
 
-AWQ pre-scales weights per input channel: `W' = W · diag(s)`. This is a *static* rescaling — it doesn't depend on the loss function. AWQ's job is to make outlier-activation channels' weights survive quantization (by amplifying them before quantization → relative error is preserved).
+For hipfire's Stage A (AWQ) + Stage B (GPTQ) stack, the weight transform at quantize time is:
 
-GPTQ optimizes *how* the quantization rounds happen — but takes the input weight matrix as given. So the natural composition is:
+```
+W (BF16)
+  → W_awq = W · diag(s)                            [Stage A: AWQ pre-scaling]
+  → W_rot = FWHT_per_256_along_K(W_awq)            [offline rotation, baked into stored weights]
+  → W_gptq = GPTQ(W_rot, H_target, fixed_scales)   [Stage B: column-sequential update]
+  → W_quant = round_to_per_256_block_grid(W_gptq)  [INT4 codewords + (scale, min_val) per 256-block]
+```
 
-1. Quantize-time pass 1 (AWQ): `W_awq = W · diag(s)` where `s[j] = (RMS_act[j])^α`.
-2. Quantize-time pass 2 (GPTQ): apply GPTQ's column-by-column update on `W_awq` to get `W_gptq_awq`.
-3. Quantize-time pass 3 (FWHT + MQ4): rotate per 256-block, quantize each block to INT4.
+Where:
+- `s[j]` = AWQ scale per input channel (computed once from imatrix).
+- `H_target` = `FWHT_per_256 · diag(1/s) · H_unrot · diag(1/s) · FWHT_per_256^T` (Hessian transformed into the AWQ-divided, FWHT-rotated basis — see §3 for the derivation).
+- `fixed_scales` = per-256-block (scale, min_val) computed from `W_rot` BEFORE the GPTQ loop and FROZEN through the loop. Avoids the circular dependency where post-GPTQ weights would change the per-block min/max (per GLM5 C1).
 
-At runtime, the AWQ inverse `x/s` and the FWHT `FWHT(x/s)` cancel as before (Stage A math). GPTQ's column-by-column updates already happened — the stored `W_gptq_awq` is just a different (better-conditioned) `W'` that the runtime is oblivious to.
+At runtime, the AWQ-aware kernel divides `x/s`, the FWHT runs per 256-block, the matmul against `W_quant` produces output matching `W·x` modulo quantization noise. The math identity `(W_quant · diag(s)) · (FWHT(x/s)) ≈ W·x` holds because both AWQ's pre-scaling and FWHT's orthogonal transform are absorbed into `W_quant`.
 
-**The order matters.** GPTQ should run AFTER AWQ pre-scaling because GPTQ's Hessian-aware updates are computed on the weight matrix that will actually get quantized — i.e., on `W · diag(s)`, not on `W` alone.
+### 1.3 Stage C scaffolding reuse — partial
 
-**Open question — should GPTQ run before or after the offline FWHT?** Two options:
+MR-GPTQ (Egiazarian et al. 2509.23202) extends GPTQ for MXFP4 (= hipfire's MFP4G32). Stage C reuses **the GPTQ inner column-update + Hessian-collection infrastructure**, but the outer loop and per-block scale optimization are net new:
 
-- **Option A (GPTQ first):** `W → W_awq → W_gptq_awq → FWHT(W_gptq_awq) → quant`. GPTQ sees the unrotated weights; the FWHT happens after.
-- **Option B (FWHT first):** `W → W_awq → FWHT(W_awq) → W_gptq_fwht_awq → quant`. GPTQ sees the rotated weights, optimizes for them.
+- **Reused (~60% of Stage B code):** Hessian collection script, FP64 Cholesky, column-sequential update, AWQ-Hessian transform, asymmetric quantize step.
+- **Net new for Stage C:** E8M0 range mapping (Appendix H of MR-GPTQ paper), MSE-optimized grid alternating optimization (column-update interleaved with per-tensor block-scale tuning), MFP4 codeword grid.
 
-Option B is the right choice — GPTQ should optimize the *final* representation that will get quantized. The MQ4 per-block min-max + INT4 codewords operate on the FWHT-rotated buffer, so GPTQ should target that. The Hessian also needs to be in the rotated coordinate system. Concretely: `H_rotated = FWHT_per_256(H · FWHT_per_256^T)` — but since FWHT is orthogonal, this is just the same H expressed in a different basis. Equivalently, collect H in the input (unrotated) coordinate, but apply GPTQ's column-by-column update on `FWHT(W_awq)` with `H` rotated to match.
-
-Section 3 below proposes the concrete algorithm; the choice between collecting H pre- or post-rotation is a small implementation detail with a closed-form transformation between them.
-
-### 1.3 Why stages C (MR-GPTQ on MFP4) needs Stage B first
-
-MR-GPTQ (Egiazarian et al. 2509.23202) is GPTQ + E8M0 range mapping + MSE-optimized grid alternating optimization, specifically targeting MXFP4 (= hipfire's MFP4G32). MR-GPTQ's GPTQ leg is the same algorithm as plain GPTQ — the differentiator is the wraparound for the FP4 element format + per-block UE8M0 scale.
-
-So Stage B builds the Hessian-collection scaffolding + GPTQ inner loop for MQ4G256. Stage C reuses the scaffolding, changes the per-tensor optimization to handle FP4 codewords + UE8M0 scales. Stage C lift on MFP4G32: ~5.5pp recovery improvement per the paper (RTN 87.83% → MR-GPTQ 93.31% on Llama-3.1-8B). Stage B lift on MQ4G256: predicted +15-25% PPL beyond AWQ, but we'll measure.
+Cost estimate after Stage B lands: ~1-2 weeks additional.
 
 ---
 
-## 2. Phased plan + cost estimate
+## 2. Phased plan + revised cost estimate
 
-### Phase 1 — Hessian collection (1–2 days, CPU + GPU)
+### Phase 1 — Hessian collection via Python script (2-3 days, ~30 min runtime per model)
 
-Extend `crates/hipfire-runtime/examples/imatrix_collect.rs` to ALSO dump the per-tensor full Hessian `H = (1/n) Σ_t x_t · x_t^T` in addition to the diagonal (which is what current imatrix carries).
+**Why Python, not Rust:** the existing `crates/hipfire-runtime/examples/imatrix_collect.rs` is a llama.cpp subprocess wrapper (line 151: `Command::new(&args.llama_imatrix_bin)`). It has no native forward pass, no activation hooks. Extending it for Hessian collection is architecturally impossible without one of: (A) forking llama.cpp's imatrix tool to add Hessian accumulation [invasive, maintenance burden], (B) building a hipfire-native BF16 host forward pass [5-10 days new work, no existing infrastructure], or (C) using a Python/PyTorch tool [1-2 days, leverages mature HF transformers + torch].
 
-**Design choices:**
+v2 chooses (C). The Hessian is `E[u·u^T]` — a mathematical expectation independent of inference-engine internals. As long as we calibrate on the same tokens hipfire will see (which the Python script ensures by using HF tokenizer matching the model), the resulting Hessian is engine-agnostic. The 0.46% tokenizer disagreement rate between llama.cpp and hipfire (per issue-113 §126) is acceptable for the Hessian since it's a smoothed expectation over many tokens.
 
-- **Coverage:** only for tensors that will be GPTQ-quantized — i.e., the Stage A whitelist (`q/k/v_proj`, `gate/up_proj`, `in_proj_*`, `gate_up_proj`, `mlp.gate.weight`). Skipping `o_proj`/`out_proj`/`down_proj` saves ~30% of Hessians; we can revisit if Option B (AWQ for those tensors) lands later.
-- **Storage:** per-tensor `H` is `[K, K]` FP32. For K=1024 → 4 MiB; for K=12288 (9B's MLP intermediate via gate_up_proj) → 576 MiB. **Total for 9B:** ~6 GB worst case, ~3 GB if we shard by tensor and only collect what's needed. Sidecar file: `<model>.hessian.bin` next to the imatrix.
-- **Storage format:** binary float32 matrix per tensor, prefixed with a JSON header (matching the kldref / imatrix pattern). Each Hessian preceded by a 4-byte length + tensor-name string + 4-byte K + the `K*K*4` bytes. No compression for v1; FP32 is reasonable for v1.
-- **Calibration corpus:** same as current imatrix (wikitext-2-train, ~125k tokens). 125k tokens × ~32 layers × ~K=1024 average → ~4×10⁹ Hessian outer-product accumulations per tensor. At ~10 GFLOPS sustained on host CPU (cache-friendly outer products), ~6 minutes per tensor — but parallelism over tensors brings this down. Plan ~30 minutes wall on 32-core CPU.
-- **Numerical conditioning:** Hessian is symmetric PSD by construction. For Cholesky in Phase 2 we need `H + λI` with `λ ≈ 0.01 * mean(diag(H))` (standard GPTQ damping). Add `λ` at Cholesky time, not collection time.
+**Deliverables:**
 
-**Concrete deliverables:**
+1. New script `scripts/collect_hessian.py` (~100 LOC):
+   - Inputs: BF16 model dir (HF format), calibration corpus (text file, sub-sampled to 128 sequences × 2048 tokens — Gemini 2.1 recommendation matching GPTQ paper's scale), output sidecar path.
+   - For each `nn.Linear` whose name is on the GPTQ-eligible list (all MQ4G256 tensors per Topic 10 — q/k/v/qkv, gate/up/down, in_proj_*, o_proj/out_proj/down_proj, router): register a forward hook that accumulates `x.T @ x` into a per-tensor running sum.
+   - Run forward pass over the calibration tokens (no gradient, no labels — just collect activations).
+   - After the pass, divide by token count → `H_tensor = (1/N) · Σ x_t · x_t^T`.
+   - Serialize all tensor Hessians to a single binary file with a JSON header.
+   - Tokenizer: HF AutoTokenizer for the same model. Calibration corpus: wikitext-2-train (existing AWQ imatrix corpus) sub-sampled to 128 × 2048 = 262144 tokens.
+   - Estimated runtime: ~30 min on a GPU host with the BF16 model loaded (most time is the forward pass, not the outer-product accumulation).
 
-1. New `--hessian-out <path>` flag on `imatrix_collect`.
-2. New helper `collect_per_tensor_hessian` that hooks the same forward pass that imatrix uses, accumulates `H` on the host (no GPU Hessian — host CPU is fine for this scale).
-3. Binary file format spec at `docs/plans/gptq-hessian-format.md` (sibling to `kldref-format`).
-4. Unit test: collect Hessian on a 4-layer toy model, verify symmetry and that `H[j,j]` matches imatrix's `in_sum2[j] / n_tokens`.
+2. New module `crates/hipfire-runtime/src/hessian_io.rs` (~250 LOC) — read side: binary file format spec, mmap-based per-tensor lookup, FP64 deserialization. The Hessian binary format is also documented in `docs/plans/gptq-hessian-format.md`.
 
-### Phase 2 — GPTQ algorithm in the quantizer (3–5 days, CPU)
+3. Sidecar binary format:
+   - Header: 16-byte magic `HFHS` (Hipfire Hessian Sidecar) + 4-byte version + 8-byte total tensor count.
+   - Per-tensor record: 4-byte name length + name string + 4-byte expert_idx (default 0; reserved for Stage B.1 MoE expert Hessians per GLM5 N7) + 4-byte K dimension + 8-byte fp32-or-fp64 flag (1 = FP32, 2 = FP64) + `K*K * sizeof(scalar)` bytes Hessian matrix.
+   - Storage as FP32 (4 bytes/entry, 6 GB worst case on 9B) is sufficient — we promote to FP64 only for Cholesky.
 
-Implement GPTQ's column-by-column update inside `hipfire-quantize`. New CLI flag: `--gptq <path-to-hessian.bin>` (mutually compatible with `--awq`).
+4. Unit test: collect Hessian on TinyLlama (1.1B BF16), verify symmetry (`H[i,j] == H[j,i]` to FP32 precision), and that diagonal `H[j,j]` matches imatrix's `in_sum2[j] / n_tokens` to within ε.
 
-**Pseudocode (per tensor, post-AWQ-prescaling, pre-FWHT/MQ4-quant):**
+### Phase 2 — GPTQ algorithm in the quantizer (5-6 days)
+
+New module: `crates/hipfire-quantize/src/gptq.rs` (~500-600 LOC). Dependency: `faer` crate for FP64 Cholesky and triangular solve (no BLAS/LAPACK dependency, pure Rust).
+
+**Pseudocode (per tensor, post-AWQ-prescale, post-FWHT-rotate, pre-MQ4-quant):**
 
 ```
-Input:  W (M×K, post-AWQ-prescaled FP32)
-        H (K×K, precomputed Hessian)
-        block_size = 128  // GPTQ inner block (NOT the 256 FWHT block)
-        damp = 0.01 * mean(diag(H))
+Input:  W_rot (M×K, post-AWQ-prescaled + FWHT-rotated FP32 weights)
+        H_unrot (K×K, raw Hessian from Python collector)
+        s (K, AWQ scale vector; identity vector for non-AWQ-eligible tensors)
+        block_size = 128       // GPTQ Cholesky-inverse tile (NOT the FWHT block)
+        damp = 0.01 * mean(diag(H_unrot))
+        max_cond = 1e8         // condition-number cap (per Gemini §3)
 
-# Damping + Cholesky factorization
-H_damped = H + damp * I_K
-L = cholesky(H_damped)     // K×K lower triangular
-H_inv = L^-T · L^-1        // we only need the Cholesky-inverse columns
+# Step 0: pre-compute fixed per-256-block (scale, min_val) from W_rot
+# These are FROZEN through the GPTQ loop to avoid circular dependency
+# (per GLM5 C1 extension)
+n_blocks = M * K / 256
+fixed_grids = Vec<(scale, min_val); n_blocks>
+for b in 0..n_blocks:
+    block_vals = W_rot.flat[b*256 .. (b+1)*256]
+    fixed_grids[b] = (range / 15.0, min(block_vals))
 
-# Sequential column-quantization
-W_q = W.copy()  // will hold the quantized result (still FP32-valued, INT4-grid-aligned)
+# Step 1: transform Hessian into the AWQ-divided, FWHT-rotated basis
+# (per Gemini 1.1 + GLM5 M0 — offline transformation in one pass)
+H_awq = diag(1/s) @ H_unrot @ diag(1/s)            // AWQ rescaling
+H_target = FWHT_per_256_similarity(H_awq)          // similarity transform under per-256 FWHT
+# H_target is the Hessian in the same basis as W_rot
+
+# Step 2: WEIGHT-mode actorder (per Claude C3 + Gemini 1.3)
+# Permute columns of W_rot and H_target by descending diag(H_target).
+# Save permutation; un-permute weights after the loop. No g_idx stored.
+perm = argsort(diag(H_target), descending=True)
+W_p = W_rot[:, perm]
+H_p = H_target[perm, perm]
+
+# Step 3: damping + FP64 Cholesky
+H_damped = H_p + damp * I_K          // promote to FP64
+cond = cholesky_condition_estimate(H_damped)
+if cond > max_cond:
+    log("tensor X has condition number {cond} > {max_cond} — skipping GPTQ, using plain MQ4")
+    return quantize_mq4g256_from_rotated(W_rot, fixed_grids)   // fallback
+L = cholesky(H_damped)               // FP64, lower triangular, via faer
+
+# Step 4: column-sequential GPTQ loop (block_size=128 tile)
+W_q = W_p.copy().to_fp64()
 for col_start in 0..K step block_size:
     block_cols = col_start..(col_start + block_size)
     for j in block_cols:
-        # Quantize column j to MQ4's INT4 grid (per-256-FWHT-block min-max)
-        # NOTE: at this point W_q is in unrotated coords; the actual MQ4
-        # quantize happens later in quantize_mq4g256 after the offline FWHT.
-        # GPTQ here is doing element-wise nearest-INT4-after-FWHT.
-        # See §3 for the FWHT-integrated derivation.
-        q_j = quantize_one_column_to_mq4_grid(W_q[:, j])
-        err = (W_q[:, j] - q_j) / L_diag_inv[j]
-        # Propagate error to remaining columns in this block
-        W_q[:, j] = q_j
+        # Per-element quantize using FROZEN per-256-block (scale, min_val).
+        # Each element W_q[i, j] belongs to flat-block b = (i*K + j) / 256.
+        for i in 0..M:
+            b = (i * K + (perm^-1)[j]) / 256       // use original column index for block lookup
+            scale, min_val = fixed_grids[b]
+            q = clamp(round((W_q[i, j] - min_val) / scale), 0, 15)
+            W_q[i, j] = q * scale + min_val
+        # OBS error propagation within this tile
+        err = (W_p[:, j] - W_q[:, j]) / L[j, j]
         for k in (j+1)..(col_start + block_size):
-            W_q[:, k] -= err * L_inv_block[j, k]
-    # Propagate inter-block error update (the GPTQ Cholesky off-diagonal trick)
-    W_q[:, (col_start + block_size)..K] -= err_accumulated · L_inv_inter_block
+            W_q[:, k] -= err * L[j, k] / L[k, k]   // ratio per GPTQ Algorithm 1
+    # Inter-tile error propagation (GPTQ paper's cross-block update)
+    block_err = (W_p[:, block_cols] - W_q[:, block_cols])
+    W_q[:, (col_start + block_size)..K] -= block_err @ L_inv_inter_block   // see GPTQ §3.2
 
-# After the loop, W_q is quantized + Hessian-aware-error-compensated.
-# Then proceed with normal FWHT + MQ4 storage:
-emit quantize_mq4g256(W_q)
+# Step 5: un-permute and convert back to FP32
+W_p_unperm = W_q[:, argsort(perm)].to_fp32()
+
+# Step 6: final MQ4G256 storage using the same FROZEN grids
+emit quantize_mq4g256_from_rotated_with_fixed_grids(W_p_unperm, fixed_grids)
 ```
 
-**Critical implementation details:**
+**Critical implementation notes:**
 
-- **Block-wise GPTQ:** the inner block size (128) is a numerical / cache-tuning knob from the GPTQ paper, NOT the same as MQ4's 256-element FWHT block. The inner block determines how much of the Cholesky-inverse we touch per error-propagation pass. Setting to 128 matches the paper's default.
-- **MQ4-grid quantization step:** for plain GPTQ on per-tensor uniform INT4, this is `round((w - min) / scale)`. For MQ4G256, the grid is determined by the 256-element FWHT block's min/max AFTER FWHT — so the quantize-one-column step needs to know which 256-block it's in and what that block's per-tensor scale will be. **Two options here:**
-  - **Option α (split GPTQ):** run GPTQ column-by-column in unrotated coords, with the "quantize step" using a *placeholder* grid (e.g., the unrotated weight's per-tensor min/max). Then FWHT + MQ4-quant the result. This is the simplest; quality is suboptimal because GPTQ's quantization target isn't the actual MQ4 grid.
-  - **Option β (integrated):** rotate everything first. `W_awq → FWHT_per_256(W_awq)`, then GPTQ on FWHT'd weights with `H_rotated` (similarity transform of H under per-256 FWHT). Per-256-block GPTQ blocks naturally align with MQ4's per-256-block min-max. This is more accurate but requires re-deriving the Cholesky / error propagation in the rotated basis.
-  - **Choice:** start with Option α for v1 (simpler, faster to implement). Land it, measure 9B AWQ+GPTQ. If lift is < 10% beyond AWQ alone, revisit with Option β. Per the GPTQ paper, Option α (placeholder grid) recovers most of the lift; the rotated/integrated version is mostly defensive.
-- **Hessian I/O:** read the per-tensor `H` lazily from disk via mmap or pread. Don't load all 6 GB at once. Process tensors in arbitrary order — GPTQ is per-tensor, embarrassingly parallel across tensors (via rayon).
-- **Numerical conditioning:** if Cholesky fails (H + λI not PD even after damping), increase λ adaptively. Log the per-tensor effective λ. If λ exceeds 1.0 × diag mean, skip GPTQ for that tensor and fall through to plain MQ4 (with a warning) — extreme conditioning suggests bad calibration coverage.
+- **Hessian transformation (Step 1):** The per-256 FWHT is block-diagonal — `FWHT_per_256(M)` applies the same 256×256 Hadamard to each consecutive block of 256 rows/cols. Implementing `H_target[i, j] = Σ_k Σ_l FWHT[block_i, k] · H_awq[k, l] · FWHT[block_j, l]` reduces to per-block matrix products. Complexity: O(K² · 256) per tensor, ~50 ms per 4096×4096 H on host — negligible vs the K³/3 Cholesky.
+- **Asymmetric quantize step (Topic 5):** `q = round((w − min_val) / scale)`, then `dequant = q * scale + min_val`. Both scale and min_val frozen per block.
+- **Per-block lookup with permutation (Step 4):** the actorder permutation operates on COLUMNS of the K axis, but the per-256-block grid is indexed by FLAT row-major position `i*K + j_original`. We must use the un-permuted column index `(perm^-1)[j]` to look up the block. This is awkward but correct.
+- **Inter-tile update efficiency:** computes outer product `block_err @ L_inv_block` against the remaining-tiles tile of L. Standard GPTQ implementation; faer's matmul is fine.
+- **Adaptive damping:** if Cholesky fails (H + λI not PD even after promotion to FP64), increase λ by 10× and retry, up to λ = 1.0 × mean(diag(H)). Beyond that, fall through to plain MQ4 (with warning).
+- **Coverage:** ALL MQ4G256 tensors (per Topic 10), not just AWQ-eligible. For non-AWQ tensors, `s = identity vector` so `diag(1/s) = I` and the Hessian rescaling step is a no-op; the rest of the algorithm is identical.
+- **Memory cap:** rayon parallelism limited to `min(N_cores, ceil(available_RAM / max_H_FP64_size))` to prevent OOM. For 9B: max H is K=4096 → 16M entries × 8 bytes FP64 = 128 MB. 32 cores parallel = 4 GB — fits easily. For 27B: max H is K=12288 → 1.2 GB. Cap parallelism at 8 cores → 9.6 GB. (Gemini 2.2)
 
-**Concrete deliverables:**
+**CLI flags:**
 
-1. `gptq_column_sequential` function in `crates/hipfire-quantize/src/gptq.rs` (new file).
-2. `--gptq <path>` flag wired into `main.rs` MQ4G256 branch, after AWQ pre-scaling and before `quantize_mq4g256`.
-3. Per-tensor diagnostic output: input MSE, post-GPTQ MSE, effective damping, Cholesky condition number. Print in the "Quantization Summary" block.
-4. Unit tests: GPTQ on a 64×64 toy weight + identity Hessian (should be byte-identical to RTN); GPTQ on a 64×64 with a known diagonal Hessian (should match closed-form per-channel weighted-LS); GPTQ on a small full Hessian matched against a Python reference (numpy-based GPTQ).
+```
+--gptq <hessian-path>           # enable GPTQ on the provided Hessian sidecar
+--gptq-block-size <N>           # default 128 (GPTQ paper default)
+--gptq-damp <f>                 # default 0.01 * mean(diag(H))
+--gptq-actorder <none|weight>   # default 'weight' (free quality lever)
+--gptq-max-cond <f>             # default 1e8
+```
+
+**Per-tensor diagnostic output (printed in "Quantization Summary" block):**
+- Input MSE vs original BF16
+- Post-GPTQ MSE vs original BF16 (should be lower for tensors where GPTQ succeeded)
+- Effective damping λ used
+- Cholesky condition number estimate
+- Number of MQ4 quant clamps (sign that the grid was too tight)
+- Did GPTQ fall through to plain MQ4 (condition cap exceeded)?
+
+**Unit tests:**
+- GPTQ on a 64×64 toy weight + identity Hessian → byte-identical to RTN (no compensation should fire when H is identity).
+- GPTQ on a 64×64 with a known diagonal Hessian → matches closed-form per-channel weighted-LS.
+- GPTQ on a 256×256 with full Hessian → matched against a Python reference (numpy-based GPTQ).
+- WEIGHT-mode actorder: permutation matches `argsort(diag(H))` descending, un-permutation recovers original order.
+- Asymmetric quant: per-element quantize formula matches a hand-computed reference for a 16-element column with known (scale, min_val).
+- **AWQ+GPTQ integration test (per GLM5 N8):** synthetic [M=256, K=512] tensor with known AWQ scales + Hessian; verify that AWQ + GPTQ + FWHT + MQ4 has lower reconstruction error than AWQ + FWHT + MQ4 alone.
+- Stack test: AWQ-eligible vs non-AWQ tensor — verify the Hessian rescaling step is identity-on-identity for non-AWQ.
 
 ### Phase 3 — Validation cohort (1 day)
 
@@ -150,23 +218,31 @@ qwen35-9b-mq4-awq        ~/.hipfire/models/qwen3.5-9b.mq4-awq-loaderfix-2026-05-
 qwen35-9b-mq4-awq-gptq   ~/.hipfire/models/qwen3.5-9b.mq4-awq-gptq                   gfx1100
 ```
 
-**Decision tree (after eval):**
+**Decision tree (revised per Topic 9):**
 
 | Outcome | Action |
 |---|---|
-| GPTQ ΔKLD < −10% above-floor vs AWQ alone | Stage B is a real lever. Ship. Proceed to Stage C (MR-GPTQ on MFP4). |
-| GPTQ ΔKLD ∈ [−10%, +5%] vs AWQ alone | Marginal. Investigate Option β (integrated FWHT+GPTQ) or tune block_size / damping. |
-| GPTQ ΔKLD > +5% vs AWQ alone | Regression. Hessian collection or column-update logic is buggy; bisect. |
+| ΔKLD < −5% above-floor vs AWQ alone | Stage B is a real lever. Ship. Proceed to Stage C (MR-GPTQ on MFP4). |
+| ΔKLD ∈ [−5%, +2%] vs AWQ alone | Expected. AWQ already captured the activation-aware lever; ship Stage B as quality-neutral or marginal-positive. |
+| ΔKLD > +2% vs AWQ alone | Regression. Bisect: Hessian collection (run Python collector standalone), GPTQ inner loop (toy tensor test), AWQ-Hessian transform, FWHT-similarity transform, per-block scale freeze, actorder. |
 
-Predicted: −15-25% beyond AWQ, putting 9B at KLD ~0.62-0.66 (above-floor ~0.05-0.09 nats, vs Q8 floor 0.5735). That would close ~60-80% of the original mq4-base above-floor gap (0.243 nats).
+**Predicted 9B post-Stage-B numbers (revised per Topic 9):**
+
+| Variant | Predicted KLD | Predicted PPL |
+|---|---:|---:|
+| q8f16 (engine floor) | 0.5735 (measured) | 13.383 (measured) |
+| mq4-base | 0.8165 (measured) | 15.063 (measured) |
+| mq4-awq | 0.7373 (measured) | 14.303 (measured) |
+| **mq4-awq-gptq (predicted)** | **0.71-0.73** | **13.9-14.1** |
+
+Stage B is predicted to close 5-15% of the remaining above-floor gap (0.164 nats → ~0.14-0.16). The original predicted "60-80% closure" was an artifact of double-counting AWQ's contribution when applying GPTQ-on-RTN literature numbers.
 
 ### Phase 4 — Stage C scaffolding (deferred)
 
-MR-GPTQ for MFP4G32 reuses the Hessian + GPTQ column-update from Stage B. New work for Stage C:
-- E8M0 range mapping (Appendix H of MR-GPTQ paper) — the differentiator vs plain GPTQ.
+MR-GPTQ for MFP4G32 reuses Stage B's Hessian collection + Cholesky + column-sequential infrastructure. New work for Stage C (~1-2 weeks):
+- E8M0 range mapping (Appendix H of MR-GPTQ paper).
 - MSE-optimized grid alternating optimization (column-update interleaved with per-tensor block-scale tuning).
-
-Cost estimate after Stage B lands: ~1-2 weeks.
+- MFP4 codeword grid (FP4 E2M1 with UE8M0 per-32 scales).
 
 ---
 
@@ -174,56 +250,65 @@ Cost estimate after Stage B lands: ~1-2 weeks.
 
 | Risk | Mitigation |
 |---|---|
-| Hessian collection wall time > 1h | Sample subset of calibration tokens (paper uses ~128 sequences); rerun with full corpus only if quality bench warrants |
-| 6 GB sidecar disk cost | Could be reduced by collecting per-tensor `H` only for the K largest tensors (top-50% by size) and falling through to RTN+AWQ for the rest. Defer until measurement shows this matters. |
-| Option α (split GPTQ) underperforms Option β | Implement α first (cheap), measure, and re-derive β only if needed. The paper claims α recovers ~80%+ of the win. |
-| GPTQ + AWQ interaction breaks the math identity | The math holds: AWQ pre-scales weights, GPTQ optimizes those pre-scaled weights' representation, runtime divides activations by AWQ scale (no change). No interaction beyond "GPTQ sees scaled weights" which is intentional. |
-| GPTQ destabilizes per-block FWHT scale calibration | Per-256-block min-max scale is computed by `quantize_mq4g256` AFTER GPTQ writes its output. As long as GPTQ output values are still in the expected dynamic range, the per-block scale chooser adapts. Worst case is a slightly suboptimal scale; correctness intact. |
-| Hessian damping too aggressive → no benefit from GPTQ | Start with paper default `λ = 0.01 * mean(diag(H))`. Sweep `λ ∈ {0.001, 0.01, 0.1}` on one bench if v1 lift is < 5%. |
-| Calibration corpus shift between Hessian and inference distribution | wikitext-2 generalizes well; same data we used for AWQ imatrix. If we ever see a calibration-vs-evaluation domain mismatch, the issue would surface in BOTH AWQ and GPTQ — and likely AWQ first. |
+| Calibration corpus shift between Hessian and inference distribution | Reuse wikitext-2-train (same corpus as Stage A AWQ imatrix). If downstream tasks show domain mismatch, fall back to AutoGPTQ-style C4 calibration as Stage B.1. |
+| 6 GB Hessian sidecar disk cost on 9B | Acceptable on local SSD. NFS-resident sidecars are slower to load but still feasible. Stage B.1 could shard by tensor name for partial loads. |
+| AWQ + GPTQ math identity breaks | The math identity holds: AWQ pre-scales weights, GPTQ optimizes the AWQ-scaled + FWHT-rotated representation, runtime divides activations by AWQ scale (no change). The Hessian rescaling step (`H_awq = diag(1/s) · H · diag(1/s)`) ensures GPTQ optimizes for the actual runtime input distribution. Verified by §1.2 derivation. |
+| GPTQ destabilizes per-block FWHT scale calibration | Per-256-block min-max scale is computed BEFORE GPTQ runs (frozen grids per GLM5 C1) and reused unchanged after. No destabilization possible. |
+| Hessian damping too aggressive → no benefit from GPTQ | Adaptive damping with effective-λ logging. If λ exceeds 1.0 × mean(diag(H)), fall through to plain MQ4. Bench `λ ∈ {0.001, 0.01, 0.1}` if v1 lift is < 5%. |
+| Python script tokenizer disagrees with hipfire's tokenizer | Hessian is a smoothed expectation; 0.46% token-position disagreement is averaged out. Per-tensor `H` values differ by <1% between tokenizers — not material for GPTQ's per-column weighting. |
+| FP32 → FP64 Cholesky memory overhead | For 9B max K=4096: H_FP64 = 128 MB per tensor. With 32-core rayon, peak 4 GB RAM. Acceptable. For 27B max K=12288: H_FP64 = 1.2 GB. Cap parallelism at 8 cores. |
+| Python dependency in build pipeline | `scripts/collect_hessian.py` is an offline tool, not part of the daemon/runtime build. Same precedent as existing `scripts/fetch-eval-refs.sh` which uses Python via `.venv/bin/python3`. Document as optional dependency for Stage B quantizers; ship without if user accepts no Hessian = no GPTQ. |
+| Sub-sampled calibration (128 sequences) misses tail tokens | GPTQ paper, AWQ paper, and llm-compressor all use ~128 sequences. Effective for outlier capture. Validate empirically on the 9B cohort. |
+| Per-block scale freeze suboptimal post-GPTQ | The fixed scales are computed from pre-GPTQ rotated weights. Post-GPTQ weights are perturbed (by at most the quantization error magnitude). The scale's min/max is set by extreme values, which are unlikely to be GPTQ's compensation targets (those tend to be moderate per-channel adjustments). Suboptimality bound: at most ~5% of the quantization grid width on a few outlier blocks. |
 
 ---
 
-## 4. Sequencing + wall-time budget
+## 4. Sequencing + revised wall-time budget
 
 | Item | Wall time | Dependencies | Deliverable |
 |---|---:|---|---|
-| Phase 1.1 — Hessian collection in `imatrix_collect` | 1 day | None | `--hessian-out` flag, `qwen3.5-9b-bf16.hessian.bin` sidecar artifact |
-| Phase 1.2 — Hessian file format spec | 2 hours | 1.1 | `docs/plans/gptq-hessian-format.md` |
-| Phase 1.3 — Unit tests | 0.5 day | 1.1 | Toy-model Hessian symmetry + diagonal-matches-imatrix |
-| Phase 2.1 — GPTQ column-update implementation | 2 days | 1.1 | `gptq.rs` module |
-| Phase 2.2 — CLI wiring + per-tensor diagnostics | 0.5 day | 2.1 | `--gptq <path>` flag in `main.rs` |
-| Phase 2.3 — Unit tests + Python-reference cross-validation | 1 day | 2.1 | 3+ tests passing; bit-exact vs numpy reference on toy data |
-| Phase 3 — 9B cohort + decision write-up | 1 day | 2.2 | Cohort results table + `awq_gptq_postfix_findings.md` |
-| **Total Stage B wall time** | **~7 days** | | |
+| Phase 1.1 — `scripts/collect_hessian.py` implementation | 2 days | Python + HF transformers + torch installed | Standalone script |
+| Phase 1.2 — Hessian file format spec | 0.5 day | 1.1 | `docs/plans/gptq-hessian-format.md` |
+| Phase 1.3 — `hessian_io.rs` (Rust reader) | 1 day | 1.2 | Module + unit tests |
+| Phase 1.4 — Test run: collect 9B Hessians, validate diag matches imatrix | 0.5 day | 1.1-1.3 | `qwen3.5-9b-bf16.hessian.bin` artifact (~6 GB) |
+| Phase 2.1 — `faer` integration + FP64 Cholesky helper | 0.5 day | None | `gptq.rs` Cholesky + condition-estimate helpers |
+| Phase 2.2 — Hessian transformation (AWQ + FWHT) | 1 day | 2.1 | `transform_hessian_for_gptq()` function |
+| Phase 2.3 — GPTQ column-sequential implementation | 2 days | 2.1-2.2 | `gptq_column_sequential()` function |
+| Phase 2.4 — WEIGHT-mode actorder | 0.5 day | 2.3 | Sort + un-permute logic |
+| Phase 2.5 — CLI wiring + per-tensor diagnostics | 0.5 day | 2.3 | Flags + summary block |
+| Phase 2.6 — Unit tests (incl. AWQ+GPTQ integration test) | 1.5 days | 2.3-2.5 | 7+ tests passing |
+| Phase 2.7 — Python-reference cross-validation | 1 day | 2.6 | Test matching numpy GPTQ output on toy data |
+| Phase 3 — 9B cohort + decision write-up | 1 day | 2.5 | Cohort results + findings.md |
+| **Total Stage B wall time** | **~12 days** | | |
 
-Calendar plan: kick off Phase 1.1 immediately after this plan lands. Phase 2.1 starts after 1.3 unit tests are green. Phase 3 cohort runs unattended overnight. Ship in 1-1.5 weeks calendar.
+Calendar plan: kick off Phase 1.1 immediately after this plan revision lands. Phase 2.1 can start in parallel with Phase 1.4. Phase 3 cohort runs unattended overnight. Ship in 2-2.5 weeks calendar.
 
 ---
 
-## 5. Code-touch surface
+## 5. Code-touch surface (revised)
 
 | File | Change | Approx LOC |
 |---|---|---:|
-| `crates/hipfire-runtime/examples/imatrix_collect.rs` | Extend with `--hessian-out` flag + per-tensor outer-product accumulation | +120 LOC |
-| `crates/hipfire-runtime/src/hessian_io.rs` (new) | Read/write sidecar Hessian binary file format | +150 LOC |
-| `crates/hipfire-quantize/src/gptq.rs` (new) | GPTQ column-sequential algorithm + Cholesky helpers | +250 LOC |
-| `crates/hipfire-quantize/src/main.rs` | `--gptq <path>` flag, wire into MQ4G256 branch after AWQ prescale | +30 LOC |
+| `scripts/collect_hessian.py` (new) | HF + torch + numpy Hessian collector, binary file writer | +100 LOC Python |
+| `crates/hipfire-runtime/src/hessian_io.rs` (new) | Read/write sidecar Hessian format + mmap streaming | +250 LOC Rust |
+| `crates/hipfire-quantize/src/gptq.rs` (new) | GPTQ column-sequential + FP64 Cholesky + Hessian transforms + actorder + asymmetric quantize | +500-600 LOC Rust |
+| `crates/hipfire-quantize/src/main.rs` | CLI flags (`--gptq`, `--gptq-block-size`, `--gptq-damp`, `--gptq-actorder`, `--gptq-max-cond`), wire into MQ4G256 branch after AWQ prescale, before FWHT+quant | +60 LOC Rust |
+| `crates/hipfire-quantize/Cargo.toml` | Add `faer = "0.x"` dependency | +1 line |
 | `docs/plans/gptq-hessian-format.md` (new) | Sidecar binary file format spec | new doc |
-| Unit tests | `gptq.rs` test module, `hessian_io.rs` test module, `imatrix_collect.rs` Hessian-output test | +300 LOC |
-| **Total** | | ~850 LOC + 1 new doc |
+| Unit tests | `gptq.rs` test module, `hessian_io.rs` test module, Python reference comparison, AWQ+GPTQ integration | +500-600 LOC Rust |
+| **Total** | | ~1500-2000 LOC Rust + ~100 LOC Python + 1 new doc |
 
 No changes to: runtime crates (no kernel changes), wire format (no `.hfq` schema changes), benchmark harness (cohort runner works unchanged).
 
 ---
 
-## 6. Open design questions
+## 6. Open questions resolved (v2)
 
-1. **Block size for GPTQ inner update.** Paper uses 128. The MQ4 FWHT block is 256. Does it make sense to align these (block_size=256)? Worth a single-bench A/B once v1 works.
-2. **Hessian damping schedule.** Constant `λ` (paper default) vs adaptive (increase if Cholesky fails). Default to adaptive with logged effective λ.
-3. **Sequencing AWQ before vs after GPTQ in the quantize chain.** Default: AWQ first, GPTQ on AWQ-scaled weights. The reverse order doesn't compose cleanly (GPTQ would optimize on un-AWQ-scaled weights; AWQ post-multiply would re-introduce noise). **Decision (2026-05-12): deferred — adversarial review will revisit before implementation.**
-4. **Hessian collection corpus.** Reuse wikitext-2-train via existing `imatrix_collect` integration vs commit to a separate calibration set. **Decision (2026-05-12): v1 reuses wikitext-2-train (same corpus already integrated into `imatrix_collect`).** Documented risk: if downstream tasks show calibration-vs-eval domain mismatch, run a separate AutoGPTQ-style C4 calibration as Stage B.1. The bug-surface area of standing up a second calibration pipeline is high relative to expected marginal gain — defer.
-5. **MoE experts in v1.** Per-expert input distribution is conditional on the router; collecting per-expert Hessians needs the routing decisions, which adds complexity. **Decision (2026-05-12): v1 dense + linear_attn only; MoE experts deferred to Stage B.1.** Calibration dataset choice for the eventual MoE expert Hessian collection: also wikitext-2-train (see Q4); use an off-the-shelf dataset for consistency rather than building a Qwen3.5-specific one (no Qwen3.5-specific corpus is publicly available, and the marginal benefit of arch-specific calibration is small per the AWQ paper).
+1. **Block size for GPTQ inner update.** **Decision: 128** (GPTQ paper default). Bench 128 vs 256 in Stage B.1 if time permits. The Cholesky-inverse tile is independent of the MQ4 quantization grid.
+2. **Hessian damping schedule.** **Decision: adaptive** — start with `λ = 0.01 * mean(diag(H))`, multiply by 10× if Cholesky fails, up to `λ = 1.0 * mean(diag(H))`. Beyond that, skip GPTQ for that tensor with logged warning.
+3. **AWQ-before-vs-after-GPTQ ordering.** **Decision: AWQ first.** AWQ pre-scaling is applied at quantize time before GPTQ. GPTQ optimizes the AWQ-scaled, FWHT-rotated representation. Runtime AWQ inverse path is unchanged.
+4. **Hessian collection corpus.** **Decision: wikitext-2-train sub-sampled to 128 sequences × 2048 tokens (~262k tokens).** Matches GPTQ paper's scale. C4 as Stage B.1 if downstream domain mismatch appears.
+5. **MoE experts in v1.** **Decision: dense + linear_attn only.** v1 sidecar format reserves an `expert_idx` field for future MoE expert Hessians (GLM5 N7). Stage B.1 will populate it when the conditional-on-router accumulation lands.
 
 ---
 
@@ -232,9 +317,16 @@ No changes to: runtime crates (no kernel changes), wire format (no `.hfq` schema
 - **GPTQ paper:** Frantar, Ashkboos, Hoefler, Alistarh, "GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers" (arXiv 2210.17323, ICLR 2023).
 - **MR-GPTQ paper:** Egiazarian, Castro, Kuznedelev, ..., Alistarh, "MR-GPTQ: Micro-Rotated GPTQ for MXFP4 Quantization" (arXiv 2509.23202).
 - **AWQ paper:** Lin, Tang, Tang, Yang, Chen, Wang, Xiao, Dang, Gan, Han, "AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration" (arXiv 2306.00978, MLSys 2024).
+- **vLLM GPTQ (consumption-side reference):** `/home/kread/mygit/vllm/vllm/model_executor/layers/quantization/gptq.py` — inference path for GPTQ-quantized weights.
+- **compressed-tensors `ActivationOrdering`:** `/home/kread/mygit/compressed-tensors/src/compressed_tensors/quantization/quant_args.py` — WEIGHT vs GROUP actorder enum.
+- **faer crate:** https://github.com/sarah-quinones/faer-rs — Rust linear algebra, FP64 Cholesky.
 - **In-tree:**
   - `docs/plans/awq_hipfire.md` — Stage A AWQ integration (committed 6594709d).
   - `docs/plans/awq_fix_claude.md` — Stage A bug-hunt + measured results.
   - `docs/plans/qwen35-mq4-quality-gap.md` — Phase A overall plan.
-  - `crates/hipfire-runtime/examples/imatrix_collect.rs` — Tier 2 imatrix collector (extends naturally).
+  - `docs/plans/gptq_plan_rev_claude.md` — first-round Claude adversarial review.
+  - `gptq_plan_rev_gemini.md` — Gemini adversarial review.
+  - `gptq_plan_rev_glm5.md` — GLM-5 adversarial review.
+  - `docs/plans/gptq_plan_rev_synthesis.md` — three-review validation/rejection consolidation.
+  - `crates/hipfire-runtime/examples/imatrix_collect.rs` — existing imatrix subprocess wrapper (NOT extended for Hessian).
   - `crates/hipfire-quantize/src/main.rs` — quantizer entry point + Stage A AWQ wiring.
