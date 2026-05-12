@@ -989,29 +989,38 @@ fn quantize_mfp4g32_2d(
     // from the same `gen_fwht_signs(42, 256)` / `gen_fwht_signs(1042, 256)`
     // pair MQ4 ships with so the runtime's mq_rotate_x undoes this rotation.
     //
-    // Step 5a-prime: when an imatrix is provided, FWHT it ONCE before the row
-    // loop. Rationale (verified empirically by the 2026-05-12 0.8B Step 5a
-    // cohort): the imatrix captures `Σ_token act²[i]` per *unrotated*
-    // activation channel `i`. After offline-FWHT of the weights, channel
-    // `i` of the rotated weight tensor corresponds to a linear combination
-    // of unrotated activation channels (the FWHT basis vectors). Using
-    // `w[i]` (unrotated importance) as the weight for rotated channel `i`
-    // is a per-channel misalignment that scrambles attribution and made
-    // 0.8B MFP4-L4-L5c +13% KLD WORSE than uncalibrated MFP4 baseline.
+    // L5c imatrix handling for rotated formats — SKIP, by math.
     //
-    // The fix is to apply the same FWHT to the imatrix vector along its
-    // length-K input-channel axis, so the rotated imatrix aligns with the
-    // rotated weight basis. FWHT is orthogonal, so total `Σ w[i]` is
-    // preserved; the rotation re-attributes importance to the rotated
-    // dimensions correctly.
-    let imatrix_rotated: Option<Vec<f32>> = imatrix_weights.map(|w| {
-        let mut rotated = w.to_vec();
-        for seg in 0..(k / 256) {
-            cpu_fwht_256(&mut rotated[seg * 256..(seg + 1) * 256], signs1, signs2);
-        }
-        rotated
-    });
-    let imatrix_for_row = imatrix_rotated.as_deref();
+    // The imatrix captures `Σ_token act²[i]` per *unrotated* activation
+    // channel `i`. For rotated weights the relevant per-channel importance
+    // is `Var[x_rot[i]]` where `x_rot = H · x`. Since H[i,j] ∈ {±1}, we
+    // have H[i,j]² = 1 for all i,j, so:
+    //
+    //   Var[x_rot[i]] = Σ_j H[i,j]² · Var[x[j]] = Σ_j Var[x[j]]
+    //
+    // i.e. **constant across rotated channels within a 256-segment.** The
+    // rotation literally flattens per-channel importance — L5c's lever
+    // (preferential channel weighting) loses its purchase. Within-block
+    // weighted-LS reduces to unweighted-LS in the rotated basis.
+    //
+    // Empirical confirmation: an earlier attempt (Step 5a-prime initial fix)
+    // applied FWHT to the imatrix vector before threading it through the
+    // candidate search. That was DOUBLY broken: (1) FWHT mixes ±1 so the
+    // rotated imatrix vector has *negative* entries, which make the SSE
+    // candidate scoring reward errors instead of penalize them; (2) even
+    // with abs(), the per-channel-flatness argument above says the
+    // attribution carries no information. The 2026-05-12 9B Step 5a cohort
+    // measured MFP4-L4-L5c-with-FWHT-fix at MSE 7.30e-6 (vs MFP4-L4 alone
+    // at 2.71e-6) — 2.7× MSE regression, exactly the sign-inversion bug.
+    //
+    // The mathematically clean treatment: when format is rotated, treat
+    // imatrix as None (= apply pure-MSE L4). A future Step 5d could
+    // exploit cross-segment importance variation in L4B's row-scale chooser
+    // (per-segment ΣVar can vary even when within-segment is flat), but
+    // that's a separate lever; the per-block L4A path correctly skips L5c.
+    let _ = signs1; // referenced below; suppress unused-warning if path changes
+    let _ = signs2;
+    let imatrix_for_row: Option<&[f32]> = None; // L5c skipped for rotated formats
 
     let mut row_buf = vec![0.0f32; k];
     for r in 0..m {
