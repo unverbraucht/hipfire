@@ -289,6 +289,15 @@ required-features = ["arch-qwen35", "deltanet"]
 name = "eval_hipfire_llama"
 required-features = ["arch-llama"]
 
+# dump_qwen35_hidden_states — per-layer hidden-state dump for Step A of
+# the engine-drift floor investigation (localize DeltaNet drift by
+# comparing layer-by-layer against an HF transformers oracle). Reuses
+# HiddenStateRingBuffer from spec-decode infra; overrides extract_layers
+# to capture every layer.
+[[example]]
+name = "dump_qwen35_hidden_states"
+required-features = ["arch-qwen35", "deltanet"]
+
 # Tokenizer-parity helper: reads a .hfq's tokenizer + tokenizes a text slice.
 # No GPU / arch features needed (tokenizer is pure CPU).
 [[example]]

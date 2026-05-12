@@ -786,6 +786,47 @@ Test #1 — Qwen3 plain (no DeltaNet, no Q/K/V bias) discriminator (**STRONG SIG
 
 **Where the next-step work should focus** is now clear: localize the DeltaNet forward-pass divergence. Per-layer hidden-state KLD against an HF transformers reference on a single chunk (Step 2 of the original plan, plus per-layer instrumentation) should pin down which of the 18-24 LA layers contribute most, and whether the drift is a Δrule / FWHT / state-update / mixing-fraction precision issue. The LayerNorm precision hypothesis (#3) and Q8 V-cache rotation hypothesis (#5) are still on the table for the smaller residual but are now lower-priority — the bulk of the floor lives in DeltaNet.
 
+**Step A — per-layer drift localization (2026-05-12 evening). FA is the dominant per-layer contributor, not DeltaNet.**
+
+After Step B confirmed cross-engine ground truth exists, instrumented both engines for per-layer hidden-state capture on Qwen3.5-0.8B chunk 0:
+
+- `scripts/dump_hf_hidden_states.py` — HF transformers BF16 oracle. Uses a forward-pre-hook on `model.model.norm` to capture the pre-final-norm last-layer output (transformers's `output_hidden_states[n_layers]` is post-norm, which doesn't match hipfire's HiddenStateRingBuffer capture point).
+- `crates/hipfire-runtime/examples/dump_qwen35_hidden_states.rs` — hipfire forward through `forward_scratch_with_hidden`, reusing the existing `HiddenStateRingBuffer` from spec-decode infra with `extract_layers` overridden to `(0..n_layers)` for full coverage.
+- `scripts/compare_hidden_states.py` — offline per-layer cosine + relative-L2 comparator.
+
+Both dumps are 192 MB (24 layers × 2048 positions × 1024 hidden × 4 B). Identical input tokens (lifted from `qwen3.5-0.8b-bf16.kldref.bin` chunk 0).
+
+| Layer | type | rel_L2 | mean cos | Δrel_L2 vs prev | note |
+|---|---|---:|---:|---:|---|
+| 0 | LA | 0.061 | 0.998 | — | near-identical |
+| 1 | LA | 0.082 | 0.996 | +0.02 | smooth |
+| 2 | LA | 0.094 | 0.995 | +0.01 | smooth |
+| **3** | **FA #1** | **0.187** | **0.980** | **+0.09** | **biggest single-layer jump** |
+| 4 | LA | 0.212 | 0.975 | +0.03 | tracks |
+| 5 | LA | 0.222 | 0.972 | +0.01 | tracks |
+| 6 | LA | 0.237 | 0.968 | +0.01 | tracks |
+| **7** | **FA #2** | **0.289** | **0.953** | **+0.05** | second-largest jump |
+| 8 | LA | 0.308 | 0.945 | +0.02 | tracks |
+| 9 | LA | 0.321 | 0.940 | +0.01 | tracks |
+| 10 | LA | 0.335 | 0.931 | +0.01 | tracks |
+| **11** | **FA #3** | **0.342** | **0.928** | +0.01 | tail-off |
+| 12-22 | mixed | 0.29-0.33 | 0.93-0.95 | plateau | drift saturates |
+| 23 | FA | 0.323 | 0.937 | — | post-residual pre-final-norm |
+
+  Per-layer cosine min-across-positions (min_cos column) drops as low as 0.66 in mid-layers — there are specific positions where hipfire's hidden state is significantly rotated from HF's. Cosine never inverts though; we're not seeing sign flips.
+
+**Reframe: the per-layer drift is concentrated in FullAttention layers, not DeltaNet.** Layer 3 (the first FA) alone introduces ~half of the eventual rel_L2 in a single layer. Subsequent FA layers add smaller hops. LinearAttention (DeltaNet) layers track HF smoothly with tiny ~+0.01 per-layer increments. After the 4th FA (~layer 11), drift saturates and stops growing — additional layers maintain the divergence but don't compound it. This is the signature of a **fixed-direction error introduced at the first FA layer that subsequent identical operations preserve** rather than an error that accumulates.
+
+This re-frames the hypothesis #1 conclusion. The 50× floor gap between plain Qwen3-0.6B (0.0098) and Qwen3.5-0.8B (0.4945) IS real and IS Qwen3.5-specific — but the per-layer attribution points at **Qwen3.5's FullAttention path**, not its DeltaNet path. Plain Qwen3 has standard FA without Q-norm / K-norm and without the LA-FA interleaving; its near-zero floor is consistent with that. Hipfire's FA implementation for Qwen3.5 has a precision or convention bug that fires hard at the first FA layer.
+
+Candidate culprits inside Qwen3.5 FullAttention (in hipfire-arch-qwen35):
+- **Q-norm / K-norm precision** — Qwen3.5 has per-head Q-norm and K-norm (RMSNorm-style); hipfire auto-detects `has_qk_norm` from tensor presence, but the kernel dispatch (search `config.has_qk_norm` in `llama.rs`) accumulates differently or in different precision than HF.
+- **RoPE base / frequency precomputation** — Qwen3.5 uses `rope_theta=1000000.0`; if the precomputed sin/cos table loses precision, FA accuracy drops on first use.
+- **KV cache write/read precision** at the FA layers (asym3 / q8 — already partially measured by the kv-mode ablation, but the q8-KV component remaining isolated to FA layers is consistent with this).
+- **Softmax / attention probability precision** — fp16 accumulator vs fp32 in the scaled-dot-product step.
+
+Raw per-layer dumps at `/data/cache/hipfire/q3.5-0.8b-{hf,hipfire}-hidden-chunk0.bin` (not committed, 192 MB each); the comparator output is reproducible from the scripts in `scripts/dump_hf_hidden_states.py`, `scripts/compare_hidden_states.py`, and the new example binary.
+
 **Cross-engine sanity check (Step B, 2026-05-12 evening) — confirms Step A is well-posed.**
 Before starting per-layer instrumentation, validated that the BF16 reference itself is consistent across engines. Ran `scripts/cross_engine_check.py` — extracts chunk-0 tokens from `qwen3.5-0.8b-bf16.kldref.bin` (built by llama.cpp), runs the same 2048 tokens through HF transformers BF16 on CPU, computes the per-position KL divergence between llama.cpp's stored top-K distribution and HF's distribution on the same chunk.
 
