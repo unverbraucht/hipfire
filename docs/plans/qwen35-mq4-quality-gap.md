@@ -828,6 +828,70 @@ Candidate culprits inside Qwen3.5 FullAttention (in hipfire-arch-qwen35):
 
 **Reframing — both DeltaNet AND FA contribute.** Closer reading of the layer 0-2 numbers from the Q3.5-0.8B dump: rel_L2 starts at 0.06 (layer 0) and grows to 0.09 (layer 2), all through LinearAttention layers. For comparison, plain Qwen3-0.6B's TOTAL floor across 28 layers is only ~0.01 nats. So Q3.5's DeltaNet contributes ~0.06 rel_L2 in just ONE layer — already 6× more than plain Qwen3's entire 28-layer accumulation. FullAttention then adds another +0.10 at the first FA encounter. Earlier framing "drift is FA, not DeltaNet" overstates the case: both diverge from HF reference, but with different per-layer signatures — DeltaNet has a steady-state error (~0.06 from layer 0, slow growth), FA has a step-change error (+0.05 to +0.10 per FA layer in early stack, saturating). Future probes should run a similar per-layer comparison on a plain-Qwen3 model to bound how much of the Q3.5 layer-0 DeltaNet error is fundamental DeltaNet vs simply Q8 weight-quant noise propagated through any layer.
 
+**RoPE convention probe — ROOT CAUSE IDENTIFIED 2026-05-12 evening.**
+While inspecting the FullAttention path to design the next probe, found that the HF Qwen3.5 reference and hipfire use INCOMPATIBLE RoPE conventions:
+
+  - HF `transformers/models/qwen3_5/modeling_qwen3_5.py:543-579` uses `rotate_half`: pairs are (i, i + rotary_dim/2). After `q_rot * cos + rotate_half(q_rot) * sin`, dim i rotates with dim i+rotary_dim/2. **Half-split convention.**
+  - hipfire `kernels/src/rope_partial_interleaved.hip:17-18` uses `pair * 2` / `pair * 2 + 1`: pairs are (2i, 2i+1). **Interleaved convention.**
+
+These convention choices BOTH produce valid RoPE — provided the Q/K weight layout matches. llama.cpp resolves this for many model families by permuting Q/K weights at HF→GGUF convert time (`_reverse_hf_permute` at convert_hf_to_gguf.py:2533-2541, `undo_permute = True` on the LlamaModel class), reshaping HF's half-split storage into interleaved storage so the runtime's interleaved RoPE produces the correct rotation. **For Qwen3.5 specifically the entire inheritance chain (Qwen3_5TextModel → _LinearAttentionVReorderBase → Qwen3NextModel → Qwen2MoeModel → TextModel) has `undo_permute = False` / absent — ggml's RoPE for Qwen3.5 uses the half-split convention natively, matching HF's storage layout without permutation.**
+
+Hipfire-quantize converts the same HF safetensors with **no Q/K permutation**, then the runtime applies **interleaved RoPE** to weights that are stored in half-split layout. Every FullAttention layer applies the wrong rotation pairing.
+
+Why hipfire still generates coherent text despite this: Q and K are BOTH rotated wrong with the same wrong convention, so Q·K^T still produces a position-aware attention pattern — just with shifted effective frequencies. The relative-position information survives at degraded fidelity, the model still samples mostly-correct tokens, but the logits diverge from the BF16 reference by ~0.4 nats per scored position.
+
+Predicted layer-by-layer signature of an "every-FA-layer applies wrong-pair RoPE" bug:
+  - Layer 0-2 (LA): no FA, no RoPE-induced drift (matches: rel_L2 0.06-0.09 is small residual noise)
+  - Layer 3 (FA #1): biggest jump — first wrong rotation applied (matches: +0.10 step)
+  - Later FA layers: smaller jumps — residual already shifted into the wrong basis (matches: +0.05 → +0.01 decreasing)
+  - Plateau after FA #4 (~layer 11) (matches: drift saturates at ~0.32)
+
+Every observable in Step A's per-layer comparison is consistent with this single root cause.
+
+Two possible fixes:
+  - (a) Permute Q/K weights at hipfire-quantize time so interleaved RoPE produces mathematically correct rotation (same trick as llama.cpp's LlamaModel `_reverse_hf_permute`). Backward-compatible for new quants, requires re-quantize on existing .hfq files OR a runtime auto-detect / one-time fixup.
+  - (b) Switch hipfire's RoPE kernel to a half-split variant. Requires no changes to existing .hfq files. Likely needs a new `rope_partial_halfsplit_f32` kernel alongside the existing interleaved one, plus an arch dispatch in qwen35::forward.
+
+Approach (b) is incrementally safer (existing models keep working through a code path; no requantize required); approach (a) is more invasive but aligns with the established hipfire pattern of doing storage-side transforms at quantize time. The choice depends on whether other Qwen-arch models (Qwen2, Qwen3, …) currently work through hipfire's interleaved-RoPE path by coincidence (i.e., they also have the bug but the bug is masked by full-attention robustness) — if so, fixing requires careful per-model verification.
+
+**Confidence check before declaring "done":** Plain Qwen3-0.6B's near-zero floor (0.0098 nats) suggests its RoPE works correctly through hipfire — either because HF Qwen3 (non-3.5) uses interleaved convention (different from Qwen3.5's rotate_half), or because the full-attention robustness masks the bug at small scale, or because the test isn't sensitive enough. Worth a per-layer dump of Q3-0.6B to verify before committing to a fix direction.
+
+Confirmed by reading transformers source: HF `qwen3/modeling_qwen3.py:179-180` and `qwen2/modeling_qwen2.py:144-145` both use `rotate_half` — same half-split convention as Qwen3.5. So plain Qwen3-0.6B in hipfire works correctly NOT because its RoPE convention happens to match interleaved (it does NOT), but because **plain Qwen3 in hipfire goes through hipfire-arch-llama, whose `rope_f32` kernel (`kernels/src/rope.hip`) uses HALF-SPLIT convention already** (rotates pair (i, i+half) — see kernel source). The interleaved-RoPE bug is **specific to hipfire-arch-qwen35's choice of `rope_partial_interleaved.hip`**, not a hipfire-wide pattern. The fix is local to the qwen35 arch.
+
+**Half-split RoPE fix (probe-and-validate, 2026-05-12 evening).**
+
+Added `kernels/src/rope_partial_halfsplit.hip` — twin of `rope_partial_interleaved.hip` but with pair (i, i+n_rot/2) instead of (2i, 2i+1), matching HF `rotate_half` semantics. Routed via `HIPFIRE_ROPE_HALFSPLIT=1` env-gate inside `rope_partial_interleaved_f32` (dispatch.rs) so the fix can be probed without altering the default code path.
+
+Per-layer drift comparison (Q3.5-0.8B chunk 0, both runs with kv-q8):
+
+| Layer | type | rel_L2 (interleaved BUG) | rel_L2 (halfsplit FIX) | improvement |
+|---|---|---:|---:|---:|
+| 3  | FA #1 | 0.187 | **0.087** | -54% |
+| 7  | FA #2 | 0.289 | **0.157** | -46% |
+| 11 | FA #3 | 0.342 | **0.157** | -54% |
+| 15 | FA #4 | 0.297 | **0.138** | -54% |
+| 19 | FA #5 | 0.294 | **0.153** | -48% |
+| 23 | FA last | 0.323 | **0.189** | -42% |
+
+Mean cosine at FA layers jumped from 0.93–0.95 to 0.98–0.99.
+
+End-to-end KLD probe (single chunk 0, --max-chunks 1, per-token kv-q8):
+
+| Variant | slice-mean KLD on chunk 0 |
+|---|---:|
+| baseline (interleaved RoPE) | 0.4794 |
+| **halfsplit RoPE (this fix)** | **0.0835** |
+| reduction | **-83%** |
+
+The ~0.4 nat engine-drift floor on Qwen3.5 family models is **largely an interleaved-vs-halfsplit RoPE convention mismatch in hipfire-arch-qwen35**, fixed by swapping kernels with no weight-permutation required. The remaining ~0.08 KLD is consistent with the per-layer ~0.06 DeltaNet drift seen across LA layers and is the next investigation target (likely Q8 weight quant noise compounded through the DeltaNet recurrent state).
+
+Files:
+  - `kernels/src/rope_partial_halfsplit.hip` (new)
+  - `crates/rdna-compute/src/kernels.rs` (register kernel src)
+  - `crates/rdna-compute/src/dispatch.rs` (`rope_partial_interleaved_f32` env-gate to halfsplit)
+
+Promotion path: bench the fix on the 9B model + at full slice; once confirmed at scale, make halfsplit the default in `rope_partial_interleaved_f32` (and rename the function), keep an env-gate `HIPFIRE_ROPE_INTERLEAVED_LEGACY=1` for any model that needs the old behaviour, run the coherence-gate before landing the default flip.
+
 Raw per-layer dumps at `/data/cache/hipfire/q3.5-0.8b-{hf,hipfire}-hidden-chunk0.bin` (not committed, 192 MB each); the comparator output is reproducible from the scripts in `scripts/dump_hf_hidden_states.py`, `scripts/compare_hidden_states.py`, and the new example binary.
 
 **Cross-engine sanity check (Step B, 2026-05-12 evening) — confirms Step A is well-posed.**
