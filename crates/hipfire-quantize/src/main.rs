@@ -7,6 +7,7 @@
 //! RDNA-native quantized weights.
 
 mod gguf_input;
+mod hessian_io;
 
 use memmap2::Mmap;
 use std::collections::HashMap;
