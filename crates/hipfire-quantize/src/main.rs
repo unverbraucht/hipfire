@@ -14,6 +14,7 @@ use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 
 // Phase A L4 levers — quantizer-side weighted-LS scale fitting. Default off so
 // the wire format is unchanged byte-for-byte; the bench-against-baseline
@@ -36,6 +37,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 // never changes mid-run.
 static L4A_ENABLED: AtomicBool = AtomicBool::new(false);
 static L4B_ENABLED: AtomicBool = AtomicBool::new(false);
+
+// Phase A Step 5a — L5c activation-weighted LS. When IMATRIX is populated
+// (via --imatrix <path>), the per-block SSE used in L4A/L4B candidate search
+// is weighted by Σ_token act²[i] per input channel — the imatrix data
+// (read from a llama.cpp-compatible GGUF produced by `llama-imatrix`).
+//
+// Map: hipfire safetensors tensor name → per-channel `in_sum2` values
+// (length = K dim of the weight tensor). Built once in main() after CLI
+// parse; quantize call sites look up by safetensors-name and pass to
+// quantize_hfp4g32_2d which slices per-block.
+//
+// See docs/plans/qwen35-mq4-quality-gap.md §5 Step 5 for the lever def.
+static IMATRIX: OnceLock<HashMap<String, Vec<f32>>> = OnceLock::new();
 
 // ─── Safetensors Parser ─────────────────────────────────────────────────────
 
@@ -717,19 +731,31 @@ fn hfp4_block_e_ideal(block_max_normalized: f32) -> u8 {
 /// per-block sum-of-squared-errors in normalized space (i.e., as if row_scale_a
 /// were 1.0; multiply by row_scale_a² for absolute SSE).
 ///
+/// If `imatrix_weights` is Some, the SSE is per-channel-weighted:
+///   sse = Σ_i act²[i] · (recon[i] - block[i])²
+/// This is the L5c lever (Step 5a). When `None`, falls back to unweighted SSE
+/// (the L4A path from Step 1+2).
+///
 /// The caller is responsible for picking `block_e`. For the default min-max
 /// path, that's `hfp4_block_e_ideal(block_max_normalized)`; for the L4A path,
 /// it's the winner of a candidate search.
 #[inline]
-fn hfp4_pack_block_at_e(block_normalized: &[f32], block_e: u8) -> ([u8; 16], f32) {
+fn hfp4_pack_block_at_e(
+    block_normalized: &[f32],
+    block_e: u8,
+    imatrix_weights: Option<&[f32]>,
+) -> ([u8; 16], f32) {
     debug_assert_eq!(block_normalized.len(), 32);
+    if let Some(w) = imatrix_weights { debug_assert_eq!(w.len(), 32); }
     let block_scale_factor = ((block_e as i32 - 127) as f32).exp2();
     let inv_block_scale = if block_scale_factor > 0.0 { 1.0 / block_scale_factor } else { 0.0 };
     let mut packed = [0u8; 16];
     let mut sse = 0.0f32;
     for i in 0..16 {
-        let lo = block_normalized[2 * i] * inv_block_scale;
-        let hi = block_normalized[2 * i + 1] * inv_block_scale;
+        let lo_idx = 2 * i;
+        let hi_idx = 2 * i + 1;
+        let lo = block_normalized[lo_idx] * inv_block_scale;
+        let hi = block_normalized[hi_idx] * inv_block_scale;
         let lo_nibble = e2m1_round(lo);
         let hi_nibble = e2m1_round(hi);
         packed[i] = (lo_nibble & 0x0F) | ((hi_nibble & 0x0F) << 4);
@@ -738,29 +764,41 @@ fn hfp4_pack_block_at_e(block_normalized: &[f32], block_e: u8) -> ([u8; 16], f32
         // pre-row-scale reconstruction. Both are normalized.
         let lo_recon = E2M1_LUT[lo_nibble as usize] * block_scale_factor;
         let hi_recon = E2M1_LUT[hi_nibble as usize] * block_scale_factor;
-        sse += (lo_recon - block_normalized[2 * i]).powi(2)
-             + (hi_recon - block_normalized[2 * i + 1]).powi(2);
+        let lo_err2 = (lo_recon - block_normalized[lo_idx]).powi(2);
+        let hi_err2 = (hi_recon - block_normalized[hi_idx]).powi(2);
+        if let Some(w) = imatrix_weights {
+            // L5c: weight per-channel error by activation magnitude squared.
+            sse += w[lo_idx] * lo_err2 + w[hi_idx] * hi_err2;
+        } else {
+            sse += lo_err2 + hi_err2;
+        }
     }
     (packed, sse)
 }
 
 /// L4A: pick the UE8M0 exponent that minimizes per-block reconstruction MSE
-/// over the 3-candidate set {e_ideal-1, e_ideal, e_ideal+1}, where e_ideal is
-/// the existing ceil(log2) chooser. Falls back to e_ideal if L4A is off.
+/// (weighted by `imatrix_weights` if provided — Step 5a L5c lever) over the
+/// 3-candidate set {e_ideal-1, e_ideal, e_ideal+1}, where e_ideal is the
+/// existing ceil(log2) chooser. Falls back to e_ideal if L4A is off.
 ///
-/// Trade-off:
+/// Trade-off (pure-MSE — weighted MSE flips the analysis per-channel-importance):
 ///   - e_ideal-1: tighter spacing, BUT block_max clips to 6 × 2^(e-1-127).
 ///                Clipped elements take up to 50% step error; non-clipped
 ///                elements get 2× better precision.
 ///   - e_ideal:   guaranteed no clipping; baseline precision.
 ///   - e_ideal+1: looser spacing, no clipping; all elements at 0.5× precision.
 ///
-/// MSE minimization picks the right point on this trade-off per block. For
-/// blocks where a few large outliers dominate the row's distribution but the
-/// bulk of weights are small, e_ideal-1 usually wins (accept clip on outliers,
-/// gain precision on bulk). For uniform blocks, e_ideal usually wins.
+/// MSE minimization picks the right point on this trade-off per block. With
+/// L5c weighting, importance-weighted MSE is the more principled objective:
+/// the candidate that minimizes Σ act²[i] · err[i]² wins. Clipping outliers on
+/// LOW-importance channels becomes cheap; precision on HIGH-importance
+/// channels is preserved. This is what closes the format-quality gap that
+/// pure-MSE L4 left open per the §1.5 + 0.8B cohort findings.
 #[inline]
-fn hfp4_choose_block_e_l4a(block_normalized: &[f32]) -> u8 {
+fn hfp4_choose_block_e_l4a(
+    block_normalized: &[f32],
+    imatrix_weights: Option<&[f32]>,
+) -> u8 {
     let block_max_normalized = block_normalized.iter().cloned().fold(0.0f32, |m, v| m.max(v.abs()));
     let e_ideal = hfp4_block_e_ideal(block_max_normalized);
     if !L4A_ENABLED.load(Ordering::Relaxed) || block_max_normalized == 0.0 {
@@ -772,7 +810,7 @@ fn hfp4_choose_block_e_l4a(block_normalized: &[f32]) -> u8 {
     let mut best_sse = f32::INFINITY;
     let mut e = e_min;
     loop {
-        let (_packed, sse) = hfp4_pack_block_at_e(block_normalized, e);
+        let (_packed, sse) = hfp4_pack_block_at_e(block_normalized, e, imatrix_weights);
         if sse < best_sse {
             best_sse = sse;
             best_e = e;
@@ -789,8 +827,21 @@ fn hfp4_choose_block_e_l4a(block_normalized: &[f32]) -> u8 {
 /// Factored out so the L4B path can call this once per row_scale_a candidate
 /// and pick the row scale that minimizes total row error. Honors L4A internally
 /// when picking each block's UE8M0 exponent.
-fn pack_hfp4g32_row_with_scale(row: &[f32], row_scale_a: f32) -> (Vec<u8>, f32) {
+///
+/// `imatrix_row_weights`: optional per-channel act² values of length K. When
+/// provided, the per-block SSE used in L4A's candidate search + the row's
+/// total SSE used in L4B's row-scale search are both weighted by the
+/// corresponding `imatrix_row_weights[block_start..block_start+32]` slice
+/// (Step 5a L5c lever).
+fn pack_hfp4g32_row_with_scale(
+    row: &[f32],
+    row_scale_a: f32,
+    imatrix_row_weights: Option<&[f32]>,
+) -> (Vec<u8>, f32) {
     let k = row.len();
+    if let Some(w) = imatrix_row_weights {
+        debug_assert_eq!(w.len(), k, "imatrix weight length mismatch");
+    }
     let n_blocks = k / 32;
     let row_bytes = 16 + n_blocks * 17;
     let mut out = vec![0u8; row_bytes];
@@ -812,9 +863,10 @@ fn pack_hfp4g32_row_with_scale(row: &[f32], row_scale_a: f32) -> (Vec<u8>, f32) 
         for i in 0..32 {
             block_normalized[i] = row[block_start + i] * inv_row_scale;
         }
+        let block_weights = imatrix_row_weights.map(|w| &w[block_start..block_start + 32]);
         // Pick UE8M0 exponent — either L4A weighted-LS or existing ceil(log2).
-        let block_e = hfp4_choose_block_e_l4a(&block_normalized);
-        let (packed, sse_norm) = hfp4_pack_block_at_e(&block_normalized, block_e);
+        let block_e = hfp4_choose_block_e_l4a(&block_normalized, block_weights);
+        let (packed, sse_norm) = hfp4_pack_block_at_e(&block_normalized, block_e, block_weights);
         total_sse_normalized += sse_norm;
 
         let payload_off = 16 + b * 17;
@@ -835,9 +887,10 @@ fn pack_hfp4g32_row_with_scale(row: &[f32], row_scale_a: f32) -> (Vec<u8>, f32) 
 /// Returns 16-B header + (K/32) × 17-B blocks = 16 + 17 * (K/32) bytes.
 ///
 /// Internally honors L4A (per-block UE8M0 weighted-LS) and L4B (per-row
-/// row_scale_a weighted-LS) when the corresponding atomics are set. Default
-/// path is byte-equivalent to the pre-L4 implementation.
-fn quantize_hfp4g32_row(row: &[f32]) -> Vec<u8> {
+/// row_scale_a weighted-LS) when the corresponding atomics are set, and L5c
+/// activation-weighted MSE when `imatrix_row_weights` is Some. Default path
+/// is byte-equivalent to the pre-L4 implementation.
+fn quantize_hfp4g32_row(row: &[f32], imatrix_row_weights: Option<&[f32]>) -> Vec<u8> {
     assert!(row.len() % 32 == 0, "HFP4G32 requires K%32 == 0, got K={}", row.len());
 
     let row_max_abs = row.iter().cloned().fold(0.0f32, |m, v| m.max(v.abs()));
@@ -845,7 +898,7 @@ fn quantize_hfp4g32_row(row: &[f32]) -> Vec<u8> {
 
     if !L4B_ENABLED.load(Ordering::Relaxed) || row_max_abs == 0.0 {
         // Default path (and L4A-only path): row_scale_a = max_abs / 6.0.
-        let (bytes, _sse) = pack_hfp4g32_row_with_scale(row, base_scale);
+        let (bytes, _sse) = pack_hfp4g32_row_with_scale(row, base_scale, imatrix_row_weights);
         return bytes;
     }
 
@@ -865,7 +918,7 @@ fn quantize_hfp4g32_row(row: &[f32]) -> Vec<u8> {
     let mut best_sse = f32::INFINITY;
     for &divisor in &ROW_SCALE_DIVISORS {
         let candidate_scale = row_max_abs / divisor;
-        let (bytes, sse) = pack_hfp4g32_row_with_scale(row, candidate_scale);
+        let (bytes, sse) = pack_hfp4g32_row_with_scale(row, candidate_scale, imatrix_row_weights);
         if sse < best_sse {
             best_sse = sse;
             best_bytes = bytes;
@@ -883,14 +936,24 @@ fn quantize_hfp4g32_row(row: &[f32]) -> Vec<u8> {
 /// the K%256 limit is a kernel-side constraint that v2 will lift. Refusing here
 /// makes the failure mode "quantize rejects bad input" rather than "runtime
 /// panics on first dispatch with a tensor a previous step already accepted."
-fn quantize_hfp4g32_2d(f32_data: &[f32], m: usize, k: usize) -> Vec<u8> {
+fn quantize_hfp4g32_2d(
+    f32_data: &[f32],
+    m: usize,
+    k: usize,
+    imatrix_weights: Option<&[f32]>,
+) -> Vec<u8> {
     assert_eq!(f32_data.len(), m * k, "2D shape mismatch: {} vs {}*{}", f32_data.len(), m, k);
     assert!(k % 256 == 0, "HFP4G32 v1 requires K%256==0 (gemv_hfp4g32 kernel constraint; v2 will lift to K%32==0), got K={}", k);
+    if let Some(w) = imatrix_weights {
+        debug_assert_eq!(w.len(), k, "imatrix weight length must equal K");
+    }
     let row_bytes = 16 + 17 * (k / 32);
     let mut out = Vec::with_capacity(m * row_bytes);
     for r in 0..m {
         let row = &f32_data[r * k..(r + 1) * k];
-        out.extend_from_slice(&quantize_hfp4g32_row(row));
+        // All rows of a tensor share the same per-channel act² weights
+        // (imatrix entries are per-input-dim, broadcast across output rows).
+        out.extend_from_slice(&quantize_hfp4g32_row(row, imatrix_weights));
     }
     out
 }
@@ -905,9 +968,19 @@ fn quantize_hfp4g32_2d(f32_data: &[f32], m: usize, k: usize) -> Vec<u8> {
 /// Sets per-row `format_flags` to `0x05` (bit 0 = rotation present, bits 2-3 = 01
 /// = offline FWHT). This is metadata only — the kernel can still consume the
 /// row as plain HFP4G32 because the rotation is baked into the codes.
-fn quantize_mfp4g32_2d(f32_data: &[f32], m: usize, k: usize, signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+fn quantize_mfp4g32_2d(
+    f32_data: &[f32],
+    m: usize,
+    k: usize,
+    signs1: &[f32],
+    signs2: &[f32],
+    imatrix_weights: Option<&[f32]>,
+) -> Vec<u8> {
     assert_eq!(f32_data.len(), m * k, "2D shape mismatch: {} vs {}*{}", f32_data.len(), m, k);
     assert!(k % 256 == 0, "MFP4G32 requires k % 256 == 0 for 256-element FWHT, got k={}", k);
+    if let Some(w) = imatrix_weights {
+        debug_assert_eq!(w.len(), k, "imatrix weight length must equal K");
+    }
     let row_bytes = 16 + 17 * (k / 32);
     let mut out = Vec::with_capacity(m * row_bytes);
 
@@ -915,6 +988,17 @@ fn quantize_mfp4g32_2d(f32_data: &[f32], m: usize, k: usize, signs1: &[f32], sig
     // quantize as HFP4G32 and stamp the rotation flag. Reuses signs1/signs2
     // from the same `gen_fwht_signs(42, 256)` / `gen_fwht_signs(1042, 256)`
     // pair MQ4 ships with so the runtime's mq_rotate_x undoes this rotation.
+    //
+    // Imatrix consideration: the per-channel act² values are captured against
+    // the BF16 (unrotated) activation. When the runtime applies the same FWHT
+    // to activations at inference time so the dot product cancels, the
+    // EFFECTIVE per-channel importance in the ROTATED basis is the FWHT'd
+    // imatrix vector. For MFP4 in Step 5a we use the unrotated imatrix
+    // weights as-is — this is approximate but the FWHT is orthogonal, so the
+    // *total* importance is preserved; only the per-channel attribution gets
+    // smeared across the 256-element FWHT block. A rotated-imatrix variant
+    // is a Step 5a-prime refinement; the unrotated version is the simpler
+    // first ship.
     let mut row_buf = vec![0.0f32; k];
     for r in 0..m {
         row_buf.copy_from_slice(&f32_data[r * k..(r + 1) * k]);
@@ -922,7 +1006,7 @@ fn quantize_mfp4g32_2d(f32_data: &[f32], m: usize, k: usize, signs1: &[f32], sig
         for seg in 0..(k / 256) {
             cpu_fwht_256(&mut row_buf[seg * 256..(seg + 1) * 256], signs1, signs2);
         }
-        let mut row_packed = quantize_hfp4g32_row(&row_buf);
+        let mut row_packed = quantize_hfp4g32_row(&row_buf, imatrix_weights);
         // Stamp format_flags = 0x05 (bit 0 set + bits 2-3 = 01 = offline FWHT).
         row_packed[6] = 0x05;
         out.extend_from_slice(&row_packed);
@@ -992,7 +1076,7 @@ mod hfp4_tests {
     fn round_trip_constant_row() {
         // All-1.0 row: row_scale_a = 1/6, every block_e ≈ 127 + log2(1) = 127, every nibble = 2 (=1.0).
         let row = vec![1.0f32; 64];
-        let packed = quantize_hfp4g32_row(&row);
+        let packed = quantize_hfp4g32_row(&row, None);
         let recovered = dequant_hfp4g32_row(&packed, 64);
         for (i, &v) in recovered.iter().enumerate() {
             assert!((v - 1.0).abs() < 1e-2, "elem {} recovered to {}", i, v);
@@ -1006,7 +1090,7 @@ mod hfp4_tests {
             let v = E2M1_LUT[i % 16];
             v * 6.0 // scale up so row_scale_a sees max abs at 6 * 6 = 36, brings code lattice back to [-6, 6]
         }).collect();
-        let packed = quantize_hfp4g32_row(&row);
+        let packed = quantize_hfp4g32_row(&row, None);
         let recovered = dequant_hfp4g32_row(&packed, 64);
         // Bound: |recovered - input| ≤ row_scale * 2^(block_e - 127) * 0.5 (half min E2M1 step).
         // With row_scale_a = 36/6 = 6, and block_max_normalized = 6, block_e = 127 → step ≈ 0.5 → tol = 3.0.
@@ -1043,7 +1127,7 @@ mod hfp4_tests {
         }).collect();
 
         let k = row.len();
-        let packed = quantize_hfp4g32_row(&row);
+        let packed = quantize_hfp4g32_row(&row, None);
         let recovered = dequant_hfp4g32_row(&packed, k);
 
         let row_scale_a = f16_to_f32(u16::from_le_bytes([packed[0], packed[1]]));
@@ -1070,7 +1154,7 @@ mod hfp4_tests {
     fn header_layout_matches_spec() {
         // 64 elements = 2 blocks. Row size: 16 + 2*17 = 50 bytes.
         let row = vec![3.0f32; 64];
-        let packed = quantize_hfp4g32_row(&row);
+        let packed = quantize_hfp4g32_row(&row, None);
         assert_eq!(packed.len(), 50);
         // Block count == 2.
         let bc = u16::from_le_bytes([packed[4], packed[5]]);
@@ -1094,7 +1178,7 @@ mod hfp4_tests {
         let signs1 = gen_fwht_signs(42, 256);
         let signs2 = gen_fwht_signs(1042, 256);
         let f32_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.001).sin()).collect();
-        let packed = quantize_mfp4g32_2d(&f32_data, m, k, &signs1, &signs2);
+        let packed = quantize_mfp4g32_2d(&f32_data, m, k, &signs1, &signs2, None);
         let row_bytes = 16 + 17 * (k / 32);
         assert_eq!(packed.len(), m * row_bytes, "MFP4G32 byte length mismatch");
         for r in 0..m {
@@ -2307,6 +2391,149 @@ fn gguf_is_norm_tensor(name: &str) -> bool {
     name.contains("_norm") || name.contains("norm.weight")
 }
 
+/// Translate a hipfire safetensors-style tensor name to the ggml-style name
+/// used by llama.cpp's imatrix output (and the rest of llama.cpp's tooling).
+///
+/// Verified by shape-alignment on Qwen3.5-0.8B imatrix vs safetensors load log
+/// (2026-05-11):
+///   - K dims match for every covered tensor class (mlp.* , self_attn.* ,
+///     linear_attn.in_proj_qkv/z/a/b, linear_attn.out_proj).
+///   - Layer-pattern: FullAttention layers (3, 7, 11, ...) carry standard
+///     `attn_q/k/v/output`; LinearAttention layers carry `attn_qkv`/
+///     `attn_gate`/`ssm_alpha`/`ssm_beta`/`ssm_out` — the SSM-naming
+///     convention llama.cpp uses for Mamba-style sub-blocks.
+///
+/// Returns `None` for tensors that don't have an imatrix counterpart
+/// (norms / biases / 1D scalars / lookup-only tables). Those fall back to
+/// non-imatrix-weighted quantization in the call site.
+fn safetensors_to_ggml_name(name: &str) -> Option<String> {
+    // Drop the architecture-specific "language_model." prefix (Qwen3.5
+    // structure has model.language_model.layers.{N}.* — the linear-attn
+    // crate uses this nested layout, llama.cpp flattens to blk.{N}.*).
+    let normalized = name
+        .strip_prefix("model.language_model.")
+        .or_else(|| name.strip_prefix("model."))
+        .unwrap_or(name);
+
+    // Top-level (currently no imatrix coverage; default is --process-output OFF).
+    match normalized {
+        "embed_tokens.weight" => return Some("token_embd.weight".to_string()),
+        "lm_head.weight" => return Some("output.weight".to_string()),
+        "norm.weight" => return Some("output_norm.weight".to_string()),
+        _ => {}
+    }
+
+    // Per-layer: "layers.{N}.<slot>.weight"
+    let rest = normalized.strip_prefix("layers.")?;
+    let dot = rest.find('.')?;
+    let layer_idx = &rest[..dot];
+    let slot_full = &rest[dot + 1..];
+    let slot = slot_full.strip_suffix(".weight")?;
+
+    let translated = match slot {
+        // MLP — present on every layer.
+        "mlp.gate_proj" => "ffn_gate",
+        "mlp.up_proj" => "ffn_up",
+        "mlp.down_proj" => "ffn_down",
+        // FullAttention layer tensors (standard names).
+        "self_attn.q_proj" => "attn_q",
+        "self_attn.k_proj" => "attn_k",
+        "self_attn.v_proj" => "attn_v",
+        "self_attn.o_proj" => "attn_output",
+        // LinearAttention layer tensors (Mamba-2 / hybrid-arch SSM naming).
+        "linear_attn.in_proj_qkv" => "attn_qkv",
+        "linear_attn.in_proj_z" => "attn_gate",
+        "linear_attn.in_proj_a" => "ssm_alpha",
+        "linear_attn.in_proj_b" => "ssm_beta",
+        "linear_attn.out_proj" => "ssm_out",
+        // Unmapped: conv1d.weight (special-cased to HFQ4G128 at quantize
+        // time; small, not multiplied by activation in the standard sense),
+        // norm.weight, A_log, dt_bias (1D or scalars, no imatrix entry).
+        _ => return None,
+    };
+
+    Some(format!("blk.{layer_idx}.{translated}.weight"))
+}
+
+/// Load an llama.cpp-compatible imatrix GGUF file and build a lookup
+/// keyed by ggml-style tensor name. The GGUF stores per-linear-layer
+/// pairs:
+///   {name}.in_sum2     F32[k, n_mat]   sum of squared activations per channel
+///   {name}.counts      F32[1, n_mat]   token count contributing per matrix
+///
+/// For non-MoE models n_mat=1; the [k] vector goes into the map directly.
+/// For MoE we'd need per-expert handling — out of scope for Step 5a
+/// (Qwen3.5 dense + Qwen3.6 dense are the first cohort targets; A3B MoE
+/// is deferred to a future iteration that handles n_mat > 1).
+///
+/// Returns `HashMap<ggml_name, Vec<f32>>` with the .in_sum2 values keyed by
+/// the BASE tensor name (the ".in_sum2" suffix stripped).
+fn load_imatrix(path: &Path) -> HashMap<String, Vec<f32>> {
+    use gguf_input::GgmlType;
+    let gguf = gguf_input::GgufFile::open(path).unwrap_or_else(|e| {
+        eprintln!("error: failed to open imatrix file {}: {e}", path.display());
+        std::process::exit(1);
+    });
+
+    let mut map: HashMap<String, Vec<f32>> = HashMap::new();
+    let mut total_entries = 0usize;
+    let mut skipped_moe = 0usize;
+    for t in &gguf.tensors {
+        let name = match t.name.strip_suffix(".in_sum2") {
+            Some(n) => n.to_string(),
+            None => continue, // ignore .counts and any other entries
+        };
+        if t.dtype != GgmlType::F32 {
+            eprintln!("warning: imatrix entry {} has non-F32 dtype {:?}; skipping",
+                t.name, t.dtype);
+            continue;
+        }
+        // Shape is [k] (1D) for non-MoE; [k, n_mat] for MoE. Skip multi-mat
+        // tensors with a warning — Step 5a doesn't handle them yet.
+        let n_mat = if t.shape.len() >= 2 { t.shape[1] } else { 1 };
+        if n_mat != 1 {
+            skipped_moe += 1;
+            continue;
+        }
+        let k = t.shape[0];
+
+        // Read the F32 values from the tensor data segment.
+        let data = gguf.tensor_data(t);
+        let mut values = Vec::with_capacity(k);
+        for i in 0..k {
+            let off = i * 4;
+            let v = f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
+            values.push(v);
+        }
+        map.insert(name, values);
+        total_entries += 1;
+    }
+
+    eprintln!(
+        "imatrix: loaded {} entries from {} ({} MoE multi-matrix entries skipped — Step 5a is dense-only)",
+        total_entries,
+        path.display(),
+        skipped_moe,
+    );
+    if total_entries == 0 {
+        eprintln!("error: imatrix file contains no usable .in_sum2 entries");
+        std::process::exit(1);
+    }
+    map
+}
+
+/// Look up imatrix per-channel weights for a given safetensors tensor name.
+/// Returns `None` (caller falls back to non-imatrix-weighted quantization) if:
+///   - --imatrix wasn't passed (IMATRIX not initialized), OR
+///   - the tensor name doesn't have a ggml-mapping (norms, small 1D, etc.), OR
+///   - the imatrix file doesn't carry this tensor (rare; usually means the
+///     tensor wasn't exercised by the calibration corpus).
+fn imatrix_weights_for(safetensors_name: &str) -> Option<&'static [f32]> {
+    let im = IMATRIX.get()?;
+    let ggml_name = safetensors_to_ggml_name(safetensors_name)?;
+    im.get(&ggml_name).map(|v| v.as_slice())
+}
+
 /// True if the tensor is the token embedding. We Q8 these (matches the
 /// safetensors path's `is_embed` rule — Q4 is too lossy for embedding tables).
 fn gguf_is_embed_tensor(name: &str) -> bool {
@@ -2683,14 +2910,18 @@ fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat, no_kmap: b
                     // No HFP6 variant in v1. Promote6 for HFP4 stays at HFP4G32 (4.25 bpw).
                     let m = info.shape[0] as usize;
                     let k = info.shape[1] as usize;
-                    let q = quantize_hfp4g32_2d(&f32_data, m, k);
+                    // GGUF input → tensor names are already ggml-style; look
+                    // up imatrix directly (Step 5a L5c).
+                    let im = IMATRIX.get().and_then(|m| m.get(&info.name)).map(|v| v.as_slice());
+                    let q = quantize_hfp4g32_2d(&f32_data, m, k, im);
                     (q, QuantType::HFP4G32, 32u32, "HFP4G32")
                 }
                 GgufFormat::Mfp4 => {
                     // No MFP6 variant. Promote6 for MFP4 stays at MFP4G32 (4.25 bpw).
                     let m = info.shape[0] as usize;
                     let k = info.shape[1] as usize;
-                    let q = quantize_mfp4g32_2d(&f32_data, m, k, &signs1, &signs2);
+                    let im = IMATRIX.get().and_then(|m| m.get(&info.name)).map(|v| v.as_slice());
+                    let q = quantize_mfp4g32_2d(&f32_data, m, k, &signs1, &signs2, im);
                     (q, QuantType::MFP4G32, 32u32, "MFP4G32")
                 }
             }
@@ -2734,13 +2965,15 @@ fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat, no_kmap: b
                 GgufFormat::Hfp4 => {
                     let m = info.shape[0] as usize;
                     let k = info.shape[1] as usize;
-                    let q = quantize_hfp4g32_2d(&f32_data, m, k);
+                    let im = IMATRIX.get().and_then(|m| m.get(&info.name)).map(|v| v.as_slice());
+                    let q = quantize_hfp4g32_2d(&f32_data, m, k, im);
                     (q, QuantType::HFP4G32, 32u32, "HFP4G32")
                 }
                 GgufFormat::Mfp4 => {
                     let m = info.shape[0] as usize;
                     let k = info.shape[1] as usize;
-                    let q = quantize_mfp4g32_2d(&f32_data, m, k, &signs1, &signs2);
+                    let im = IMATRIX.get().and_then(|m| m.get(&info.name)).map(|v| v.as_slice());
+                    let q = quantize_mfp4g32_2d(&f32_data, m, k, &signs1, &signs2, im);
                     (q, QuantType::MFP4G32, 32u32, "MFP4G32")
                 }
             }
@@ -2879,6 +3112,30 @@ fn main() {
     L4B_ENABLED.store(l4b, Ordering::Relaxed);
     if l4a || l4b {
         eprintln!("L4 levers: l4a={l4a} (per-block UE8M0 weighted-LS) l4b={l4b} (per-row FP16 row_scale_a weighted-LS)");
+    }
+
+    // ── Phase A Step 5a (L5c): activation-weighted LS via imatrix ──
+    // --imatrix <path>: load an llama-imatrix-produced GGUF (per `examples/
+    // imatrix_collect.rs`). When set, weights the per-block + per-row SSE
+    // metric in the L4 candidate search by per-channel `Σ act²` values.
+    // Quantizer behavior with no `--imatrix` is byte-equivalent to pre-L5c.
+    //
+    // For Qwen3.5 hybrid layers, the mapper covers: ffn_{gate,up,down},
+    // self_attn.{q,k,v,o}_proj (full-attention layers), and
+    // linear_attn.{in_proj_qkv,in_proj_z,in_proj_a,in_proj_b,out_proj}
+    // (linear-attention layers via SSM-naming). Norms / biases / 1D scalars /
+    // conv1d / lookup tables fall back to non-weighted SSE.
+    let imatrix_path = args.iter().position(|a| a == "--imatrix")
+        .and_then(|i| args.get(i + 1))
+        .map(PathBuf::from);
+    if let Some(path) = &imatrix_path {
+        if !path.exists() {
+            eprintln!("error: --imatrix path not found: {}", path.display());
+            std::process::exit(1);
+        }
+        let table = load_imatrix(path);
+        IMATRIX.set(table).expect("IMATRIX set twice — should not happen");
+        eprintln!("L5c activation-weighted LS: ENABLED via {}", path.display());
     }
     // K-map gate: applies to MoE models by default. Dense models opt in
     // via --kmap-dense (the K-map dense PPL effect is mixed: regression at
@@ -3233,10 +3490,12 @@ fn main() {
                 let slice = &raw_data[slice_off..slice_off + inner_bytes];
                 let f32_slice = to_f32(slice, &dtype);
                 let (quantized, qt, gs) = if expert_mfp4 {
-                    let q = quantize_mfp4g32_2d(&f32_slice, inner_m, inner_k_usize, &signs1, &signs2);
+                    // MoE expert imatrix is multi-matrix (per-expert) — Step
+                    // 5a is dense-only; pass None until n_mat>1 support lands.
+                    let q = quantize_mfp4g32_2d(&f32_slice, inner_m, inner_k_usize, &signs1, &signs2, None);
                     (q, QuantType::MFP4G32, 32u32)
                 } else if expert_hfp4 {
-                    let q = quantize_hfp4g32_2d(&f32_slice, inner_m, inner_k_usize);
+                    let q = quantize_hfp4g32_2d(&f32_slice, inner_m, inner_k_usize, None);
                     (q, QuantType::HFP4G32, 32u32)
                 } else if expert_mq6 {
                     let q = quantize_mq6g256(&f32_slice, &signs1, &signs2);
@@ -3484,7 +3743,10 @@ fn main() {
                 let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
                 if k_dim % 32 == 0 && meta.shape.len() == 2 {
                     let m = meta.shape[0];
-                    let q = quantize_hfp4g32_2d(&f32_data, m, k_dim);
+                    // Safetensors input → translate to ggml-style name for
+                    // imatrix lookup (Step 5a L5c).
+                    let im = imatrix_weights_for(name);
+                    let q = quantize_hfp4g32_2d(&f32_data, m, k_dim, im);
                     (q, QuantType::HFP4G32, 32u32, "HFP4G32")
                 } else {
                     // Fallback to HFQ4-G128 for non-32-aligned ragged dims (rare).
@@ -3501,7 +3763,8 @@ fn main() {
                     let signs1 = gen_fwht_signs(42, 256);
                     let signs2 = gen_fwht_signs(1042, 256);
                     let m = meta.shape[0];
-                    let q = quantize_mfp4g32_2d(&f32_data, m, k_dim, &signs1, &signs2);
+                    let im = imatrix_weights_for(name);
+                    let q = quantize_mfp4g32_2d(&f32_data, m, k_dim, &signs1, &signs2, im);
                     (q, QuantType::MFP4G32, 32u32, "MFP4G32")
                 } else {
                     // Fallback to HFQ4-G128 for non-256-aligned ragged dims (rotation
