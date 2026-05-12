@@ -51,6 +51,42 @@ static L4B_ENABLED: AtomicBool = AtomicBool::new(false);
 // See docs/plans/qwen35-mq4-quality-gap.md §5 Step 5 for the lever def.
 static IMATRIX: OnceLock<HashMap<String, Vec<f32>>> = OnceLock::new();
 
+// Phase A Stage A — AWQ (Activation-aware Weight Quantization, Lin et al
+// 2023). When AWQ_ALPHA is set (via --awq [<alpha>=0.5]), each linear-layer
+// weight gets per-input-channel pre-scaling applied BEFORE the standard
+// quantize+rotation path:
+//
+//   s[j] = (rms_act[j])^α   where rms_act[j] = sqrt(imatrix.in_sum2[j] / n_tok)
+//
+// Then W'[i,j] = W[i,j] * s[j] is what gets quantized + (for MQ4/MFP4) FWHT-
+// rotated + packed into the wire format.
+//
+// At inference, the runtime must apply x / s element-wise BEFORE the rotation
+// kernel — the math `(W·s) · (x/s) = W·x` cancels exactly at infinite
+// precision. The quantizer writes the `s` vector as a sidecar 1D F16 tensor
+// alongside each weight (name = `<weight_name>.awq_scale`); the runtime
+// loader reads it and passes to fused_rmsnorm_rotate_mq (or equivalent for
+// HFP4/MFP4).
+//
+// Why per-channel pre-scaling helps where per-block weighted-LS (L5c)
+// failed on rotated formats:
+//   - L5c weights individual block-level errors by per-channel importance.
+//     For FWHT-rotated weights, rotation flattens per-channel importance
+//     within blocks (Var[x_rot[i]] = Σ_j Var[x[j]] = const). The lever
+//     has nothing to weight.
+//   - AWQ applies its scaling in the UNROTATED basis before the FWHT bake-
+//     in. The math composes: rot(W·s) is stored, rot(x/s) is computed at
+//     inference. Per-channel importance attribution survives the rotation
+//     because s is folded into the activation flow.
+//   - Egiazarian et al (2509.23202 §3.2) also caution: at small group sizes
+//     (g=16 NVFP4, g=32 MXFP4), "outlier mitigation is provably neutralized".
+//     This applies to MFP4G32 but NOT to MQ4G256 — AWQ should work on MQ4.
+//
+// Default alpha = 0.5 (AWQ paper's grid-search center). --awq alone enables
+// AWQ at alpha=0.5; --awq <value> sets explicit alpha. Alpha=0 disables;
+// alpha=1 is pure activation-magnitude scaling (no smoothing).
+static AWQ_ALPHA: OnceLock<f32> = OnceLock::new();
+
 // ─── Safetensors Parser ─────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -1065,6 +1101,108 @@ fn dequant_hfp4g32_row(packed: &[u8], k: usize) -> Vec<f32> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod awq_tests {
+    use super::*;
+
+    /// Verify geometric mean of computed AWQ scales is ~1.0 — the
+    /// normalization in compute_awq_scales should center the scale
+    /// vector so downstream min-max quantization isn't perturbed.
+    #[test]
+    fn awq_scales_geomean_is_one() {
+        // Realistic-ish imatrix: log-normal-ish per-channel statistics
+        let in_sum2: Vec<f32> = (0..256)
+            .map(|j| (1.0 + 10.0 * (j as f32 / 256.0)).exp())  // 1.0 → e^11
+            .collect();
+        for &alpha in &[0.0f32, 0.25, 0.5, 0.75, 1.0] {
+            let s = compute_awq_scales(&in_sum2, alpha);
+            assert_eq!(s.len(), in_sum2.len());
+            // Geometric mean = exp(mean(log(s)))
+            let log_mean = s.iter()
+                .map(|&v| (v as f64).ln())
+                .sum::<f64>() / s.len() as f64;
+            let geo_mean = log_mean.exp();
+            assert!((geo_mean - 1.0).abs() < 1e-4,
+                "alpha={alpha}: geo_mean={geo_mean} (want 1.0)");
+        }
+    }
+
+    /// Alpha = 0 should produce all-ones scales (AWQ disabled at layer level).
+    #[test]
+    fn awq_scales_alpha_zero_is_identity() {
+        let in_sum2: Vec<f32> = (1..=128).map(|j| j as f32).collect();
+        let s = compute_awq_scales(&in_sum2, 0.0);
+        for &v in &s {
+            assert!((v - 1.0).abs() < 1e-5, "alpha=0 scale {v} should be 1.0");
+        }
+    }
+
+    /// Larger imatrix values should produce larger scales for alpha > 0.
+    /// Monotonicity check.
+    #[test]
+    fn awq_scales_monotonic_in_imatrix() {
+        let in_sum2 = vec![1.0_f32, 4.0, 16.0, 64.0, 256.0];
+        let s = compute_awq_scales(&in_sum2, 0.5);
+        for w in s.windows(2) {
+            assert!(w[1] > w[0], "scales not monotonic: {} -> {}", w[0], w[1]);
+        }
+    }
+
+    /// AWQ math identity: `(W · diag(s)) · (x / s) == W · x` at infinite
+    /// precision. With fp32 weights + fp32 activations, error should be
+    /// at floating-point rounding precision (~1e-5 relative).
+    #[test]
+    fn awq_math_identity_holds() {
+        // Tiny test: 4 output × 8 input matmul
+        let m = 4;
+        let k = 8;
+        // Random-ish weights and activations
+        let w: Vec<f32> = (0..m * k).map(|i| (i as f32 - 16.0) * 0.1).collect();
+        let x: Vec<f32> = (0..k).map(|j| (j as f32 + 1.0) * 0.5).collect();
+
+        // Reference: y = W * x
+        let mut y_ref = vec![0.0_f32; m];
+        for i in 0..m {
+            for j in 0..k {
+                y_ref[i] += w[i * k + j] * x[j];
+            }
+        }
+
+        // AWQ-scaled: pre-scale W, pre-divide x
+        let in_sum2: Vec<f32> = (1..=k).map(|j| j as f32 * 10.0).collect();
+        let s = compute_awq_scales(&in_sum2, 0.5);
+        let mut w_scaled = w.clone();
+        awq_pre_scale_weights(&mut w_scaled, m, k, &s);
+        let x_div: Vec<f32> = x.iter().zip(&s).map(|(&xv, &sv)| xv / sv).collect();
+
+        // y' = (W * diag(s)) * (x / s)
+        let mut y_awq = vec![0.0_f32; m];
+        for i in 0..m {
+            for j in 0..k {
+                y_awq[i] += w_scaled[i * k + j] * x_div[j];
+            }
+        }
+
+        // Compare
+        for i in 0..m {
+            let rel = (y_awq[i] - y_ref[i]).abs() / y_ref[i].abs().max(1e-6);
+            assert!(rel < 1e-5,
+                "row {i}: AWQ y={} ref y={} rel_err={}", y_awq[i], y_ref[i], rel);
+        }
+    }
+
+    /// Edge case: zero imatrix entries should produce finite scales
+    /// (clamped via 1e-12 floor in compute_awq_scales).
+    #[test]
+    fn awq_handles_zero_imatrix() {
+        let in_sum2 = vec![0.0_f32, 1.0, 4.0, 0.0];
+        let s = compute_awq_scales(&in_sum2, 0.5);
+        for &v in &s {
+            assert!(v.is_finite() && v > 0.0, "scale {v} should be finite + positive");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2557,6 +2695,94 @@ fn imatrix_weights_for(safetensors_name: &str) -> Option<&'static [f32]> {
     im.get(&ggml_name).map(|v| v.as_slice())
 }
 
+/// Compute AWQ per-channel scales `s[j]` for one linear-layer weight tensor.
+///
+/// Inputs:
+///   - `in_sum2`: imatrix data — Σ_token act²[j] per input channel, length K.
+///     Source: hipfire's `imatrix_collect` (llama.cpp `--imatrix` output).
+///   - `alpha`: AWQ tuning parameter ∈ [0, 1]. Paper-original default = 0.5.
+///
+/// Output:
+///   - `Vec<f32>` of length K, with geometric mean normalized to ≈ 1.0.
+///
+/// Formula (AWQ-paper-original simplified for hipfire's data shape):
+///   1. RMS_act[j] = sqrt(in_sum2[j] / N_tok). The N_tok term is a global
+///      constant for the tensor and gets absorbed by the geo-mean normalization
+///      below, so we can omit it from the per-channel computation.
+///      Equivalent: use sqrt(in_sum2[j]) directly.
+///   2. s_raw[j] = (RMS_act[j])^alpha
+///   3. Normalize: s[j] = s_raw[j] / exp(mean_j log(s_raw[j]))
+///      This keeps the post-AWQ-scaled weight tensor's overall magnitude
+///      in the same range as the input — important for the downstream MQ4
+///      min-max scale fitter not to suddenly compress/expand its dynamic
+///      range based on alpha.
+///
+/// Edge cases:
+///   - Zero in_sum2[j] (channel never exercised by calibration): clamp to
+///     a tiny floor (1e-12) before sqrt to avoid log(0). Practically rare;
+///     would mean a channel is unused in the calibration corpus.
+///   - alpha == 0 → all s[j] = 1.0 (AWQ disabled at this layer). Caller
+///     can short-circuit before invoking this function.
+///
+/// Cost: O(K). For 9B Qwen3.5 ~32 calls × ~4096 elements = ~131K ops total
+/// across the whole quantize. Negligible.
+fn compute_awq_scales(in_sum2: &[f32], alpha: f32) -> Vec<f32> {
+    let k = in_sum2.len();
+    debug_assert!(k > 0, "empty imatrix vector");
+
+    // Step 1+2: RMS_act^alpha, with the constant N_tok factor absorbed into
+    // the geo-mean normalization. The sqrt and (·)^alpha combine into
+    // (·)^(alpha/2) on the raw in_sum2 values.
+    //
+    // Implementation choice: compute log(s_raw) directly so we can do the
+    // geo-mean normalization in log space (numerically more stable for
+    // wide dynamic-range imatrix values).
+    let half_alpha = (alpha as f64) * 0.5;
+    let mut log_s_raw = Vec::with_capacity(k);
+    let mut sum_log: f64 = 0.0;
+    for &v in in_sum2 {
+        let v_clamped = (v as f64).max(1e-12);
+        let log_s = half_alpha * v_clamped.ln();   // log(v^(alpha/2)) = (alpha/2) * log(v)
+        log_s_raw.push(log_s);
+        sum_log += log_s;
+    }
+    let mean_log = sum_log / (k as f64);
+
+    // Step 3: subtract mean in log space, then exp back. After this,
+    // geo_mean(s) = exp(0) = 1.0 exactly (within floating-point precision).
+    log_s_raw.into_iter()
+        .map(|l| ((l - mean_log).exp()) as f32)
+        .collect()
+}
+
+/// Apply AWQ pre-scaling to a row-major [m, k] weight tensor in place:
+/// `W'[i,j] = W[i,j] * s[j]` for every (i, j).
+///
+/// AWQ scales are per-INPUT-channel (length K). The same s[j] vector
+/// broadcasts across every output row i.
+///
+/// Done in-place to avoid allocating a second [m, k] buffer. The caller
+/// owns the W slice and is responsible for ensuring this pre-scaling
+/// happens BEFORE any subsequent transformation (e.g. FWHT rotation).
+fn awq_pre_scale_weights(weights: &mut [f32], m: usize, k: usize, scales: &[f32]) {
+    debug_assert_eq!(weights.len(), m * k, "weight buffer size mismatch");
+    debug_assert_eq!(scales.len(), k, "AWQ scale vector must have length K");
+    for r in 0..m {
+        let row = &mut weights[r * k..(r + 1) * k];
+        for j in 0..k {
+            row[j] *= scales[j];
+        }
+    }
+}
+
+/// Helper: convert a `Vec<f32>` AWQ-scale vector into the F16 byte
+/// payload that `HfqTensor` consumes for sidecar emission.
+fn awq_scales_to_f16_bytes(scales: &[f32]) -> Vec<u8> {
+    scales.iter()
+        .flat_map(|&s| f32_to_f16(s).to_le_bytes())
+        .collect()
+}
+
 /// True if the tensor is the token embedding. We Q8 these (matches the
 /// safetensors path's `is_embed` rule — Q4 is too lossy for embedding tables).
 fn gguf_is_embed_tensor(name: &str) -> bool {
@@ -3160,6 +3386,40 @@ fn main() {
         IMATRIX.set(table).expect("IMATRIX set twice — should not happen");
         eprintln!("L5c activation-weighted LS: ENABLED via {}", path.display());
     }
+
+    // ── Phase A Stage A: AWQ (Activation-aware Weight Quantization) ──
+    // --awq           → enable AWQ at default alpha=0.5
+    // --awq-alpha <f> → enable AWQ at explicit alpha (overrides default)
+    // Requires --imatrix (we derive RMS_act from imatrix's in_sum2 values).
+    // Per-channel scaling: W' = W · diag(s) at quantize time, sidecar
+    // 1D F16 tensor <weight>.awq_scale stored alongside the parent weight.
+    // Runtime path divides activations by s before the rotation kernel —
+    // separate change, not in this patch. Implementation reference:
+    // docs/plans/awq_hipfire.md.
+    //
+    // Stage A targets MQ4G256 specifically (large g=256 → AWQ's outlier-
+    // mitigation works; per Egiazarian et al 2509.23202 §3.2, small-group
+    // formats (g=16/32 NVFP4/MXFP4) "provably neutralize traditional
+    // outlier mitigation techniques" — MR-GPTQ is the right lever there,
+    // tracked as Stage C). HFP4/MFP4 are explicitly NOT awq-pre-scaled
+    // in this patch.
+    let awq_enabled = args.iter().any(|a| a == "--awq")
+        || args.iter().any(|a| a == "--awq-alpha");
+    let awq_alpha = args.iter().position(|a| a == "--awq-alpha")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(0.5);
+    if awq_enabled {
+        if IMATRIX.get().is_none() {
+            eprintln!("error: --awq requires --imatrix (we derive RMS_act per channel from imatrix in_sum2 values)");
+            std::process::exit(1);
+        }
+        if !(0.0..=1.0).contains(&awq_alpha) {
+            eprintln!("warning: --awq-alpha {awq_alpha} outside typical [0, 1] range; using anyway");
+        }
+        AWQ_ALPHA.set(awq_alpha).expect("AWQ_ALPHA set twice — should not happen");
+        eprintln!("AWQ pre-scaling: ENABLED (alpha={awq_alpha}, formula: s[j]=(RMS_act[j])^alpha, geo-mean normalized to 1)");
+    }
     // K-map gate: applies to MoE models by default. Dense models opt in
     // via --kmap-dense (the K-map dense PPL effect is mixed: regression at
     // short context, win at long context — see benchmarks/results/
@@ -3620,6 +3880,14 @@ fn main() {
             // ── K-map override ──────────────────────────────────────────────
             let kmap_level = kmap.get(&**name).copied().unwrap_or(QuantLevel::Base);
 
+            // AWQ sidecar scales for this tensor — populated only inside the
+            // MQ4G256 arm when --awq is enabled and an imatrix entry exists
+            // for this tensor's ggml-translated name. After the main tensor
+            // push, we emit an `<name>.awq_scale` 1D F16 sidecar tensor so
+            // the runtime can apply `x / s` before the rotation kernel at
+            // inference time.
+            let mut awq_sidecar_scales: Option<Vec<f32>> = None;
+
             let (quantized, qt, gs, label) = if kmap_level == QuantLevel::Q8 {
                 // K-map says Q8 (embed, lm_head, router)
                 let q = quantize_q8f16(&f32_data);
@@ -3750,7 +4018,30 @@ fn main() {
                 if k_dim % 256 == 0 {
                     let signs1 = gen_fwht_signs(42, 256);
                     let signs2 = gen_fwht_signs(1042, 256);
-                    let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
+                    // Phase A Stage A — AWQ pre-scaling, when --awq is enabled
+                    // AND we have imatrix data for this tensor. Mutates a
+                    // local copy of the weights so the original
+                    // f32_data slice/Vec returned by to_f32() is left intact
+                    // for downstream consumers (we don't currently have any
+                    // here, but this is hygienic).
+                    let q = if let (Some(alpha), Some(im_weights))
+                        = (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
+                    {
+                        debug_assert_eq!(im_weights.len(), k_dim,
+                            "imatrix length ({}) != K dim ({}) for {}",
+                            im_weights.len(), k_dim, name);
+                        let scales = compute_awq_scales(im_weights, alpha);
+                        // Stash for sidecar emission after the main tensor push.
+                        awq_sidecar_scales = Some(scales.clone());
+                        let m_dim = meta.shape[0];
+                        // Copy weights so we don't mutate to_f32's buffer
+                        // (might be shared/borrowed depending on dtype path).
+                        let mut scaled = f32_data.clone();
+                        awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
+                        quantize_mq4g256(&scaled, &signs1, &signs2)
+                    } else {
+                        quantize_mq4g256(&f32_data, &signs1, &signs2)
+                    };
                     (q, QuantType::MQ4G256, 256u32, "MQ4G256")
                 } else {
                     // Fallback to standard HFQ4-G128 for non-256-aligned
@@ -3984,11 +4275,34 @@ fn main() {
             hfq_tensors.push(HfqTensor {
                 name: name.to_string(),
                 quant_type: qt,
-                shape,
+                shape: shape.clone(),
                 group_size: gs,
                 data: quantized,
                 spilled_len: 0,
             });
+            // Phase A Stage A — emit AWQ scale sidecar tensor immediately
+            // after the parent weight. Naming convention:
+            // `<weight_name>.awq_scale` (strip the trailing `.weight` and
+            // append `.awq_scale.weight` so the runtime loader recognizes
+            // it as a 1D F16 tensor of length K). 1D shape [K]; runtime
+            // pairs it with the parent weight at model open.
+            if let Some(scales) = awq_sidecar_scales.take() {
+                let sidecar_name = match name.strip_suffix(".weight") {
+                    Some(stem) => format!("{stem}.awq_scale.weight"),
+                    None => format!("{name}.awq_scale.weight"),
+                };
+                let bytes = awq_scales_to_f16_bytes(&scales);
+                eprintln!("    AWQ:    {} [{}] (1D F16, {} B)",
+                    sidecar_name, scales.len(), bytes.len());
+                hfq_tensors.push(HfqTensor {
+                    name: sidecar_name,
+                    quant_type: QuantType::F16,
+                    shape: vec![scales.len() as u32],
+                    group_size: 0,
+                    data: bytes,
+                    spilled_len: 0,
+                });
+            }
             } // end else (non-Q8HFQ path)
         } else if is_vision && vision_quant == "hfq4" && n_elements >= 32 {
             // Quantize vision weights to HFQ4G256 (for speed-critical VL workloads)
