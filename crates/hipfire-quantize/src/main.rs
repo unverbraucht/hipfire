@@ -989,16 +989,30 @@ fn quantize_mfp4g32_2d(
     // from the same `gen_fwht_signs(42, 256)` / `gen_fwht_signs(1042, 256)`
     // pair MQ4 ships with so the runtime's mq_rotate_x undoes this rotation.
     //
-    // Imatrix consideration: the per-channel act² values are captured against
-    // the BF16 (unrotated) activation. When the runtime applies the same FWHT
-    // to activations at inference time so the dot product cancels, the
-    // EFFECTIVE per-channel importance in the ROTATED basis is the FWHT'd
-    // imatrix vector. For MFP4 in Step 5a we use the unrotated imatrix
-    // weights as-is — this is approximate but the FWHT is orthogonal, so the
-    // *total* importance is preserved; only the per-channel attribution gets
-    // smeared across the 256-element FWHT block. A rotated-imatrix variant
-    // is a Step 5a-prime refinement; the unrotated version is the simpler
-    // first ship.
+    // Step 5a-prime: when an imatrix is provided, FWHT it ONCE before the row
+    // loop. Rationale (verified empirically by the 2026-05-12 0.8B Step 5a
+    // cohort): the imatrix captures `Σ_token act²[i]` per *unrotated*
+    // activation channel `i`. After offline-FWHT of the weights, channel
+    // `i` of the rotated weight tensor corresponds to a linear combination
+    // of unrotated activation channels (the FWHT basis vectors). Using
+    // `w[i]` (unrotated importance) as the weight for rotated channel `i`
+    // is a per-channel misalignment that scrambles attribution and made
+    // 0.8B MFP4-L4-L5c +13% KLD WORSE than uncalibrated MFP4 baseline.
+    //
+    // The fix is to apply the same FWHT to the imatrix vector along its
+    // length-K input-channel axis, so the rotated imatrix aligns with the
+    // rotated weight basis. FWHT is orthogonal, so total `Σ w[i]` is
+    // preserved; the rotation re-attributes importance to the rotated
+    // dimensions correctly.
+    let imatrix_rotated: Option<Vec<f32>> = imatrix_weights.map(|w| {
+        let mut rotated = w.to_vec();
+        for seg in 0..(k / 256) {
+            cpu_fwht_256(&mut rotated[seg * 256..(seg + 1) * 256], signs1, signs2);
+        }
+        rotated
+    });
+    let imatrix_for_row = imatrix_rotated.as_deref();
+
     let mut row_buf = vec![0.0f32; k];
     for r in 0..m {
         row_buf.copy_from_slice(&f32_data[r * k..(r + 1) * k]);
@@ -1006,7 +1020,7 @@ fn quantize_mfp4g32_2d(
         for seg in 0..(k / 256) {
             cpu_fwht_256(&mut row_buf[seg * 256..(seg + 1) * 256], signs1, signs2);
         }
-        let mut row_packed = quantize_hfp4g32_row(&row_buf, imatrix_weights);
+        let mut row_packed = quantize_hfp4g32_row(&row_buf, imatrix_for_row);
         // Stamp format_flags = 0x05 (bit 0 set + bits 2-3 = 01 = offline FWHT).
         row_packed[6] = 0x05;
         out.extend_from_slice(&row_packed);
