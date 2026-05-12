@@ -172,3 +172,63 @@ Total wall time to Stage A go/no-go: ~25 min from commit.
 ## Open follow-up (post-fix)
 
 The whitelist intentionally drops AWQ on `o_proj` / `out_proj` / `down_proj`. Literature suggests AWQ provides additional benefit on these tensors too — when the runtime supports it. The right follow-up is **Option B from `awq_bug_hunt_glm5.md` §Fix**: add AWQ-aware variants of `rotate_x_mq` and `fused_silu_mul_rotate_mq` (4 new kernels + dispatcher wiring) so the skipped projections can also benefit. Defer until Stage A on the whitelisted subset is confirmed worthwhile.
+
+---
+
+## Postscript — second bug found + final measurement (2026-05-12 PM)
+
+After the whitelist fix landed (commit `6711308d` + `ca759da6` for MoE completeness), the 0.8B re-eval gave KLD **9.5654** — still catastrophic but a 30% reduction. The proportional improvement matched the 26% of corrupting sidecars the whitelist removed (48 of 186), strongly suggesting another systemic issue affecting the remaining whitelisted weights too.
+
+### Root cause #2 — the Qwen3.5 crate's private loader
+
+`crates/hipfire-arch-qwen35/src/qwen35.rs:742` has its own `load_weight_tensor_raw` (and `load_weight_tensor` wrapper) which hardcoded `awq_scale: None` for every weight type. The Phase 2a infrastructure (`load_awq_scale` in `hipfire_runtime::hfq`) was simply never invoked from the Qwen3.5 forward path.
+
+**Detection signal**: the AWQ kernel `fused_rmsnorm_mq_rotate_awq.hsaco` did NOT exist anywhere on disk. Compilation only happens when the dispatcher actually launches a kernel; since `if let Some(awq) = next_linear.awq_scale.as_ref()` was always `None`, the kernel was never invoked, and so never JIT-compiled. Verified by `find . -name "*awq*.hsaco"` returning nothing before the loader fix.
+
+**Fix**: commit `0aa58185` adds a `load_awq_scale_for` helper to qwen35.rs (mirrors `hipfire_runtime::hfq::load_awq_scale`) and populates `WeightTensor.awq_scale` in the MQ4G256 arm of `load_weight_tensor`. After this landed, `fused_rmsnorm_mq_rotate_awq.hsaco` appeared on disk on the first eval run — proving the kernel was finally being invoked.
+
+### Stage A measured results
+
+**0.8B (dense, 24 layers):**
+
+| Variant | KLD | KLD above Q8 floor | PPL |
+|---|---:|---:|---:|
+| q8f16 (engine floor) | 0.4598 | — | 30.996 |
+| mq4-base | 0.6721 | +0.2123 | 36.594 |
+| mq4-awq-loaderfix (α=0.5) | **0.6707** | **+0.2109** | **37.31** |
+
+AWQ delta on 0.8B: −0.0014 nats KLD (−0.7% above-floor) — within noise. AWQ neither helps nor hurts at this scale.
+
+**9B (hybrid, 32 layers = 8 full_attn + 24 linear_attn):**
+
+| Variant | KLD | KLD above Q8 floor | PPL |
+|---|---:|---:|---:|
+| q8f16 (engine floor, 256ch) | 0.5735 | — | 13.383 |
+| mq4-base (512ch) | 0.8165 | +0.2430 | 15.063 |
+| **mq4-awq-loaderfix (α=0.5, 512ch)** | **0.7373** | **+0.1638** | **14.303** |
+
+**AWQ delta on 9B: −0.0792 nats KLD (−32.6% reduction in quantization-attributable noise), −5.0% absolute PPL.**
+
+That's *above* the literature's typical 15–25% lift on Q4 INT4 AWQ. The over-performance is plausibly because hipfire's FWHT rotation already mitigates dense outliers, leaving AWQ to focus on the sparse extreme outliers that survive rotation — where its outlier-preservation lever works best.
+
+### Strategic confirmation
+
+- AWQ is a real Phase A lever on dense+hybrid Qwen3.5 architectures at ≥9B scale.
+- The 0.8B → 9B scale-dependence pattern matches the AWQ paper's prediction (outliers grow with scale, AWQ's value grows with outliers).
+- Stage B (GPTQ on MQ4) and Stage C (MR-GPTQ on MFP4) are *unblocked* by this validation — the AWQ runtime path is correct, and the same Phase 2a/2b dispatch infrastructure will serve GPTQ.
+
+### Cost summary of getting here
+
+| Cost item | Wall time |
+|---|---|
+| Initial broken AWQ implementation discovery (whitelist + loader bug) | ~4h |
+| Hypothesis testing + α=0 discriminator + sidecar inspection | ~1h |
+| Loader fix code + build + verify | ~15 min |
+| 9B re-quantize + dual eval (mq4-base + mq4-awq, 512ch each) | ~50 min |
+| **Total cycle from "first bad cohort number" to "validated 9B Stage A win"** | **~6h** |
+
+The infrastructure investment (`fused_rmsnorm_rotate_for_mq` AWQ dispatch, AWQ kernel, sidecar storage protocol) carries forward into Stage B/C with zero re-work — only the *calibration* algorithm changes between A and B.
+
+### Open AWQ follow-up — `o_proj` / `out_proj` / `down_proj` (Option B from glm5 doc)
+
+These tensors are skipped by the whitelist because their runtime paths (`rotate_x_mq`, `fused_silu_mul_rotate_mq`) have no AWQ inverse. Literature suggests another few percent KLD reduction is on the table from AWQ-ing them too. Cost: 4 new HIP kernels + dispatcher wiring. Deferred — confirm Stage B/C first; if AWQ + GPTQ + MR-GPTQ together leave a meaningful residual gap to UD-Q3_K_XL, revisit then.

@@ -3,15 +3,29 @@
 **Date:** 2026-05-12
 **Companion to:** `/home/kread/mygit/vllm/vllm_awq.md` (deep-dive analysis of vLLM + compressed-tensors AWQ; treat that as the upstream reference). This doc is the **hipfire-specific translation** — what changes vs vLLM's design when targeting MQ4 + FWHT-256, what stays the same, and what's open.
 
-**Status:** ✅ **Implementation shipped 2026-05-12 (PM); Phase 3 bench in flight.** Originally landed as research / design synthesis; the action plan below has been executed:
+**Status:** ✅ **Implementation shipped + validated on 9B Qwen3.5 (2026-05-12 evening).** Originally landed as research / design synthesis; the action plan below has been executed AND empirically confirmed as a real Phase A quality lever:
 - Phase 1 (quantizer): commit `83054300` — `--awq` / `--awq-alpha`, log-space scale computation, in-place `W' = W · diag(s)`, F16 sidecar `<weight>.awq_scale.weight` emission for MQ4G256 only. 5 unit tests, 36/36 quantizer suite green.
 - Phase 2a (runtime): commit `e51a3cd9` — `WeightTensor.awq_scale: Option<GpuTensor>` field, sidecar loader (F16→F32 host-side, F32 GpuTensor uploaded), `fused_rmsnorm_mq_rotate_awq` HIP kernel (Phase 1c divide-by-scale before FWHT; FWHT bytes-identical to non-AWQ variant), dispatch wrappers `fused_rmsnorm_rotate_mq_awq{,_batched}`.
 - Phase 2b (forward-pass dispatch): commit `a4265ce4` — `fused_rmsnorm_rotate_mq_batched_for` helper that auto-routes based on next-linear's `awq_scale`; 10 call sites in `qwen35.rs` converted (1 decode + 7 batched + 2 helpers).
+- **Bug-hunt phase (2026-05-12 PM) — two bugs blocked the first cohort:**
+  - Commit `6711308d` (+ `ca759da6` for MoE completeness): whitelist-only AWQ pre-scaling in the quantizer (skip `o_proj`/`out_proj`/`down_proj` whose runtime paths have no AWQ inverse — pre-scaling them produces `(W·s)·x ≠ W·x` corruption). Full diagnosis + comparison to the other agent's substring-match proposal in `awq_fix_claude.md`.
+  - Commit `0aa58185`: the Qwen3.5 crate had its OWN private `load_weight_tensor` that hardcoded `awq_scale: None` for all weight types — the Phase 2a `load_awq_scale` infrastructure was never invoked from the Qwen3.5 forward path. The dispatcher always fell through to the non-AWQ kernel; the AWQ kernel was never JIT-compiled (verified: `fused_rmsnorm_mq_rotate_awq.hsaco` did not exist on disk before the fix landed).
 - Bench wiring (orthogonal fix): commit `21772a4d` — replaced broken `tail -1 serve.log | grep "warm-up complete"` race in `quant_cohort.sh` + `bench_humaneval_completion.sh` with a `/v1/models` poll. Surfaced by Stage 0 (Q8 floor) cohort returning `model not found` for smoke even though KLD/PPL scored fine.
 
-**Sidecar emission verified:** AWQ-quantized 9B has 248 `awq_scale` tensors (matches 32 layers × ~8 linears/layer); baseline has 0. AWQ-disabled code path is byte-identical to pre-AWQ.
+**Sidecar emission verified:** AWQ-quantized 9B has 184 `awq_scale` tensors after the whitelist fix (matches q/k/v ×8 + gate/up ×32 + in_proj_{qkv,z,a,b} ×24 for 8 full_attn + 24 linear_attn layers). All `o_proj` / `out_proj` / `down_proj` correctly excluded. AWQ-disabled code path is byte-identical to pre-AWQ.
 
-**Phase 3 bench in flight (2026-05-12 PM):** 3-variant cohort on Qwen3.5-9B (gfx1100, asym3 KV, prefill, 512 chunks): `q8f16` engine-drift control + `mq4-base` baseline + `mq4-awq` candidate. Results landing at `benchmarks/quality-baselines/results/2026-05-12-cohort-phase-a-stage-a-awq-9b/`. Q8 floor pre-measured at KLD 0.5735 — engine drift dominates the absolute number; AWQ delta is read as `KLD(mq4-awq) − KLD(mq4-base)`, not as fraction of absolute KLD.
+**Final Stage A measurements (Qwen3.5, gfx1100, asym3 KV, prefill scoring, 512 chunks):**
+
+| Variant | KLD | Above Q8 floor | PPL | AWQ Δ vs base |
+|---|---:|---:|---:|---:|
+| 0.8B q8f16 (floor) | 0.4598 | — | 30.996 | — |
+| 0.8B mq4-base | 0.6721 | +0.2123 | 36.594 | — |
+| 0.8B mq4-awq | 0.6707 | +0.2109 | 37.31 | −0.7% (noise) |
+| 9B q8f16 (floor, 256ch) | 0.5735 | — | 13.383 | — |
+| **9B mq4-base** | **0.8165** | **+0.2430** | **15.063** | — |
+| **9B mq4-awq** | **0.7373** | **+0.1638** | **14.303** | **−32.6% / −5.0% PPL** |
+
+The 0.8B → 9B scale-dependence pattern matches the AWQ paper's prediction: outlier severity grows with parameter count, so AWQ's outlier-preservation lever scales up with model size. **At 9B the −32.6% above-floor KLD reduction is at the upper end of literature's typical 15-25% range on Q4 quants — plausibly because hipfire's FWHT rotation already handles dense outliers, leaving AWQ to target the sparse extreme outliers that survive rotation (where outlier preservation works best).**
 
 ---
 

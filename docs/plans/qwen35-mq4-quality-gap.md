@@ -717,7 +717,7 @@ Disambiguating-variant rule (going forward): every cohort that compares 4-bit ca
 | stage | status (2026-05-12 PM) | wall budget | gates | strategic priority |
 |---|---|---|---|---|
 | Stage 0 (Q8 floor cohort) | ✅ done | ~2.5h | none | critical: required interpretation prerequisite |
-| Stage A (AWQ on MQ4) | ✅ feature-complete; Phase 3 bench in flight | ~1.5-2 weeks | Stage 0 | **highest** — cheapest path; AWQ works at MQ4's g=256 (per-block large-group) |
+| Stage A (AWQ on MQ4) | ✅ shipped + validated (9B: −32.6% above-floor KLD, −5.0% PPL) | ~1.5-2 weeks | Stage 0 | **highest** — cheapest path; AWQ works at MQ4's g=256 (per-block large-group) |
 | Stage B (GPTQ on MQ4) | ⏸️ pending | ~2 weeks | optional after Stage A | high — stacks additively; builds Hessian collector for Stage C |
 | **Stage C (MR-GPTQ on MFP4)** | ⏸️ pending | **~2-3 weeks** | after Stage B (shares scaffolding) | **paper-validated for MFP4** — might make Stage E unnecessary |
 | Stage D (UD kmap) | ⏸️ pending | ~1-2 days | independent of A/B/C | medium — small effort, orthogonal lever |
@@ -734,7 +734,27 @@ Disambiguating-variant rule (going forward): every cohort that compares 4-bit ca
 
 Sidecar emission verified: AWQ-quantized 9B has 248 `awq_scale` tensors stored (matches 32 layers × ~8 linears/layer); baseline has 0. AWQ-disabled code path is byte-identical to pre-AWQ.
 
-**Phase 3 (in flight 2026-05-12 PM) — Stage A end-to-end bench.** 3-variant cohort on Qwen3.5-9B (gfx1100, asym3 KV, prefill scoring, 512 chunks): `q8f16` engine-drift control, `mq4-base` baseline, `mq4-awq` candidate. TSV at `/tmp/cohort-specs/phase-a-stage-a-awq-9b.tsv`, results landing at `benchmarks/quality-baselines/results/2026-05-12-cohort-phase-a-stage-a-awq-9b/`. Decision criterion: `KLD(mq4-awq) − KLD(q8f16) < KLD(mq4-base) − KLD(q8f16)` ⇒ AWQ helps; magnitude determines whether to advance to Stage B or revisit α.
+**Phase 3 (completed 2026-05-12 evening) — Stage A end-to-end bench.** Initial 0.8B cohort surfaced TWO bugs in the Stage A pipeline, both fixed before final measurement:
+
+1. **Quantizer over-scoping** (commit `6711308d`): the AWQ pre-scaling was applied to every MQ4G256 weight with imatrix data, including the post-attention/post-silu projections (`wo` / `o_proj` / `out_proj` / `down_proj`) whose runtime path uses `rotate_x_mq` and `fused_silu_mul_rotate_mq` — neither of which has an AWQ inverse. Pre-scaled weights met undivided activations → `(W·s)·x ≠ W·x` corruption per channel. Fixed via a whitelist guard (`awq_eligible(name)`) that only pre-scales tensors whose runtime path will apply the divide. MoE completeness follow-up at commit `ca759da6`.
+2. **Qwen3.5 crate's private loader hardcoded `awq_scale: None`** (commit `0aa58185`): the Phase 2a `load_awq_scale` infrastructure shipped in `hipfire_runtime::hfq` was simply never invoked from the Qwen3.5 forward path because `crates/hipfire-arch-qwen35/src/qwen35.rs:742` has its own `load_weight_tensor_raw` that returned `awq_scale: None` for every weight type. Detection signal: the AWQ kernel `fused_rmsnorm_mq_rotate_awq.hsaco` did not exist on disk before this fix — kernels are JIT-compiled on first dispatch, and the dispatch's `awq_scale.is_some()` check was always false. Fix mirrors the upstream loader closure inside the Qwen3.5 crate.
+
+Detailed diagnosis trace in `docs/plans/awq_fix_claude.md` (rebuttal + measured results) and `docs/plans/awq_bug_hunt_glm5.md` (independent agent's diagnosis of the first bug). Cost from "first bad cohort" to "validated 9B Stage A win": ~6 hours.
+
+**Final Stage A measurements (Qwen3.5, gfx1100, asym3 KV, prefill scoring, 512 chunks):**
+
+| Variant | KLD | Above Q8 floor | PPL | AWQ delta |
+|---|---:|---:|---:|---:|
+| 0.8B q8f16 (floor) | 0.4598 | — | 30.996 | — |
+| 0.8B mq4-base | 0.6721 | +0.2123 | 36.594 | — |
+| 0.8B mq4-awq-loaderfix | 0.6707 | +0.2109 | 37.31 | **−0.7% (within noise)** |
+| 9B q8f16 (floor, 256ch) | 0.5735 | — | 13.383 | — |
+| **9B mq4-base** | **0.8165** | **+0.2430** | **15.063** | — |
+| **9B mq4-awq-loaderfix** | **0.7373** | **+0.1638** | **14.303** | **−32.6% / −5.0% PPL** |
+
+The 0.8B → 9B scale dependence matches AWQ paper predictions: outlier preservation gains grow with model size because outlier severity scales with parameter count. **Stage A AWQ is a real Phase A quality lever on Qwen3.5-9B and beyond**, and the infrastructure (Phase 2a dispatch + Phase 2b call-site wiring + sidecar storage) carries forward into Stage B (GPTQ) and Stage C (MR-GPTQ) without rework — only the *calibration* algorithm changes.
+
+**Open follow-up (Option B from `awq_bug_hunt_glm5.md`):** add AWQ-aware variants of `rotate_x_mq` and `fused_silu_mul_rotate_mq` (4 new HIP kernels + dispatcher wiring) so `o_proj` / `out_proj` / `down_proj` can also benefit from AWQ. Literature suggests another few percent KLD reduction. Deferred until Stage B/C measure-up — if the AWQ+GPTQ+MR-GPTQ stack still leaves a meaningful gap to UD-Q3_K_XL at equal bpw, revisit then.
 
 **What the Steps 1-7 work above bought us even though the pivot reframes the plan:** the infrastructure to MEASURE all of this is in place — `quant_cohort.sh`, `eval_hipfire`, `imatrix_collect`, `ud_decompile`, BF16 kldref files for 9B and 0.8B. The bench loop is ~25 minutes per cohort variant on 9B. Stage A AWQ can iterate against measurement at that cadence, which is the engineering velocity needed to actually validate a calibration lever empirically (not just predict its impact from a lever-decomposition spreadsheet).
 
