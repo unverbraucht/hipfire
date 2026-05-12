@@ -12692,7 +12692,13 @@ impl Gpu {
         batch: usize, n: usize, eps: f32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel("rmsnorm", kernels::RMSNORM_SRC, "rmsnorm_f32")?;
+        // Probe: HIPFIRE_RMSNORM_F64=1 swaps the f32-accumulating kernel for an
+        // f64-accumulating one. Inputs/outputs stay f32. Used to test whether
+        // accumulation precision in QK-norm contributes to the engine-drift
+        // floor on Qwen3.5 FullAttention layers. Default (unset / 0) is unchanged.
+        let f64_acc = std::env::var("HIPFIRE_RMSNORM_F64").ok().as_deref() == Some("1");
+        let entry = if f64_acc { "rmsnorm_f32_f64acc" } else { "rmsnorm_f32" };
+        self.ensure_kernel("rmsnorm", kernels::RMSNORM_SRC, entry)?;
 
         let mut x_ptr = x.buf.as_ptr();
         let mut w_ptr = weight.buf.as_ptr();
@@ -12709,11 +12715,12 @@ impl Gpu {
         ];
 
         let block_size = 256u32.min(n as u32);
-        let shared_mem = block_size * 4;
+        // f64 accumulator needs 8 bytes per slot vs 4 for f32.
+        let shared_mem = block_size * if f64_acc { 8 } else { 4 };
         let bytes = crate::profile::rmsnorm_bytes(batch * n);
         let timer = crate::profile::begin_timer(&self.hip, "rmsnorm", "rmsnorm_batched", bytes);
         let result = self.launch_maybe_blob(
-            "rmsnorm_f32",
+            entry,
             [batch as u32, 1, 1],
             [block_size, 1, 1],
             shared_mem,
