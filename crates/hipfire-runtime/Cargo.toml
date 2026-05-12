@@ -279,6 +279,16 @@ required-features = []
 name = "eval_hipfire"
 required-features = ["arch-qwen35", "deltanet"]
 
+# eval_hipfire_llama — KLD eval for llama-arch hipfire models (Qwen2 /
+# Qwen2.5 / Llama / TinyLlama). Per-token scoring only; llama-arch
+# `forward_prefill_batch` lacks the hidden-state capture hook the prefill
+# scoring mode in eval_hipfire relies on. Built 2026-05-12 to unblock
+# hypothesis #1 (DeltaNet recurrent-drift discriminator) on the engine-
+# drift floor investigation.
+[[example]]
+name = "eval_hipfire_llama"
+required-features = ["arch-llama"]
+
 # Tokenizer-parity helper: reads a .hfq's tokenizer + tokenizes a text slice.
 # No GPU / arch features needed (tokenizer is pure CPU).
 [[example]]

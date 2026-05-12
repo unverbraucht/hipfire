@@ -722,6 +722,52 @@ Disambiguating-variant rule (going forward): every cohort that compares 4-bit ca
 
 asym3 KV is contributing **~0.20 of the 0.57** floor (~33%) — substantial but not the whole story. ~0.40 remains with q8 KV. Q8 KV vs FP16 KV is 0.01–0.05 in literature; benign cross-engine drift is 0.01–0.05; Q8 weight quant is 0.001–0.005. Sum of these explainable components: at most ~0.10. The remaining ~**0.30 nats is unaccounted for** and points to a real hipfire-vs-llama.cpp implementation discrepancy, not benign drift. Next diagnostic step is Step 2 (position-0 logit comparison vs an independent HF transformers oracle) to localize: feed-forward vs attention-with-KV-history. Raw kldseqs at `benchmarks/quality-baselines/results/2026-05-12-kv-ablation-9b/per-seq/`.
 
+**Residual-0.30 hypothesis probes (2026-05-12 evening, gfx1151).** Five candidates considered for the unaccounted ~0.30:
+
+1. DeltaNet (linear-attention) recurrent drift × 24 layers
+2. Tokenizer / BOS / chat-template framing — **ruled out**; ref tokens[0..16] byte-identical to llama-tokenize output, no BOS prepend
+3. RMSNorm precision drift × 32 layers
+4. lm_head Q8 vs BF16 precision (Q8 lm_head over 4096 × 248320)
+5. Q8 K-cache rotation oddity
+
+Test #4 — lm_head precision (**FALSIFIED**).
+- Added diagnostic env-gate `HIPFIRE_QUANTIZE_LM_HEAD_F16=1` in `hipfire-quantize` (Base arm of `kmap_resolve_mode`; does not require `--kmap-dense` so lm_head F16 is isolated from K-map's other Promote6 side-effects). One-liner override; default behaviour unchanged.
+- Produced `~/.hipfire/models/qwen3.5-9b.q8f16-f16lm-2026-05-12` (10.48 GB vs 9.53 GB baseline; size delta = 909 MB == predicted F16-vs-Q8 lm_head delta to the byte, confirming the override fired).
+- **Initial eval was kernel-gated**: at canonical `--scoring-mode prefill --kv-mode asym3` the F16 lm_head decompressed to F32 at load time (`qwen35.rs:810-819`) and per-position dispatch fell through a serial F32 GEMV path → 4 tok/s wall, ~84 h full-slice ETA. Unusable as a diagnostic.
+- **F16 lm_head plumbing landed** (commit pending) to close that gap: stop the host-side F16→F32 decompress and keep `DType::F16` on GPU; add `DType::F16` arm in `weight_gemv` that calls `gemm_f16_batched_lmhead(batch=1)`; in `eval_hipfire.rs` prefill scoring branch, replace the per-position `weight_gemv` loop with a single `gemm_f16_batched_lmhead(batch=scored_per_chunk)` call when the lm_head is F16. Uses the existing WMMA-backed `gemm_mw16_residual_wmma` kernel — no new kernels written.
+- Per-chunk timing breakdown (single-chunk timing run with `gpu.hip.device_synchronize()` between phases): prefix forward_prefill_batch = 53.4 s, scored forward_prefill_batch with hidden capture = 53.5 s, alloc(1 GB) = 0.05 s, **batched lm_head GEMM = 0.79 s**, score loop (1023 PCIe downloads + KLD math) = 0.85 s. lm_head went from ~280 s/chunk (F32 fall-through) to 0.79 s/chunk (WMMA batched) — a ~350× speedup. The transformer-stack `forward_prefill_batch` (53 s/chunk) is the new dominant cost on gfx1151 9B prefill, unrelated to the lm_head question.
+- **Final eval (matched mode against the 0.6004 baseline): `--scoring-mode per-token --kv-mode asym3 --max-chunks 20`**:
+
+  | variant | slice-mean KLD | mean NLL | PPL |
+  |---|---:|---:|---:|
+  | q8f16 baseline (Q8 lm_head)               | 0.600439 | 2.6203 | 13.7390 |
+  | q8f16-f16lm (F16 lm_head, this run)       | 0.600614 | 2.6206 | 13.7441 |
+  | **Δ (F16 − Q8)** | **+0.000175** | +0.0003 | +0.0051 |
+
+  Per-sequence KLDs match to 4 decimal places (seq[:5] = [0.4794, 0.5677, 0.7836, 0.2883, 0.5038] vs [0.4794, 0.5675, 0.7834, 0.2881, 0.5034]). The 1.7e-4 nat delta is round-off noise, not a real precision contribution. **Hypothesis #4 is falsified: lm_head Q8 quantization is NOT a measurable contributor to the engine-drift floor on this model + slice.** The residual ~0.30 nats lives elsewhere — DeltaNet drift (#1), RMSNorm precision (#3), or Q8 K-cache rotation (#5) remain the open candidates.
+- Engineering byproduct worth keeping: the F16 lm_head plumbing also unblocks future vision-encoder F16 paths (Qwen-VL `linear_f16` consumers) and lays groundwork for an eventual BF16 lm_head — the WMMA kernel exists and is now reachable from the standard `weight_gemv` dispatch.
+
+Raw kldseqs at `benchmarks/quality-baselines/results/2026-05-12-lm-head-precision-9b/per-seq/`.
+
+Test #1 — Qwen2.5-7B DeltaNet discriminator (**INFRA closed, RESULT UNUSABLE — separate bug**).
+- Qwen2.5-7B (Qwen2 arch, full attention, **no DeltaNet**) is the cleanest discriminator: if its KLD floor lands meaningfully below the 9B Q3.5 floor under matched eval conditions, DeltaNet recurrent drift is real.
+- `eval_hipfire` is hardcoded to `hipfire-arch-qwen35` (DeltaNetState in the per-token signature, Qwen35Scratch type). Ported as `crates/hipfire-runtime/examples/eval_hipfire_llama.rs` — same KLD math + HFKSEQ output, plumbed through `<Llama as Architecture>` + `hipfire_runtime::llama::{forward_scratch_embed, forward_scratch_compute}`. Per-token mode only; `forward_prefill_batch` in `hipfire_runtime::llama` lacks the hidden-state capture hook that eval_hipfire's prefill scoring path relies on. Registered as a separate `[[example]]` with `required-features = ["arch-llama"]`. Cargo binary at `target/release/examples/eval_hipfire_llama`.
+- Q2.5-7B kldref built via `build_kld_ref` against locally-converted BF16 GGUF (`/data/models/qwen/Qwen2.5-7B-BF16/Qwen2.5-7B-Instruct-BF16.gguf`, 15.2 GB; throughput ~552 tok/s on gfx1151). Output: `benchmarks/quality-baselines/refs/qwen2.5-7b-bf16.kldref.bin` (2.49 GB).
+- Q2.5-7B quantized as `qwen2.5-7b-instruct.q8f16` (8.1 GB).
+- Two further constraints surfaced on first launch: (a) `--kv-mode asym3` rejects non-Qwen3.5 head_dim (`llama.rs:3065` asserts head_dim=256; Q2.5-7B has head_dim=128) → switched to `--kv-mode q8`. (b) Per-token rate on 7B is ~11 tok/s (full slice = ~30 h); current run caps at `--max-chunks 32` (~50 min wall) for a directional 32-chunk-mean comparison. A matched `--max-chunks 32 --kv-mode q8 --scoring-mode per-token` run on the existing 9B q8f16 model is queued next for the apples-to-apples delta.
+
+What the 7B test settles vs leaves open:
+- **Settles directionally** (32-chunk noisy mean): does removing DeltaNet move the floor by ~0.3 nats? Yes/no/maybe.
+- **Does NOT settle**: absolute floor under prefill-mode methodology (per-token vs prefill numbers don't transplant); per-architecture confounders (Q2 vs Q3.5 do not share *only* DeltaNet — also differ on MTP layer, head_dim, vocab size; the 7B vs 9B parameter count is a confound for absolute KLD but not for the floor-shift direction).
+
+**Q2.5-7B result was unusable**: slice-mean KLD = 8.38, PPL = 28569 — model emitting effectively-random logits. The `eval_hipfire_llama` harness loaded the model + ran forward, but either the hipfire-arch-llama Qwen2.5 forward path has a bug, the BF16-ref tokenization disagrees with the loaded tokenizer, or both. Setting hypothesis #1 aside pending root-cause investigation of `eval_hipfire_llama` + Q2.5-7B; KLD floor for non-DeltaNet Qwen-family discriminator is still open. Raw kldseq at `benchmarks/quality-baselines/results/2026-05-12-qwen25-7b-deltanet-discriminator/per-seq/`.
+
+**Where the floor stands after these two tests (2026-05-12 evening):**
+- KV asym3 → q8 ablation accounted for ~0.20 of 0.57 → residual ~0.37 with q8 KV (~0.30 unaccounted vs benign cross-engine drift).
+- Test #4 (lm_head Q8 vs F16) contributes < 0.001 nats → **NOT the source**.
+- Test #1 (DeltaNet discriminator) blocked on harness/tokenizer bug → open.
+- Remaining hypothesis surface: DeltaNet recurrent drift × 24 LA layers (#1, needs harness fix), RMSNorm fp16/fp32 precision drift × 32 layers (#3, untested), Q8 V-cache rotation oddity (#5, untested). Step 2 of the original plan (position-0 logit comparison vs HF transformers oracle) remains the highest-information-value next probe to localize feed-forward vs attention-with-history.
+
 **Sequencing summary:**
 
 | stage | status (2026-05-12 PM) | wall budget | gates | strategic priority |

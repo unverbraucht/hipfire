@@ -2126,6 +2126,17 @@ fn kmap_resolve_mode(name: &str, n_layers: usize, is_moe: bool, kmap_mode: u8) -
     if name.contains("embed_tokens") || name.contains("token_embd")
         || name.contains("lm_head") || name.ends_with("output.weight")
     {
+        // 2026-05-12 — env-gated override for the engine-drift-floor
+        // hypothesis #4 (lm_head Q8-vs-F16 contribution). When
+        // HIPFIRE_QUANTIZE_LM_HEAD_F16=1, store lm_head as F16 instead of Q8.
+        // Embeddings + routers stay Q8 (different concern). Diagnostic-only;
+        // do not enable in production cohort runs.
+        let is_lm_head = name.contains("lm_head") || name.ends_with("output.weight");
+        if is_lm_head
+            && std::env::var("HIPFIRE_QUANTIZE_LM_HEAD_F16").ok().as_deref() == Some("1")
+        {
+            return QuantLevel::F16;
+        }
         return QuantLevel::Q8;
     }
 
@@ -3933,7 +3944,19 @@ fn main() {
             } else {
 
             // ── K-map override ──────────────────────────────────────────────
-            let kmap_level = kmap.get(&**name).copied().unwrap_or(QuantLevel::Base);
+            // 2026-05-12 — diagnostic env-gate (engine-drift floor hypothesis
+            // #4: is lm_head Q8 storage the residual contributor?). When
+            // HIPFIRE_QUANTIZE_LM_HEAD_F16=1 we force lm_head/output.weight
+            // to QuantLevel::F16 regardless of K-map state. Lets a dense
+            // model get an FP16 lm_head without engaging --kmap-dense's
+            // Promote6 side-effects.
+            let kmap_level = if (name.contains("lm_head") || name.ends_with("output.weight"))
+                && std::env::var("HIPFIRE_QUANTIZE_LM_HEAD_F16").ok().as_deref() == Some("1")
+            {
+                QuantLevel::F16
+            } else {
+                kmap.get(&**name).copied().unwrap_or(QuantLevel::Base)
+            };
 
             // AWQ sidecar scales for this tensor — populated only inside the
             // MQ4G256 arm when --awq is enabled and an imatrix entry exists
