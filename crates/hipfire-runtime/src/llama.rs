@@ -1237,6 +1237,13 @@ pub fn is_batchable_la(dt: DType, arch: &str) -> bool {
         DType::MQ4G256 | DType::HFQ4G256
         | DType::MQ6G256 | DType::HFQ6G256
     );
+    // Note (2026-05-12): adding Q8_0 here was attempted (Tier 1 of the
+    // q8f16-floor diagnostic) and **silently produced zero/NaN logits**.
+    // The dispatch sites in forward_prefill_chunk hard-code HFQ4/MQ4
+    // kernels (e.g. fused_qkv_hfq4g256_*, gemv_hfq4g256_residual_*) and
+    // have no Q8_0 path. Promoting Q8_0 here without wiring those sites
+    // → KLD = 0.0, NLL = NaN. See `docs/plans/issue-113-quant-quality-eval.md`
+    // §13 — proper Q8 prefill support is multi-site engineering work.
     if always_ok {
         return true;
     }
@@ -4131,6 +4138,9 @@ mod tests {
     #[test]
     fn is_batchable_la_unsupported_dtypes() {
         // Q4K / Q6K / Q8_0 / F32 stay on per-token forward_scratch.
+        // (Tried promoting Q8_0 to always_ok 2026-05-12 — silently produced
+        // zero/NaN logits because forward_prefill_chunk's dispatch sites
+        // hard-code MQ4/HFQ4 kernels. See `is_batchable_la` comment.)
         for arch in ["gfx1100", "gfx1200"] {
             assert!(!is_batchable_la(DType::Q4K, arch));
             assert!(!is_batchable_la(DType::Q6K, arch));

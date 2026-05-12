@@ -712,6 +712,16 @@ Status 2026-05-12 (afternoon): ✅ **done.** Result: KLD mean = 0.5735 (CI 0.549
 
 Disambiguating-variant rule (going forward): every cohort that compares 4-bit candidates should include a Q8/FP16 engine-floor row, so `KLD(MQ4) − KLD(Q8)` cleanly isolates the quantization-attributable component.
 
+**KV-mode ablation (2026-05-12, gfx1151, 9B-q8f16, n=20 chunks).** Same Q8 candidate, per-token mode, asym3 vs q8 KV cache:
+
+| KV mode | slice-mean KLD | PPL |
+|---|---:|---:|
+| asym3 (canonical floor cohort) | 0.6004 (20-chunk variance of the 0.5735 published number) | 13.74 |
+| q8                              | **0.4034** | 11.51 |
+| Δ (asym3 − q8) | **−0.197 (−33%)** | sign-test p=1.91e-6, 100% one-signed |
+
+asym3 KV is contributing **~0.20 of the 0.57** floor (~33%) — substantial but not the whole story. ~0.40 remains with q8 KV. Q8 KV vs FP16 KV is 0.01–0.05 in literature; benign cross-engine drift is 0.01–0.05; Q8 weight quant is 0.001–0.005. Sum of these explainable components: at most ~0.10. The remaining ~**0.30 nats is unaccounted for** and points to a real hipfire-vs-llama.cpp implementation discrepancy, not benign drift. Next diagnostic step is Step 2 (position-0 logit comparison vs an independent HF transformers oracle) to localize: feed-forward vs attention-with-KV-history. Raw kldseqs at `benchmarks/quality-baselines/results/2026-05-12-kv-ablation-9b/per-seq/`.
+
 **Sequencing summary:**
 
 | stage | status (2026-05-12 PM) | wall budget | gates | strategic priority |

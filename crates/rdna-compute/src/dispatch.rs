@@ -3508,6 +3508,35 @@ impl Gpu {
         result
     }
 
+    /// AWQ-aware batched variant of `fused_rmsnorm_rotate_mq_batched`.
+    ///
+    /// Phase 2b (commit a4265ce4) added a call site in `llama.rs` that
+    /// invokes this method, but Phase 2a (commit e51a3cd9) only landed the
+    /// non-batched `fused_rmsnorm_rotate_mq_awq`. This stub closes that gap
+    /// by looping the non-batched kernel per token. Correctness-equivalent;
+    /// slower than a true batched kernel would be.
+    ///
+    /// Replace with a proper batched HIP kernel (grid.x = batch_size on
+    /// `fused_rmsnorm_mq_rotate_awq` after verifying that kernel is
+    /// batch-position-independent) when AWQ-prefill becomes a perf-target.
+    pub fn fused_rmsnorm_rotate_mq_awq_batched(
+        &mut self,
+        x: &GpuTensor,
+        weight: &GpuTensor,
+        awq_scale: &GpuTensor,
+        x_rot: &GpuTensor,
+        k: usize,
+        eps: f32,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        for i in 0..batch_size {
+            let x_row = x.sub_offset(i * k, k);
+            let xr_row = x_rot.sub_offset(i * k, k);
+            self.fused_rmsnorm_rotate_mq_awq(&x_row, weight, awq_scale, &xr_row, k, eps)?;
+        }
+        Ok(())
+    }
+
     /// Fused SwiGLU + FWHT rotation. Reads gate/up, computes
     /// silu(gate[k])*up[k] on the fly, applies FWHT rotation, writes x_rot.
     /// Used as the w_down input stage for MQ4 — replaces the pair
