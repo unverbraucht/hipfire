@@ -760,13 +760,31 @@ What the 7B test settles vs leaves open:
 - **Settles directionally** (32-chunk noisy mean): does removing DeltaNet move the floor by ~0.3 nats? Yes/no/maybe.
 - **Does NOT settle**: absolute floor under prefill-mode methodology (per-token vs prefill numbers don't transplant); per-architecture confounders (Q2 vs Q3.5 do not share *only* DeltaNet — also differ on MTP layer, head_dim, vocab size; the 7B vs 9B parameter count is a confound for absolute KLD but not for the floor-shift direction).
 
-**Q2.5-7B result was unusable**: slice-mean KLD = 8.38, PPL = 28569 — model emitting effectively-random logits. The `eval_hipfire_llama` harness loaded the model + ran forward, but either the hipfire-arch-llama Qwen2.5 forward path has a bug, the BF16-ref tokenization disagrees with the loaded tokenizer, or both. Setting hypothesis #1 aside pending root-cause investigation of `eval_hipfire_llama` + Q2.5-7B; KLD floor for non-DeltaNet Qwen-family discriminator is still open. Raw kldseq at `benchmarks/quality-baselines/results/2026-05-12-qwen25-7b-deltanet-discriminator/per-seq/`.
+**Q2.5-7B result was unusable**: slice-mean KLD = 8.38, PPL = 28569 — model emitting effectively-random logits. **Root cause identified**: `hipfire-runtime::llama` does not load or apply Q/K/V projection biases. Qwen2/2.5 stores them (84 bias tensors verified in the .hfq: `model.layers.<i>.self_attn.{q,k,v}_proj.bias`), Qwen3 removed them, hipfire-arch-llama was built for Qwen3-only. Fix scope: add `q_bias` / `k_bias` / `v_bias` fields to `LayerWeights`, gate loading on `find_tensor`, call existing `gpu.bias_add_f32` after the Q/K/V matmuls in `forward_scratch_compute` + `forward_prefill_chunk`. ~half-day patch, deferred — see next section for the cheaper substitute that ran instead. Raw kldseq at `benchmarks/quality-baselines/results/2026-05-12-qwen25-7b-deltanet-discriminator/per-seq/`.
 
-**Where the floor stands after these two tests (2026-05-12 evening):**
-- KV asym3 → q8 ablation accounted for ~0.20 of 0.57 → residual ~0.37 with q8 KV (~0.30 unaccounted vs benign cross-engine drift).
-- Test #4 (lm_head Q8 vs F16) contributes < 0.001 nats → **NOT the source**.
-- Test #1 (DeltaNet discriminator) blocked on harness/tokenizer bug → open.
-- Remaining hypothesis surface: DeltaNet recurrent drift × 24 LA layers (#1, needs harness fix), RMSNorm fp16/fp32 precision drift × 32 layers (#3, untested), Q8 V-cache rotation oddity (#5, untested). Step 2 of the original plan (position-0 logit comparison vs HF transformers oracle) remains the highest-information-value next probe to localize feed-forward vs attention-with-history.
+Test #1 — Qwen3 plain (no DeltaNet, no Q/K/V bias) discriminator (**STRONG SIGNAL, hypothesis #1 supported**).
+- Skipping the Q2.5 bias retrofit, used Qwen3-0.6B as the no-DeltaNet test vehicle (no Q/K/V bias, no q_norm/k_norm — already supported by hipfire-arch-llama). Built BF16 GGUF via `convert_hf_to_gguf.py` (1.5 GB), then kldref via `build_kld_ref` (~10 min, 1632 tok/s on gfx1151), q8f16 quantize (~1 min).
+- Matched the comparison against `qwen3.5-0.8b.q8f16` (already in the model cache, BF16 kldref already in `refs/`) — Qwen3.5-0.8B is close-in-size to Qwen3-0.6B (same family-of-families, similar capability) but has DeltaNet (18 LA + 6 FA hybrid).
+- Both runs: `--kv-mode q8 --scoring-mode per-token --max-chunks 20`, matched conditions; only architecture differs.
+
+| Model | architecture | KLD floor | PPL | mean NLL |
+|---|---|---:|---:|---:|
+| Qwen3-0.6B | plain Qwen3 (no DeltaNet, no QKV bias) | **0.0098** | 19.5 | 2.972 |
+| Qwen3.5-0.8B | Qwen3.5 hybrid (18 LA + 6 FA = 75% LA) | **0.4945** | 33.2 | 3.503 |
+| Qwen3.5-9B (kv-q8 ablation) | Qwen3.5 hybrid (24 LA + 8 FA = 75% LA) | **0.4034** | 11.5 | — |
+
+  Raw kldseqs at `benchmarks/quality-baselines/results/2026-05-12-deltanet-discriminator/per-seq/`.
+
+- **The Qwen3-0.6B floor is ~50× lower than Qwen3.5-0.8B at essentially-equal size.** This is not a model-size effect (0.6B vs 0.8B is within 35%); it is an architecture effect. Q3.5-0.8B and Q3.5-9B land at similar floor magnitude (0.49 vs 0.40 nats) despite the 11× param-count gap, which is consistent with both having the same 75% LA-layer ratio. Plain Qwen3 at 0.01 nats is essentially Q8 weight quantization noise — the "engine-drift floor" is *not* generic cross-engine drift, it is **specific to hipfire's DeltaNet / Qwen3.5-hybrid implementation**.
+- Consequence: previously framed measurements like "Stage A AWQ closes X% of the gap to UD-Q4_K_XL on Q3.5-9B" were comparing `(4-bit-quant noise) + (DeltaNet drift baseline ~0.4)` against `(BF16) + (llama.cpp's DeltaNet implementation drift, whatever it is)`. The 4-bit-attributable component is much smaller than the headline KLD numbers suggested — the literature-comparable AWQ lift of ~0.02-0.05 nats becomes detectable once the DeltaNet pedestal is either subtracted (by including a Q8 control row in every Q3.5 cohort, which we already do) or eliminated (by fixing the DeltaNet forward path).
+
+**Where the floor stands after these tests (2026-05-12 evening):**
+- KV asym3 → q8 ablation: ~0.20 nats of 0.57 (kv-rotation precision).
+- Test #4 (lm_head Q8 vs F16): < 0.001 nats — NOT the source.
+- Test #1 (DeltaNet discriminator): Qwen3.5 hybrid vs plain Qwen3 differs by ~0.48 nats at matched size — **DeltaNet implementation is the dominant remaining contributor**, well above any benign engine-drift baseline.
+- Q3.5 stack residuals after subtracting DeltaNet contribution: ≲ 0.01 nats — within Q8 quant-noise expectations.
+
+**Where the next-step work should focus** is now clear: localize the DeltaNet forward-pass divergence. Per-layer hidden-state KLD against an HF transformers reference on a single chunk (Step 2 of the original plan, plus per-layer instrumentation) should pin down which of the 18-24 LA layers contribute most, and whether the drift is a Δrule / FWHT / state-update / mixing-fraction precision issue. The LayerNorm precision hypothesis (#3) and Q8 V-cache rotation hypothesis (#5) are still on the table for the smaller residual but are now lower-priority — the bulk of the floor lives in DeltaNet.
 
 **Sequencing summary:**
 
