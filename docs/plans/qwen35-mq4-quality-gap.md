@@ -698,24 +698,47 @@ Already have the UD-Q4_K_XL kmap artifact for 9B (commit `679bff46`). Implement 
 
 Only fires if Stages A + B + C + D don't close the bpw-matched gap to UD-Q3_K_XL meaningfully (target: 60%+ of the gap closed). Tracked in `docs/plans/mq4v2-format-proposal.md` with Stage 1 / Stage 2 / Stage 3 sub-decomposition.
 
-**Stage 0 prerequisite (in flight as of 2026-05-12) — Hipfire Q8 baseline cohort (~30 min wall).**
+**Stage 0 prerequisite — Hipfire Q8 baseline cohort (~2.5h wall on 9B at 256 chunks).**
 
 Quantize 9B as `--format q8f16` (near-lossless per-tensor — measured 2.63e-8 mean MSE, 113× lower than MFP4). Run the standard cohort. The resulting KLD vs llama.cpp BF16 measures the **engine-drift floor** — the KLD that hipfire produces even when the quant is near-lossless. Without this number, "Stage A closes X% of the gap" can't be interpreted (X% of what? — depends on whether the floor is 0.05 or 0.5 KLD).
 
-This unblocks meaningful interpretation of every subsequent calibration measurement.
+Status 2026-05-12 (afternoon): ✅ **done.** Result: KLD mean = 0.5735 (CI 0.5490–0.5996), KLD p99 = 18.325, PPL = 13.383, n=261,888 tokens scored. Stored at `benchmarks/quality-baselines/results/2026-05-12-cohort-phase-a-q8-floor-9b/`.
+
+**Interpretation caveat — the 0.57 is not Q8 quantization noise.** Q8 vs FP16 in published literature is ~0.001–0.005 KLD. 0.57 nats is "different model" territory. What we actually measured is `hipfire(Q8 weights + asym3 KV cache) vs external_ref(BF16, llama.cpp scoring path)`. The dominant contribution to 0.57 is **hipfire engine drift vs llama.cpp** (kernel precision, accumulation order, attention math, FWHT-rotated K-cache); KV-cache asym3 quantization contributes a meaningful but smaller share; Q8 weight quantization itself contributes ~0.001–0.01. Implications for Phase 3+:
+
+1. The number is the **hipfire-engine-on-asym3-KV floor** against an external reference, not the "Q8 floor" in the literature sense.
+2. All Phase A candidates inherit the same offset. The number that matters is **delta-above-floor**, not absolute KLD.
+3. Literature AWQ lift of +15-20% PPL is measured against `floor + quant_noise`, which is almost entirely `floor` in our setup. Expected absolute KLD improvement is small in nat terms (~0.02–0.05) and at the edge of CI width on 256 chunks (~0.025 half-width). Bench at 512+ chunks for distinguishability, or add an additional FP16/Q8 engine-control variant per-cohort so quantization-attributable delta is isolated from engine drift.
+
+Disambiguating-variant rule (going forward): every cohort that compares 4-bit candidates should include a Q8/FP16 engine-floor row, so `KLD(MQ4) − KLD(Q8)` cleanly isolates the quantization-attributable component.
 
 **Sequencing summary:**
 
-| stage | wall budget | gates | strategic priority |
-|---|---|---|---|
-| Stage 0 (Q8 floor cohort) | ~30 min | none | critical: required interpretation prerequisite |
-| Stage A (AWQ on MQ4) | ~1.5-2 weeks | Stage 0 | **highest** — cheapest path; AWQ works at MQ4's g=256 (per-block large-group) |
-| Stage B (GPTQ on MQ4) | ~2 weeks | optional after Stage A | high — stacks additively; builds Hessian collector for Stage C |
-| **Stage C (MR-GPTQ on MFP4)** | **~2-3 weeks** | after Stage B (shares scaffolding) | **paper-validated for MFP4** — might make Stage E unnecessary |
-| Stage D (UD kmap) | ~1-2 days | independent of A/B/C | medium — small effort, orthogonal lever |
-| Stage E (MQ4K wire format) | ~5-7 weeks | DEFERRED, gated on A+B+C+D | only if calibration on existing formats falls short |
+| stage | status (2026-05-12 PM) | wall budget | gates | strategic priority |
+|---|---|---|---|---|
+| Stage 0 (Q8 floor cohort) | ✅ done | ~2.5h | none | critical: required interpretation prerequisite |
+| Stage A (AWQ on MQ4) | ✅ feature-complete; Phase 3 bench in flight | ~1.5-2 weeks | Stage 0 | **highest** — cheapest path; AWQ works at MQ4's g=256 (per-block large-group) |
+| Stage B (GPTQ on MQ4) | ⏸️ pending | ~2 weeks | optional after Stage A | high — stacks additively; builds Hessian collector for Stage C |
+| **Stage C (MR-GPTQ on MFP4)** | ⏸️ pending | **~2-3 weeks** | after Stage B (shares scaffolding) | **paper-validated for MFP4** — might make Stage E unnecessary |
+| Stage D (UD kmap) | ⏸️ pending | ~1-2 days | independent of A/B/C | medium — small effort, orthogonal lever |
+| Stage E (MQ4K wire format) | ⏸️ DEFERRED | ~5-7 weeks | DEFERRED, gated on A+B+C+D | only if calibration on existing formats falls short |
+
+#### Stage A — shipped 2026-05-12 (PM)
+
+| Phase | What landed | Where |
+|---|---|---|
+| Phase 1 — Quantizer | AWQ pre-scaling for MQ4G256: `compute_awq_scales` (log-space accumulation, geo-mean normalized), `awq_pre_scale_weights` (in-place `W' = W · diag(s)`), F16 sidecar emission `<weight>.awq_scale.weight`, CLI flags `--awq` / `--awq-alpha` | `crates/hipfire-quantize/src/main.rs` (commit `83054300`); 5 new tests in `awq_tests` module |
+| Phase 2a — Runtime infra | `awq_scale: Option<GpuTensor>` field on `WeightTensor`; sidecar loader (F16→F32 host-side); `fused_rmsnorm_mq_rotate_awq` HIP kernel (extra per-channel divide before FWHT); dispatch wrappers | `crates/hipfire-runtime/src/{hfq,llama}.rs`, `crates/rdna-compute/src/{dispatch,kernels}.rs`, `kernels/src/fused_rmsnorm_mq_rotate_awq.hip` (commit `e51a3cd9`) |
+| Phase 2b — Forward-pass wiring | Helper `fused_rmsnorm_rotate_mq_batched_for` that takes the next-linear's `WeightTensor` and dispatches AWQ variant when it carries `awq_scale`; converted 10 call sites across decode + batched paths | `crates/hipfire-runtime/src/llama.rs`, `crates/hipfire-arch-qwen35/src/qwen35.rs` (commit `a4265ce4`) |
+| Bench infra fix | Replaced broken `tail -1 serve.log \| grep "warm-up complete"` race + obsolete `pgrep "examples/daemon"` fallback with `wait_for_model_ready` (polls `/v1/models` for requested basename) | `scripts/quant_cohort.sh`, `scripts/bench_humaneval_completion.sh` (commit `21772a4d`) |
+
+Sidecar emission verified: AWQ-quantized 9B has 248 `awq_scale` tensors stored (matches 32 layers × ~8 linears/layer); baseline has 0. AWQ-disabled code path is byte-identical to pre-AWQ.
+
+**Phase 3 (in flight 2026-05-12 PM) — Stage A end-to-end bench.** 3-variant cohort on Qwen3.5-9B (gfx1100, asym3 KV, prefill scoring, 512 chunks): `q8f16` engine-drift control, `mq4-base` baseline, `mq4-awq` candidate. TSV at `/tmp/cohort-specs/phase-a-stage-a-awq-9b.tsv`, results landing at `benchmarks/quality-baselines/results/2026-05-12-cohort-phase-a-stage-a-awq-9b/`. Decision criterion: `KLD(mq4-awq) − KLD(q8f16) < KLD(mq4-base) − KLD(q8f16)` ⇒ AWQ helps; magnitude determines whether to advance to Stage B or revisit α.
 
 **What the Steps 1-7 work above bought us even though the pivot reframes the plan:** the infrastructure to MEASURE all of this is in place — `quant_cohort.sh`, `eval_hipfire`, `imatrix_collect`, `ud_decompile`, BF16 kldref files for 9B and 0.8B. The bench loop is ~25 minutes per cohort variant on 9B. Stage A AWQ can iterate against measurement at that cadence, which is the engineering velocity needed to actually validate a calibration lever empirically (not just predict its impact from a lever-decomposition spreadsheet).
+
+**Foot-gun discovered 2026-05-12:** `hipfire-quantize` defaults to `--format q8f16`. To get MQ4G256 you must pass `--format mq4` explicitly. The CLI's `--help` only prints `--input` / `--output`. Cost: one wasted quantize pair (~7 min CPU + 18 GB disk reclaimed) before noticing the output was Q8 instead of MQ4. Future cohort specs should embed the full quantize command, not just the output path.
 
 ### Phase B — Format-family fillout (3–4 weeks, can run in parallel with Phase A)
 

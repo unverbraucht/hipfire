@@ -3,7 +3,19 @@
 **Date:** 2026-05-12
 **Companion to:** `/home/kread/mygit/vllm/vllm_awq.md` (deep-dive analysis of vLLM + compressed-tensors AWQ; treat that as the upstream reference). This doc is the **hipfire-specific translation** — what changes vs vLLM's design when targeting MQ4 + FWHT-256, what stays the same, and what's open.
 
-**Status:** Research / design synthesis. Companion doc is "lightly validated"; spot-checks below confirm key claims. This doc is the action plan derived from those findings.
+**Status:** ✅ **Implementation shipped 2026-05-12 (PM); Phase 3 bench in flight.** Originally landed as research / design synthesis; the action plan below has been executed:
+- Phase 1 (quantizer): commit `83054300` — `--awq` / `--awq-alpha`, log-space scale computation, in-place `W' = W · diag(s)`, F16 sidecar `<weight>.awq_scale.weight` emission for MQ4G256 only. 5 unit tests, 36/36 quantizer suite green.
+- Phase 2a (runtime): commit `e51a3cd9` — `WeightTensor.awq_scale: Option<GpuTensor>` field, sidecar loader (F16→F32 host-side, F32 GpuTensor uploaded), `fused_rmsnorm_mq_rotate_awq` HIP kernel (Phase 1c divide-by-scale before FWHT; FWHT bytes-identical to non-AWQ variant), dispatch wrappers `fused_rmsnorm_rotate_mq_awq{,_batched}`.
+- Phase 2b (forward-pass dispatch): commit `a4265ce4` — `fused_rmsnorm_rotate_mq_batched_for` helper that auto-routes based on next-linear's `awq_scale`; 10 call sites in `qwen35.rs` converted (1 decode + 7 batched + 2 helpers).
+- Bench wiring (orthogonal fix): commit `21772a4d` — replaced broken `tail -1 serve.log | grep "warm-up complete"` race in `quant_cohort.sh` + `bench_humaneval_completion.sh` with a `/v1/models` poll. Surfaced by Stage 0 (Q8 floor) cohort returning `model not found` for smoke even though KLD/PPL scored fine.
+
+**Sidecar emission verified:** AWQ-quantized 9B has 248 `awq_scale` tensors (matches 32 layers × ~8 linears/layer); baseline has 0. AWQ-disabled code path is byte-identical to pre-AWQ.
+
+**Phase 3 bench in flight (2026-05-12 PM):** 3-variant cohort on Qwen3.5-9B (gfx1100, asym3 KV, prefill, 512 chunks): `q8f16` engine-drift control + `mq4-base` baseline + `mq4-awq` candidate. Results landing at `benchmarks/quality-baselines/results/2026-05-12-cohort-phase-a-stage-a-awq-9b/`. Q8 floor pre-measured at KLD 0.5735 — engine drift dominates the absolute number; AWQ delta is read as `KLD(mq4-awq) − KLD(mq4-base)`, not as fraction of absolute KLD.
+
+---
+
+**Original status (pre-2026-05-12 PM):** Research / design synthesis. Companion doc is "lightly validated"; spot-checks below confirm key claims. This doc is the action plan derived from those findings.
 
 ---
 
