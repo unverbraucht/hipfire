@@ -59,20 +59,41 @@ sleep 2
 echo "Starting daemon with model: $HFQ_PATH"
 HIPFIRE_DEFAULT_MODEL="$HFQ_PATH" hipfire serve 8080 -d 2>&1 | tail -2
 
-# Wait for warm-up.
+# Wait until /v1/models reports the requested model is registered. The CLI's
+# own `serve -d` polls /health before returning, but /v1/models is the
+# authoritative "right model is loaded" gate. Replaces the legacy
+# `tail -1 serve.log | grep "warm-up complete"` check, which broke when
+# serve.log had a stale "warm-up complete" line from the previous session
+# (the file is opened O_APPEND), and the `pgrep -af "examples/daemon"`
+# fallback that fired falsely because the CLI no longer spawns a process
+# named "examples/daemon" (it's `bun ... serve <port>` now).
+want=$(basename "$HFQ_PATH")
 warmup_start=$(date +%s)
-until tail -1 ~/.hipfire/serve.log 2>/dev/null | grep -q "warm-up complete"; do
-    sleep 5
-    if ! pgrep -af "examples/daemon" >/dev/null; then
-        echo "error: daemon failed to start"
-        exit 1
+ready=0
+tmp=$(mktemp)
+while [ $(( $(date +%s) - warmup_start )) -lt 300 ]; do
+    if curl -sS --max-time 3 -o "$tmp" http://127.0.0.1:8080/v1/models 2>/dev/null; then
+        if python3 -c "
+import sys, json
+try:
+    with open('$tmp') as f:
+        d = json.load(f)
+    sys.exit(0 if any(m.get('id','').endswith('$want') for m in d.get('data', [])) else 1)
+except Exception:
+    sys.exit(1)
+" 2>/dev/null; then
+            ready=1
+            break
+        fi
     fi
-    if [ $(( $(date +%s) - warmup_start )) -gt 300 ]; then
-        echo "error: warm-up timeout after 300s"
-        hipfire stop || true
-        exit 1
-    fi
+    sleep 2
 done
+rm -f "$tmp"
+if [ "$ready" != "1" ]; then
+    echo "error: daemon /v1/models did not list '$want' within 300s"
+    hipfire stop || true
+    exit 1
+fi
 
 MODEL_ID=$(curl -sS http://127.0.0.1:8080/v1/models 2>/dev/null \
     | python3 -c "import sys,json; ms=json.load(sys.stdin)['data']; n='$(basename "$HFQ_PATH")'; [print(m['id']) for m in ms if m['id'].endswith(n)]" \
