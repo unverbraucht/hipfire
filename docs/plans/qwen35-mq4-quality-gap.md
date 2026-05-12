@@ -487,6 +487,31 @@ Two prerequisite steps are added (Step 0 and Step 0.5) and every L4/L5 step gets
 
 Order matters because each step's bench harness validates the next.
 
+#### Phase A status as of 2026-05-12
+
+What landed:
+
+| Step | Status | Where |
+|---|---|---|
+| Step 0 — Bench expansion | ✅ shipped | `scripts/quant_cohort.sh` + `eval_hipfire` (via #113 / #233 / #235 / #236) |
+| Step 0.5 — Reproduce on gfx1100 | ✅ done (9B + 0.8B) | cohorts `2026-05-11-cohort-phase-a-step-0.5/` (9B), `2026-05-11-cohort-phase-a-0.8b-step-0.5+1+2/` (0.8B). 9B MFP4 reproduced fivetide's +25% PPL gap (we measured +38% on prefill mode); 0.8B reproduced +93.8% → +104% PPL gap |
+| Step 1+2 — L4 weighted-LS for HFP4/MFP4 | ✅ shipped, **mixed empirical result** | `crates/hipfire-quantize/src/main.rs` `--l4` flag (commit `739465c7`). Cohort: HFP4-L4 -1% KLD on 0.8B but +5.8% on 9B; MFP4-L4 -4% KLD on 9B but +6.6% on 0.8B. L4 in its current 3-candidate form is **rotation-and-model-size conditional**, not a clean lever — see §1.5 |
+| Step 3 — `--tensor-type` regex CLI | ⏸️ pending | Mechanism only; no quality change expected; not on critical path |
+| Step 4 — `imatrix_collect` | ✅ Tier 2 shipped | `crates/hipfire-runtime/examples/imatrix_collect.rs` (commit `c0deb3de`). Wraps `llama-imatrix` per pinned commit. Produced 9B + 0.8B imatrix.gguf at `benchmarks/quality-baselines/refs/qwen3.5-*-bf16.imatrix.gguf` |
+| Step 5a — L5c per-block weighted-LS | ✅ shipped, **mixed empirical result** | `crates/hipfire-quantize/src/main.rs` `--imatrix` flag (commit `2d050152`). Cohort: HFP4-L4-L5c -9% KLD on 0.8B (clean win), only +3% recovery on 9B (still WORSE than baseline) — see `2026-05-12-cohort-phase-a-step-5a-0.8b/comparison.md` |
+| Step 5a-prime — MFP4 imatrix handling | ✅ corrected (commit `1c3cd639`) | First fix (FWHT'd the imatrix) was mathematically wrong (sign bug). The actual correct treatment is **skip L5c for rotated formats** — the rotation flattens per-channel importance within blocks. MFP4-L4-L5c effectively reduces to MFP4-L4. |
+| Step 6a — native L5d (imatrix-driven allocation) | ⏸️ pending | Depends on Step 4 imatrix data (have it). Not started; deferred behind the AWQ/GPTQ pivot below. |
+| Step 6b — UD decompile | ✅ tool shipped, kmap ingestion pending | `crates/hipfire-quantize/src/bin/ud_decompile.rs` (commit `679bff46`). Qwen3.5-9B UD-Q4_K_XL kmap artifact landed at `benchmarks/quality-baselines/external/ud-decompile/`. `--kmap-file` consumer not yet implemented. |
+| Step 7 — A3B reasoning smoke | ⏸️ pending | Gated on best Phase A configuration emerging |
+
+Three big surprises:
+
+1. **L4 (pure-MSE candidate search) is directionally a coin-flip vs model quality.** Four data points (2 sizes × 2 formats): two consistent + two inverted. Documented in `2026-05-12-cohort-phase-a-step-5a-9b/comparison.md` §2.2.
+2. **L5c (per-block activation-weighted LS) is rotation-incompatible by math.** For FWHT-rotated weights, `Var[x_rot[i]] = Σ_j Var[x[j]]` — constant across rotated channels within a 256-segment. The per-channel weighting lever has nothing to weight. Documented in `2026-05-12-cohort-phase-a-step-5a-9b/comparison.md` §2.3.
+3. **The gap to Unsloth is much bigger at bpw-matched comparison.** GGUF anchor data (commit `6c00a558`) shows hipfire MQ4 at +75% PPL vs UD-Q3_K_XL despite hipfire using +0.37 more bits per weight. The earlier "+62% vs UD-Q4_K_XL" framing was cross-bpw and made the gap look smaller than it is. Documented in `2026-05-12-cohort-phase-a-step-5a-9b/comparison.md` §2.1 + `docs/plans/mq4v2-format-proposal.md` §1.
+
+The pivot below adjusts Phase A in response to these findings.
+
 **Step 0 — Bench expansion (3–5 days). Prerequisite for everything below.**
 
 Today's `scripts/bench_quant_quality.sh` emits MSE + final-norm sanity + train-pursuit smoke test. That's not enough to distinguish PPL-good-KLD-bad from PPL-bad-KLD-good. Extend the bench to emit, per format variant:
@@ -612,6 +637,62 @@ Decision: at this point we have, for each baseline format × calibration combina
 
 **Expected end state of Phase A:** decision made on evidence. The original "Phase A delivers KLD-mean 0.10–0.20" projection was based on per-weight-MSE extrapolation; it should be treated as a hopeful ceiling, not a target. The honest target is "deliver enough data to choose a default with confidence." Multi-format calibrated quants land for whichever model × format combination measures best, with explicit "different default format per arch" tolerated if the data supports it. **All without a wire-format change** — the wire-format extensibility analysis in §3 stands regardless of which element format ends up the winner.
 
+### Phase A revised (2026-05-12) — AWQ/GPTQ pivot, MQ4K deferred
+
+The Step 5a + 9B GGUF-anchor cohort findings (summarized in the status block above) re-prioritize Phase A. Steps 1-7 as written stay valid as documentation of what was tried and what landed; what changes is *what comes next*.
+
+**The pivot in one paragraph.** L5c per-block weighted-LS only partially works: clean +9% KLD win on 0.8B HFP4 but only +3% recovery (still worse than baseline) on 9B HFP4, and mathematically incompatible with rotated formats. Meanwhile the GGUF anchors expose a bpw-matched PPL gap of +75% to UD-Q3_K_XL despite hipfire using +0.37 more bits/weight — the calibration lever (in our per-block form) isn't closing this. The natural conclusion is to try a different calibration mechanism (AWQ's per-channel pre-scaling + GPTQ's Hessian-aware sequential quantization) on the existing MQ4 wire format, both of which compose with hipfire's rotation lever and require no kernel migration.
+
+**Stage A — AWQ on MQ4 (~1.5-2 weeks, no kernel migration). Top priority.**
+
+Per-channel AWQ scale calibration from existing imatrix data. Pre-scale weights `W' = W · diag(s)` before quantization; at inference, divide activations by `s` before the rotation kernel (foldable into RMSNorm, or as a tiny vector-divide kernel before `mq_rotate_x`). The math `(W·s) · (rot(x)/s) = W·rot(x)` cancels exactly — full derivation in `mq4v2-format-proposal.md` §0.
+
+What ships:
+- Quantizer-side: AWQ scale computation (per linear layer, from imatrix), pre-quantize weight scaling
+- Wire format extension: per-tensor FP16 scale vector (length K). Tiny — ~256 KB total for 9B; either sidecar or per-tensor header field
+- Runtime: tiny pre-rotation kernel mod (apply `x / s` before existing `mq_rotate_x`)
+- Bench: 9B + 0.8B cohort, against UD-Q3_K_XL anchor
+
+Predicted lever value (from AWQ literature on Q4 quants): +15-20% PPL improvement. Composes with FWHT rotation.
+
+**Stage B — GPTQ on MQ4 (~2 weeks, zero kernel/format change). Stacks with A.**
+
+Hessian-aware column-by-column sequential quantization. Output is still MQ4 wire format — just better INT4 placement that minimizes the loss-weighted reconstruction error instead of per-element MSE.
+
+What ships:
+- Calibration extension: extend `imatrix_collect` (or add a sibling tool) to dump per-layer `X^T X` (full Hessian) in addition to the diagonal `Σ act²` that current imatrix carries
+- Quantizer-side: GPTQ algorithm in the MQ4 path
+- **Zero wire format change. Zero kernel change.** Same .hfq files load identically
+- Bench: stack on Stage A's calibrated-MQ4-with-AWQ
+
+Predicted lever value: +15-25% PPL improvement on top of RTN. Composes additively with AWQ.
+
+**Stage C — Step 6b kmap ingestion (~1-2 days). Cheap orthogonal lever.**
+
+Already have the UD-Q4_K_XL kmap artifact for 9B (commit `679bff46`). Implement the `--kmap-file` CLI flag in the quantizer that overrides the hardcoded K-map rules with a JSON-driven per-tensor allocation. Apply Unsloth's per-tensor promotion choices to hipfire format equivalents. Bench in matrix with Stages A + B.
+
+**Stage D — MQ4K wire format prototype (~5-7 weeks). DEFERRED.**
+
+Only fires if Stages A + B + C don't close the bpw-matched gap to UD-Q3_K_XL meaningfully (target: 60%+ of the gap closed). Tracked in `docs/plans/mq4v2-format-proposal.md` with Stage 1 / Stage 2 / Stage 3 sub-decomposition.
+
+**Stage 0 prerequisite (in flight as of 2026-05-12) — Hipfire Q8 baseline cohort (~30 min wall).**
+
+Quantize 9B as `--format q8f16` (near-lossless per-tensor — measured 2.63e-8 mean MSE, 113× lower than MFP4). Run the standard cohort. The resulting KLD vs llama.cpp BF16 measures the **engine-drift floor** — the KLD that hipfire produces even when the quant is near-lossless. Without this number, "Stage A closes X% of the gap" can't be interpreted (X% of what? — depends on whether the floor is 0.05 or 0.5 KLD).
+
+This unblocks meaningful interpretation of every subsequent calibration measurement.
+
+**Sequencing summary:**
+
+| stage | wall budget | gates | strategic priority |
+|---|---|---|---|
+| Stage 0 (Q8 floor cohort) | ~30 min | none | critical: required interpretation prerequisite |
+| Stage A (AWQ) | ~1.5-2 weeks | Stage 0 | **highest** — cheapest path to a meaningful quality win |
+| Stage B (GPTQ) | ~2 weeks | optional after Stage A | high — stacks additively |
+| Stage C (UD kmap) | ~1-2 days | independent of A/B | medium — small effort, orthogonal lever |
+| Stage D (MQ4K) | ~5-7 weeks | DEFERRED, gated on A+B+C | only if needed |
+
+**What the Steps 1-7 work above bought us even though the pivot reframes the plan:** the infrastructure to MEASURE all of this is in place — `quant_cohort.sh`, `eval_hipfire`, `imatrix_collect`, `ud_decompile`, BF16 kldref files for 9B and 0.8B. The bench loop is ~25 minutes per cohort variant on 9B. Stage A AWQ can iterate against measurement at that cadence, which is the engineering velocity needed to actually validate a calibration lever empirically (not just predict its impact from a lever-decomposition spreadsheet).
+
 ### Phase B — Format-family fillout (3–4 weeks, can run in parallel with Phase A)
 
 8. HFP3G32 (qt=30) — E2M0 + UE8M0 + FP16 row. Quantizer + correctness-anchor kernel. Bench: 3.0 bpw with median MSE ~3× of HFP4G32, but on dormant tensors (low ZD score) the model-aggregate KLD impact is negligible.
@@ -668,6 +749,26 @@ The question we set out to answer: *"what's the current problem, and how do we g
 If Phase A delivers what the lever-by-lever math predicts, hipfire ships an MFP4 + calibrated quantizer that **beats UD-Q4_K_XL on KLD at equal bpw, while also being 70–75% of theoretical FP16 WMMA throughput on RDNA3+**. That's a quality lead AND a perf lead, on a wire format we own.
 
 The risk is Phase 11's lesson: the A3B `<think>` spiral was not closed by reducing per-weight noise. If after Phase A the spiral still fires, the answer is not more quantization work; it's the runtime-side investigation noted in `docs/plans/qwen35-moe-coherence-investigation.md` §"Phase 11 engine-pass implications" (sampler intervention, vLLM FP16-router contract, period-N block-attractor detection). Quantization closes the quality gap; runtime closes the residual coherence risk.
+
+### 6.1 Update 2026-05-12 — what changed after the cohort
+
+The strategic claims above were authored before the Step 0.5 / Step 1+2 / Step 5a cohorts and the GGUF-anchor cross-reference. Three updates:
+
+**Update 1 — HFP4 vs MQ4 as the "format to commit to" is genuinely open.** The §1.5 cohort surfaced that MFP4 baseline measures +37% KLD over MQ4 baseline at 9B (and +94% at 0.8B). Even calibrated, HFP4-L4-L5c at 9B is +3% KLD over the uncalibrated HFP4 baseline (and HFP4 baseline itself is +21% over MQ4). At bpw-matched comparison MQ4 is the clearer Phase A baseline, not MFP4. The "HFP4 is the format for several years" claim above is **suspended pending evidence that calibrated-HFP4 outperforms calibrated-MQ4** — that measurement doesn't exist yet (Step 5b for MQ4 calibration isn't built; current plan pivots to AWQ/GPTQ on MQ4 instead — see §5 Phase A revised).
+
+**Update 2 — the calibration mechanism mattered more than the gap doc projected.** The lever-by-lever framing predicted L5c would close most of the gap. Empirically L5c (per-block weighted-LS) gave +9% KLD on 0.8B HFP4 and ~0% net on 9B HFP4, and is math-incompatible with rotated formats. The pivot to AWQ (per-channel pre-scaling, composes with rotation) + GPTQ (Hessian-aware sequential, zero infrastructure change) is the response — both are quantizer-side improvements on the existing MQ4 wire format that don't require the wire-format change implied by "ship HFP4 for several years."
+
+**Update 3 — the bpw-matched UD anchor gap is bigger than the framing acknowledged.** Hipfire MQ4 sits at +75% PPL behind UD-Q3_K_XL at hipfire's actual aggregate bpw (~4.87) and Unsloth's matched anchor (~4.50), DESPITE hipfire having +0.37 more bits per weight. Closing this gap is the real Phase A target; the gap doc §2.4 estimate ("a couple levers behind Unsloth at equal bpw") understated the work. Detail: `docs/plans/mq4v2-format-proposal.md` §1 + the 9B cohort comparison.
+
+**What's robust about the original strategic claim:**
+- Rotation is a unique hipfire lever that no GGUF variant has (kept in all paths forward)
+- Wire-format extensibility analysis (§3) still holds — when we DO need to extend, we have headroom
+- Runtime-side coherence work (Phase 11 lessons) is orthogonal — none of the Phase A cohort surprises change that
+
+**What changes:**
+- The default format isn't pre-committed. Step 5b on MQ4 (via AWQ/GPTQ — §5 Phase A revised) decides.
+- The "HFP4 + calibration beats UD-Q4_K_XL" projection is downgraded from "predicted" to "open empirical question pending Stage A+B+C measurement"
+- MQ4K (new wire format with Q4_K-style sub-scaling, per `mq4v2-format-proposal.md`) is the fallback option if AWQ+GPTQ on MQ4 don't close the gap. Not Phase A's first lever, but the cost is bounded (~5-7 weeks total deployment) and the decision criterion is clear.
 
 ---
 
