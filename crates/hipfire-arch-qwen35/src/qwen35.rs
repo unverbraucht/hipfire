@@ -4,6 +4,7 @@
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{self, f16_to_f32, EmbeddingFormat, WeightTensor, weight_gemv,
                               weight_gemv_prerotated, fused_rmsnorm_rotate_for_mq,
+                              fused_rmsnorm_rotate_mq_batched_for,
                               weight_gemv_residual, weight_gemv_swiglu_residual};
 use hipfire_runtime::multi_gpu::Gpus;
 use crate::speculative::HiddenStateRingBuffer;
@@ -4007,8 +4008,12 @@ fn prefill_moe_ffn_body_batched(
     let rot_batch     = pbs.moe_rot_batch.as_ref().expect("moe scratch");
 
     // ── 1. rmsnorm + FWHT pre-rotate for MQ4 inputs ──
-    gpu.fused_rmsnorm_rotate_mq_batched(
-        &pbs.x_batch, ffn_norm, &pbs.x_rot_batch, dim, config.norm_eps, n,
+    // AWQ-aware: dispatches the _awq_batched kernel if ffn.router carries
+    // an awq_scale sidecar (Phase A Stage A — Q/router/shared all share
+    // the same input rmsnorm output, so any of their AWQ scales is
+    // mathematically equivalent; pick router as canonical).
+    fused_rmsnorm_rotate_mq_batched_for(
+        gpu, &pbs.x_batch, ffn_norm, &ffn.router, &pbs.x_rot_batch, dim, config.norm_eps, n,
     )?;
 
     // ── 2. Router + shared-gate + shared.gate + shared.up (4 batched GEMMs) ──
@@ -4331,8 +4336,9 @@ fn forward_prefill_chunk(
                 // we reuse x_rot_batch as the "normed, unrotated" output
                 // so the subsequent GEMM can read it the same way.
                 if is_mq {
-                    gpu.fused_rmsnorm_rotate_mq_batched(
-                        &pbs.x_batch, &layer.attn_norm, &pbs.x_rot_batch, dim, config.norm_eps, n,
+                    // AWQ-aware: next linear is LA's fused wqkv.
+                    fused_rmsnorm_rotate_mq_batched_for(
+                        gpu, &pbs.x_batch, &layer.attn_norm, &layer.wqkv, &pbs.x_rot_batch, dim, config.norm_eps, n,
                     )?;
                 } else {
                     gpu.rmsnorm_batched(
@@ -4562,8 +4568,9 @@ fn forward_prefill_chunk(
                 let ffn_is_mq3_lloyd = matches!(layer.w_gate.gpu_dtype, DType::MQ3G256Lloyd);
                 let ffn_is_fp4 = matches!(layer.w_gate.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
                 if ffn_is_mq {
-                    gpu.fused_rmsnorm_rotate_mq_batched(
-                        &pbs.x_batch, &layer.ffn_norm, &pbs.x_rot_batch, dim, config.norm_eps, n,
+                    // AWQ-aware: next linear is w_gate (gate/up share input → same AWQ scale).
+                    fused_rmsnorm_rotate_mq_batched_for(
+                        gpu, &pbs.x_batch, &layer.ffn_norm, &layer.w_gate, &pbs.x_rot_batch, dim, config.norm_eps, n,
                     )?;
                 } else {
                     gpu.rmsnorm_batched(
@@ -4690,8 +4697,9 @@ fn forward_prefill_chunk(
 
                 // 1. rmsnorm (+ rotate for MQ) for the attn preamble.
                 if qkv_is_mq {
-                    gpu.fused_rmsnorm_rotate_mq_batched(
-                        &pbs.x_batch, &layer.attn_norm, &pbs.x_rot_batch, dim, config.norm_eps, n,
+                    // AWQ-aware: next linear is wq (Q/K/V share input → same AWQ scale).
+                    fused_rmsnorm_rotate_mq_batched_for(
+                        gpu, &pbs.x_batch, &layer.attn_norm, &layer.wq, &pbs.x_rot_batch, dim, config.norm_eps, n,
                     )?;
                 } else {
                     gpu.rmsnorm_batched(
@@ -5016,8 +5024,9 @@ fn forward_prefill_chunk(
                 let fa_ffn_is_mq3_lloyd = matches!(layer.w_gate.gpu_dtype, DType::MQ3G256Lloyd);
                 let fa_ffn_is_fp4 = matches!(layer.w_gate.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
                 if fa_ffn_is_mq {
-                    gpu.fused_rmsnorm_rotate_mq_batched(
-                        &pbs.x_batch, &layer.ffn_norm, &pbs.x_rot_batch, dim, config.norm_eps, n,
+                    // AWQ-aware: next linear is w_gate (FA-FFN, gate/up share input).
+                    fused_rmsnorm_rotate_mq_batched_for(
+                        gpu, &pbs.x_batch, &layer.ffn_norm, &layer.w_gate, &pbs.x_rot_batch, dim, config.norm_eps, n,
                     )?;
                 } else {
                     gpu.rmsnorm_batched(
@@ -5167,8 +5176,9 @@ fn forward_prefill_chunk(
                 let is_6bit = matches!(layer.wqkv.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
 
                 if is_mq {
-                    gpu.fused_rmsnorm_rotate_mq_batched(
-                        &pbs.x_batch, &layer.attn_norm, &pbs.x_rot_batch, dim, config.norm_eps, n,
+                    // AWQ-aware: next linear is LA's fused wqkv.
+                    fused_rmsnorm_rotate_mq_batched_for(
+                        gpu, &pbs.x_batch, &layer.attn_norm, &layer.wqkv, &pbs.x_rot_batch, dim, config.norm_eps, n,
                     )?;
                 } else {
                     gpu.rmsnorm_batched(
@@ -5328,8 +5338,9 @@ fn forward_prefill_chunk(
                 let qkv_is_6bit = matches!(layer.wq.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
 
                 if qkv_is_mq {
-                    gpu.fused_rmsnorm_rotate_mq_batched(
-                        &pbs.x_batch, &layer.attn_norm, &pbs.x_rot_batch, dim, config.norm_eps, n,
+                    // AWQ-aware: next linear is wq (Q/K/V share input → same AWQ scale).
+                    fused_rmsnorm_rotate_mq_batched_for(
+                        gpu, &pbs.x_batch, &layer.attn_norm, &layer.wq, &pbs.x_rot_batch, dim, config.norm_eps, n,
                     )?;
                 } else {
                     gpu.rmsnorm_batched(
