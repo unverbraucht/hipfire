@@ -184,6 +184,38 @@ fi
 # read from disk to avoid newline-normalization drift.
 PROMPT='A train leaves Station A traveling at 60 km/h. Two hours later, a second train leaves Station A on the same track traveling at 90 km/h. How long after the second train departs will it catch up to the first? Show your reasoning step by step.'
 
+# wait_for_model_ready <hfq_path> [timeout_sec]
+# Polls /v1/models until the requested model is registered. Returns 0 on success.
+# Used after `hipfire serve -d` returns (the CLI already polls /health before
+# exiting). The legacy `tail -1 serve.log | grep "warm-up complete"` check is
+# broken because serve.log is opened O_APPEND — a stale "warm-up complete" line
+# from the previous session passes the gate before the new daemon binds. And
+# `pgrep -af "examples/daemon"` doesn't match anymore — the CLI now spawns
+# `bun ... serve <port>`, not a standalone daemon binary.
+wait_for_model_ready() {
+    local hfq_path="$1"; local timeout="${2:-120}"
+    local want; want=$(basename "$hfq_path")
+    local start; start=$(date +%s)
+    local tmp; tmp=$(mktemp)
+    while [ $(( $(date +%s) - start )) -lt "$timeout" ]; do
+        if curl -sS --max-time 3 -o "$tmp" http://127.0.0.1:8080/v1/models 2>/dev/null; then
+            if python3 -c "
+import sys, json
+try:
+    with open('$tmp') as f:
+        d = json.load(f)
+    sys.exit(0 if any(m.get('id','').endswith('$want') for m in d.get('data', [])) else 1)
+except Exception:
+    sys.exit(1)
+" 2>/dev/null; then
+                rm -f "$tmp"; return 0
+            fi
+        fi
+        sleep 2
+    done
+    rm -f "$tmp"; return 1
+}
+
 # ─── Per-variant loop ────────────────────────────────────────────────────
 while IFS=$'\t' read -r VARIANT HFQ_PATH ARCH; do
     # Skip blank/comment rows.
@@ -357,12 +389,13 @@ print(s)
         # Default mode
         hipfire stop 2>&1 | head -1 || true; sleep 2
         HIPFIRE_DEFAULT_MODEL="$HFQ_PATH" hipfire serve 8080 -d 2>&1 | tail -1 >/dev/null
-        warmup_start=$(date +%s)
-        until tail -1 ~/.hipfire/serve.log 2>/dev/null | grep -q "warm-up complete"; do
-            sleep 5
-            if ! pgrep -af "examples/daemon" >/dev/null; then break; fi
-            if [ $(( $(date +%s) - warmup_start )) -gt 300 ]; then break; fi
-        done
+        if ! wait_for_model_ready "$HFQ_PATH" 300; then
+            SMOKE_DEFAULT="ERR_DAEMON_NOT_READY"
+            SMOKE_WORKAROUND="ERR_DAEMON_NOT_READY"
+            hipfire stop 2>&1 | head -1 || true
+            echo "| ${VARIANT} | ${ARCH} | ${MSE_MEAN} | ${KLD_MEAN} | ${KLD_P99} | ${PPL_VAL} | ${HE_TOK_SUM} | ${SMOKE_DEFAULT} | ${SMOKE_WORKAROUND} |" >> "$PROGRESS"
+            continue
+        fi
 
         MODEL_ID=$(curl -sS http://127.0.0.1:8080/v1/models 2>/dev/null \
             | python3 -c "import sys,json; ms=json.load(sys.stdin)['data']; n='$(basename "$HFQ_PATH")'; [print(m['id']) for m in ms if m['id'].endswith(n)]" \
@@ -393,12 +426,12 @@ except Exception as e:
         # Workaround mode (HIPFIRE_QWEN_MOE_FINAL_NORM_RAW=1)
         sleep 2
         HIPFIRE_QWEN_MOE_FINAL_NORM_RAW=1 HIPFIRE_DEFAULT_MODEL="$HFQ_PATH" hipfire serve 8080 -d 2>&1 | tail -1 >/dev/null
-        warmup_start=$(date +%s)
-        until tail -1 ~/.hipfire/serve.log 2>/dev/null | grep -q "warm-up complete"; do
-            sleep 5
-            if ! pgrep -af "examples/daemon" >/dev/null; then break; fi
-            if [ $(( $(date +%s) - warmup_start )) -gt 300 ]; then break; fi
-        done
+        if ! wait_for_model_ready "$HFQ_PATH" 300; then
+            SMOKE_WORKAROUND="ERR_DAEMON_NOT_READY"
+            hipfire stop 2>&1 | head -1 || true
+            echo "| ${VARIANT} | ${ARCH} | ${MSE_MEAN} | ${KLD_MEAN} | ${KLD_P99} | ${PPL_VAL} | ${HE_TOK_SUM} | ${SMOKE_DEFAULT} | ${SMOKE_WORKAROUND} |" >> "$PROGRESS"
+            continue
+        fi
         timeout 300 curl -sS http://127.0.0.1:8080/v1/chat/completions \
             -H 'Content-Type: application/json' -d "$body" > "${PV}.smoke-workaround.json" 2>&1 || true
 
