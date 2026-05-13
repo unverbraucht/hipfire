@@ -5987,6 +5987,42 @@ fn dump_dn_inputs(
     Ok(())
 }
 
+/// Generic per-stage hidden-state dump for the engine-drift residual audit
+/// (`docs/investigations/2026-05-13-engine-drift-residual-audit/`).
+/// Writes append-only records: [u32×8 header { layer_idx, pos, stage_id,
+/// n_elems, 0,0,0,0 }] + [f32 × n_elems]. The Python comparator groups by
+/// stage_id and computes per-stage rel_L2 / cos vs an HF transformers BF16
+/// oracle. Stage IDs are documented in the investigation summary.
+fn dump_la_stage(
+    gpu: &mut Gpu,
+    path: &str,
+    stage_id: u32,
+    layer_idx: usize,
+    pos: usize,
+    buf: &GpuTensor,
+    n_elems: usize,
+) -> HipResult<()> {
+    use std::io::Write;
+    let host = gpu.download_f32(buf)?;
+    assert!(host.len() >= n_elems,
+        "dump_la_stage stage {stage_id}: host len {} < n_elems {n_elems}",
+        host.len());
+    let mut f = std::fs::OpenOptions::new()
+        .create(true).append(true).open(path)
+        .unwrap_or_else(|e| panic!("dump_la_stage open {path}: {e}"));
+    let hdr = [
+        layer_idx as u32, pos as u32,
+        stage_id, n_elems as u32,
+        0u32, 0u32, 0u32, 0u32,
+    ];
+    for w in hdr.iter() { f.write_all(&w.to_le_bytes()).unwrap(); }
+    let bytes = unsafe {
+        std::slice::from_raw_parts(host.as_ptr() as *const u8, n_elems * 4)
+    };
+    f.write_all(bytes).unwrap();
+    Ok(())
+}
+
 /// Companion to `dump_dn_inputs` — captures only the raw post-w_alpha
 /// projection alpha (i.e. `s.dn_alpha` BEFORE `fused_sigmoid_alpha_gate`).
 /// Same file format as dump_dn_inputs but only the alpha slot is written
@@ -6044,9 +6080,25 @@ fn forward_scratch_layers(
     let mut delta_layer_idx = 0usize;
     let mut kv_layer_idx = 0usize;
 
+    // Engine-drift residual audit: env-gated diagnostic dumps. Reading once
+    // here per forward rather than per-layer-per-position keeps the hot path
+    // free of ~24 std::env::var calls per decoded token when probes are off.
+    let dump_dn_inputs_path = std::env::var("HIPFIRE_DUMP_DN_INPUTS").ok();
+    let dump_a_raw_path = std::env::var("HIPFIRE_DUMP_A_RAW").ok();
+    let dump_la_stages_path = std::env::var("HIPFIRE_DUMP_LA_STAGES").ok();
+    let dump_target_layer = std::env::var("HIPFIRE_DUMP_DN_LAYER")
+        .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(4);
+
     for layer_idx in 0..config.n_layers {
         match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
             (LayerWeights::DeltaNet(layer), LayerType::LinearAttention) => {
+                // Stage 0 — LA block input (residual stream pre-rmsnorm).
+                if let Some(p) = dump_la_stages_path.as_deref() {
+                    if layer_idx == dump_target_layer {
+                        dump_la_stage(gpu, p, 0, layer_idx, pos, &s.x, dim)?;
+                    }
+                }
+
                 // Fused RMSNorm + FWHT rotation (Phase 3.6). For MQ4 weights this
                 // writes rmsnorm(x) followed by FWHT into s.x_rot in a single
                 // kernel launch. For non-MQ weights it falls back to plain rmsnorm
@@ -6054,6 +6106,16 @@ fn forward_scratch_layers(
                 let x_rot = fused_rmsnorm_rotate_for_mq(
                     gpu, &layer.wqkv, &s.x, &layer.attn_norm, &s.tmp, &s.x_rot, config.norm_eps,
                 )?;
+
+                // Stage 1 — post-rmsnorm (s.tmp). For MQ-family weights the
+                // post-FWHT-rotated buffer x_rot is what feeds the projection,
+                // but s.tmp also holds the unrotated rmsnorm output for q8f16
+                // path (HF oracle parity). The audit targets q8f16 first.
+                if let Some(p) = dump_la_stages_path.as_deref() {
+                    if layer_idx == dump_target_layer {
+                        dump_la_stage(gpu, p, 1, layer_idx, pos, &s.tmp, dim)?;
+                    }
+                }
                 // Cross-arch fast path: one fused 4-way projection kernel
                 // (wqkv + wz + w_beta + w_alpha) in a single launch. Works
                 // for BOTH MQ4 (weights FWHT-rotated, input x_rot FWHT-rotated)
@@ -6117,15 +6179,23 @@ fn forward_scratch_layers(
                     weight_gemv_prerotated(gpu, &layer.w_beta, &s.tmp, x_rot, &s.dn_beta)?;
                     weight_gemv_prerotated(gpu, &layer.w_alpha, &s.tmp, x_rot, &s.dn_alpha)?;
                 }
-                // Probe (in-place): HIPFIRE_DUMP_A_RAW=<path> +
-                // HIPFIRE_DUMP_DN_LAYER=<idx> captures the post-w_alpha-projection
-                // alpha scalar-per-head value BEFORE the sigmoid_alpha_gate
-                // transform fires. Bisects whether alpha drift originates in
-                // projection or in the softplus/A_log/dt_bias transform.
-                if let Some(p) = std::env::var("HIPFIRE_DUMP_A_RAW").ok().as_deref() {
-                    let target = std::env::var("HIPFIRE_DUMP_DN_LAYER")
-                        .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(4);
-                    if layer_idx == target {
+                // Stage 2 — post-projection (raw qkv, z, alpha, beta).
+                // Four separate records since dim layouts differ.
+                if let Some(p) = dump_la_stages_path.as_deref() {
+                    if layer_idx == dump_target_layer {
+                        dump_la_stage(gpu, p, 2, layer_idx, pos, &s.dn_qkv, qkv_dim)?;
+                        dump_la_stage(gpu, p, 3, layer_idx, pos, &s.dn_z, v_dim)?;
+                        dump_la_stage(gpu, p, 4, layer_idx, pos, &s.dn_alpha, n_v_heads)?;
+                        dump_la_stage(gpu, p, 5, layer_idx, pos, &s.dn_beta, n_v_heads)?;
+                    }
+                }
+
+                // Legacy probe: HIPFIRE_DUMP_A_RAW captures post-w_alpha alpha
+                // in its own on-disk format consumed by `compare_dn_inputs.py`.
+                // Stage 4 above writes the same data in the unified per-stage
+                // format. Both gates can coexist.
+                if let Some(p) = dump_a_raw_path.as_deref() {
+                    if layer_idx == dump_target_layer {
                         dump_a_raw(gpu, p, layer_idx, pos, &s.dn_alpha, n_v_heads)?;
                     }
                 }
@@ -6137,6 +6207,14 @@ fn forward_scratch_layers(
                     &s.dn_beta, &s.dn_alpha, &layer.dt_bias, &layer.a_log, n_v_heads,
                 )?;
 
+                // Stage 6/7 — post sigmoid_alpha_gate gated alpha + beta.
+                if let Some(p) = dump_la_stages_path.as_deref() {
+                    if layer_idx == dump_target_layer {
+                        dump_la_stage(gpu, p, 6, layer_idx, pos, &s.dn_alpha, n_v_heads)?;
+                        dump_la_stage(gpu, p, 7, layer_idx, pos, &s.dn_beta, n_v_heads)?;
+                    }
+                }
+
                 // Fused conv1d+SiLU+split: writes directly to q_raw/k_raw/v,
                 // eliminating the 3 DtoD copies that used to follow a
                 // contiguous conv1d_silu into dn_conv_out.
@@ -6146,6 +6224,15 @@ fn forward_scratch_layers(
                     &dn_state.conv_states[delta_layer_idx],
                     k_dim, v_dim,
                 )?;
+
+                // Stage 8/9/10 — post conv1d_silu_split (q_raw, k_raw, v).
+                if let Some(p) = dump_la_stages_path.as_deref() {
+                    if layer_idx == dump_target_layer {
+                        dump_la_stage(gpu, p, 8, layer_idx, pos, &s.dn_q_raw, k_dim)?;
+                        dump_la_stage(gpu, p, 9, layer_idx, pos, &s.dn_k_raw, k_dim)?;
+                        dump_la_stage(gpu, p, 10, layer_idx, pos, &s.dn_v, v_dim)?;
+                    }
+                }
 
                 // Fused: l2_norm(q_raw) + l2_norm(k_raw) + scale(q_raw).
                 // Three launches collapsed to one — saves ~2 dispatches per
@@ -6158,6 +6245,14 @@ fn forward_scratch_layers(
                     1.0 / (hd as f32).sqrt(),
                     config.norm_eps,
                 )?;
+
+                // Stage 11/12 — post l2norm+scale (q_raw, k_raw, pre-GQA-expand).
+                if let Some(p) = dump_la_stages_path.as_deref() {
+                    if layer_idx == dump_target_layer {
+                        dump_la_stage(gpu, p, 11, layer_idx, pos, &s.dn_q_raw, k_dim)?;
+                        dump_la_stage(gpu, p, 12, layer_idx, pos, &s.dn_k_raw, k_dim)?;
+                    }
+                }
 
                 // Repeat-interleave Q/K if needed.
                 // Phase 3a-A fix: replace per-head memcpy loop with one fused kernel.
@@ -6178,18 +6273,14 @@ fn forward_scratch_layers(
                     gpu.memcpy_dtod_auto(&s.dn_k.buf, &s.dn_k_raw.buf, k_dim * 4)?;
                 }
 
-                // Probe: HIPFIRE_DUMP_DN_INPUTS=<path> + HIPFIRE_DUMP_DN_LAYER=<idx>
-                // captures Q/K/V/α/β at the recurrence input for one target LA
-                // layer per chunk. Used to bisect upstream-of-DeltaNet drift
-                // sources against an HF transformers oracle. Diagnostic-only,
-                // single-position-per-call append; the dispatcher is a wrapper
-                // function so the hot path stays branchless when the env-var
-                // is unset.
-                let dump_path = std::env::var("HIPFIRE_DUMP_DN_INPUTS").ok();
-                if let Some(path) = dump_path.as_deref() {
-                    let target = std::env::var("HIPFIRE_DUMP_DN_LAYER")
-                        .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(4);
-                    if layer_idx == target {
+                // Legacy probe: HIPFIRE_DUMP_DN_INPUTS captures Q/K/V/α/β at
+                // the recurrence input in its own on-disk format consumed by
+                // `compare_dn_inputs.py`. Stages 11/12 + 6/7 + 10 above cover
+                // the same data in the unified per-stage format (post GQA
+                // expand for stages 11/12 → dn_q/dn_k vs dn_q_raw/dn_k_raw is
+                // a no-op when n_key == n_value).
+                if let Some(path) = dump_dn_inputs_path.as_deref() {
+                    if layer_idx == dump_target_layer {
                         dump_dn_inputs(gpu, path, layer_idx, pos,
                             &s.dn_q, &s.dn_k, &s.dn_v, &s.dn_alpha, &s.dn_beta,
                             n_v_heads, config.linear_value_head_dim,
@@ -6217,10 +6308,35 @@ fn forward_scratch_layers(
                     )?,
                 }
 
+                // Stage 13 — post-recurrence (gated_delta_net output).
+                if let Some(p) = dump_la_stages_path.as_deref() {
+                    if layer_idx == dump_target_layer {
+                        dump_la_stage(gpu, p, 13, layer_idx, pos, &s.dn_attn_out, v_dim)?;
+                    }
+                }
+
                 gpu.gated_norm_f32(&s.dn_attn_out, &s.dn_z, &layer.norm_weight, &s.dn_normed,
                     n_v_heads, config.linear_value_head_dim, config.norm_eps)?;
+
+                // Stage 14 — post gated_norm (= input to wo).
+                if let Some(p) = dump_la_stages_path.as_deref() {
+                    if layer_idx == dump_target_layer {
+                        dump_la_stage(gpu, p, 14, layer_idx, pos, &s.dn_normed, v_dim)?;
+                    }
+                }
+
                 // Fused wo GEMV + residual add: s.x += layer.wo * s.dn_normed
                 weight_gemv_residual(gpu, &layer.wo, &s.dn_normed, &s.x)?;
+
+                // Stage 15 — LA block output (post wo + residual). Equal to
+                // stage 0 of the next layer when the FFN block doesn't run
+                // between — but Qwen3.5 always has an FFN after each LA, so
+                // stage 15 of layer N is the *pre-FFN-norm* residual.
+                if let Some(p) = dump_la_stages_path.as_deref() {
+                    if layer_idx == dump_target_layer {
+                        dump_la_stage(gpu, p, 15, layer_idx, pos, &s.x, dim)?;
+                    }
+                }
 
                 // FFN: fused rmsnorm + rotate for w_gate/w_up.
                 let x_rot = fused_rmsnorm_rotate_for_mq(
