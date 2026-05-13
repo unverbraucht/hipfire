@@ -959,6 +959,32 @@ Implementation cost: ~2-3 h. `hipfire-quantize` already has `HIPFIRE_QUANTIZE_LM
   - Floor drops → confirm "quant noise amplified by recurrence" as the source. The fix path is then: (a) accept the floor as the cost of Q8 quantization on Qwen3.5-LA layers, (b) ship higher-precision DeltaNet layers (BF16 LA only) for quality-sensitive runs, or (c) calibrated GPTQ on the LA layer projections.
   - Floor doesn't drop → bisect the upstream stages with similar dump-and-compare passes; one of GLM-5's "clean" verdicts has a subtle issue.
 
+**RESULT — GLM-5's Finding 2 is REFUTED (2026-05-13).**
+
+Added `HIPFIRE_QUANTIZE_LA_F16=1` env-gate in hipfire-quantize that forces every `linear_attn.{in_proj_qkv,in_proj_z,in_proj_a,in_proj_b,out_proj}.weight` to `QuantLevel::F16` storage. Re-quantized Q3.5-0.8B with the gate on; new file size 991 MB vs baseline 813 MB (+178 MB, matching the predicted F16-vs-Q8 size delta on the affected tensors). Re-ran the per-layer hidden-state dump.
+
+Per-layer rel_L2 vs HF transformers BF16 oracle (Q3.5-0.8B chunk 0, halfsplit RoPE default, kv-q8):
+
+| Layer | type | Q8 LA weights (baseline) | F16 LA weights | Δ |
+|---|---|---:|---:|---:|
+| 0     | LA       | 0.061 | 0.064 | +0.002 |
+| 4     | LA       | 0.140 | 0.128 | **-0.012** |
+| 5     | LA       | 0.167 | 0.157 | -0.010 |
+| 7     | FA       | 0.157 | 0.149 | -0.008 |
+| 11    | FA       | 0.157 | 0.163 | +0.006 |
+| 23    | FA last  | 0.189 | 0.189 | 0     |
+
+Promoting LA-layer projections from Q8 to F16 shifts the layer-4 LA jump by only **-0.012 nats** (0.140 → 0.128). If GLM-5's hypothesis were correct ("0.06 per LA layer is Q4/Q8 quant noise amplified by the recurrence"), F16 weights — carrying ~16× less per-element noise than Q8 — should have dropped the layer-4 drift to ≲ 0.02. They did not.
+
+The residual ~0.08 KLD is **not** an inherent quant-noise floor. It's a real, fixable convention or precision mismatch upstream of `gated_delta_net_f32` in one of:
+  - `conv1d_silu_split` — causal conv1d kernel size, ring-buffer indexing, weight layout
+  - `fused_qk_l2_norm_scale` — eps placement, scale-application order (`x*rsqrt*scale` vs `x*(rsqrt*scale)`)
+  - `fused_sigmoid_alpha_gate` — softplus formulation, dt_bias add/multiply, alpha gate sign
+  - `fused_rmsnorm_mq_rotate` (input pre-LA RMSNorm + FWHT)
+  - or `gated_delta_net_f32` itself (though probe c.2 fp64-state already ruled out precision; there could still be an ordering / sign / scale issue)
+
+Next concrete probe: dump Q/K/V/g/β tensors at the **input to `gated_delta_net_f32`** for chunk 0 from both hipfire and HF transformers; per-element compare. If they match byte-exactly, the bug is INSIDE the recurrence kernel after all (algorithmic). If they diverge, bisect the upstream stages by injecting HF-computed values via DMA at each stage boundary until the divergence localizes. Cost: ~half-day of instrumentation in `qwen35::forward_scratch_layers` + Python-side HF tensor capture.
+
 Raw per-layer dumps at `/data/cache/hipfire/q3.5-0.8b-{hf,hipfire}-hidden-chunk0.bin` (not committed, 192 MB each); the comparator output is reproducible from the scripts in `scripts/dump_hf_hidden_states.py`, `scripts/compare_hidden_states.py`, and the new example binary.
 
 **Cross-engine sanity check (Step B, 2026-05-12 evening) — confirms Step A is well-posed.**

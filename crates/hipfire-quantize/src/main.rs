@@ -4007,8 +4007,29 @@ fn main() {
             // to QuantLevel::F16 regardless of K-map state. Lets a dense
             // model get an FP16 lm_head without engaging --kmap-dense's
             // Promote6 side-effects.
+            //
+            // 2026-05-13 — companion diagnostic env-gate
+            // HIPFIRE_QUANTIZE_LA_F16=1 forces all `linear_attn.*` projection
+            // weights to F16 storage. Used to test GLM-5's hypothesis that
+            // the residual ~0.06 per-LA-layer drift is weight-quantization
+            // noise amplified by the DeltaNet recurrence. If a model
+            // quantized with this gate shows a dramatically lower layer-4
+            // rel_L2 vs the Q8 baseline (~0.14), the LA-layer floor IS
+            // quant-noise. If not, GLM-5's "all upstream stages clean"
+            // verdict missed something. Matches `linear_attn.` so embeddings
+            // / lm_head / FullAttention projections are unaffected.
+            let is_la_weight = name.contains("linear_attn.")
+                && (name.ends_with("in_proj_qkv.weight")
+                    || name.ends_with("in_proj_z.weight")
+                    || name.ends_with("in_proj_a.weight")
+                    || name.ends_with("in_proj_b.weight")
+                    || name.ends_with("out_proj.weight"));
             let kmap_level = if (name.contains("lm_head") || name.ends_with("output.weight"))
                 && std::env::var("HIPFIRE_QUANTIZE_LM_HEAD_F16").ok().as_deref() == Some("1")
+            {
+                QuantLevel::F16
+            } else if is_la_weight
+                && std::env::var("HIPFIRE_QUANTIZE_LA_F16").ok().as_deref() == Some("1")
             {
                 QuantLevel::F16
             } else {
