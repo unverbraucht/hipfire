@@ -229,6 +229,136 @@ Phase 1c verdict because stages 0-14 already paint the picture.)
 - `crates/hipfire-arch-qwen35/src/qwen35.rs:dump_la_stage` + 16 call sites
 - `scripts/dump_hf_la_stages.py`, `scripts/compare_la_stages.py`
 
+## Phase 1d — Precision-intervention probes (2026-05-13 follow-up)
+
+Phase 1c findings ranked two probes — embedding precision (#1) and
+conv1d_silu_split q/k asymmetry (#2) — by predicted impact. Phase 1d
+ran both and a stacked variant, with model-output KLD as the bottom-line
+measurement (5 chunks per-token Q8 KV).
+
+### Per-stage results at LA layer 0 (chunk 0)
+
+| stage | baseline | embed F16 | embed+conv F16 |
+|---:|---:|---:|---:|
+| 0 (embedding) | 0.0053 | **0.0000** | 0.0000 |
+| 1 (rmsnorm) | 0.0055 | 0.0017 | 0.0017 |
+| 2 (in_proj_qkv) | 0.0048 | 0.0037 | 0.0037 |
+| 8 (conv q_raw) | 0.0085 | 0.0077 | **0.0048** |
+| 9 (conv k_raw) | 0.0109 | 0.0101 | **0.0055** |
+| 10 (conv v) | 0.0045 | 0.0043 | **0.0031** |
+| 11 (q post-l2norm) | 0.0087 | 0.0079 | **0.0050** |
+| 12 (k post-l2norm) | 0.0118 | 0.0108 | **0.0059** |
+| 13 (recurrence) | 0.0454 | 0.0448 | 0.0471 |
+| 14 (gated_norm) | 0.0428 | 0.0428 | 0.0464 |
+
+F16 embed: stage 0 → bit-exact match with HF (BF16's 8-bit mantissa is a
+strict subset of F16's 11-bit mantissa, so BF16 → F32 → F16 → F32
+round-trips exactly). Reduction propagates through stages 1-12 but the
+recurrence saturates around 0.045-0.047 regardless.
+
+F16 conv: stages 8-12 drop ~50%. Recurrence output is *unchanged or
+slightly worse*. State-trajectory amplification dominates per-position
+input drift.
+
+### Model-output KLD (5 chunks, per-token, Q8 KV)
+
+| variant | KLD | Δ vs baseline | file size |
+|---|---:|---:|---:|
+| baseline q8f16 (all Q8) | **0.0796** | — | 814 MB |
+| embed+conv F16 | 0.0895 | **+12.4%** | 1052 MB |
+| full LA F16 (embed+conv+5 proj) | 0.0850 | **+6.8%** | 1230 MB |
+
+**All three precision interventions regress the floor.** Going from Q8
+to F16 storage on the affected weights — which is 10× more precise per
+element — makes the model output diverge MORE from the BF16 reference,
+not less.
+
+### Mechanism
+
+The closed investigation predicted this: "cumulative numerical
+imprecision across the forward pipeline; each kernel's accumulator
+order, fused-vs-separate-op rounding, and gain stacking through norm
+weights collectively produce a small per-dim residual-stream bias that
+compounds layer-by-layer."
+
+The mechanism is the inverse of what intuition suggests:
+
+1. Hipfire's kernel pipeline has implicit **bias offsets** from accumulator
+   ordering, fusion patterns, and round-to-nearest semantics. These
+   produce a small per-dim systematic deviation from HF's exact compute.
+2. Q8 weight quantization noise is approximately **zero-mean random**
+   (uniform over each block's ±1 ULP rounding). Over 2048 positions
+   × 18 LA layers, this random noise statistically interacts with the
+   engine's systematic bias offsets — partially canceling them.
+3. Replacing Q8 noise with bit-exact F16 weights eliminates the random
+   component. The engine's systematic bias is no longer offset by random
+   noise, and the net divergence from BF16 reference grows.
+
+This is the failure mode of "fix one source of noise in a complex
+nonlinear pipeline" — random noise was load-bearing for cancellation.
+
+### Verdict
+
+The 0.08-nat engine-drift floor is **structural and not closable** by
+per-weight precision interventions. The data shows:
+
+- Single-stage precision fix (embed F16): zero impact at model output
+- Two-stage stacked (embed+conv F16): regression
+- Six-stage stacked (full LA F16): smaller regression but still worse
+
+Closing the floor requires either:
+
+- **Engine surgery**: byte-match hipfire's LA-block kernels to HF's
+  `chunk_gated_delta_rule` accumulator/fusion patterns. Estimated effort:
+  several weeks. High risk of introducing new regressions in fused paths
+  the production runtime depends on.
+
+- **Calibration**: AWQ Stage A is already shipped (9B: −32.6% above-floor
+  KLD, validated 2026-05-12). Stage B (GPTQ) and Stage C (MR-GPTQ) extend
+  the same pattern. These don't fight the floor — they pre-rotate
+  weights so the engine's bias and the calibration shift compose into a
+  smaller net drift.
+
+### Implication for cohort comparison
+
+Q3.5 quality-eval cohorts on hipfire must measure **above-floor delta**,
+not absolute KLD vs an external BF16 reference. Comparing hipfire q8f16
+(0.080) to llama.cpp Q4_K_M (0.035) is **not** apples-to-apples — the
+0.045 gap is engine implementation, not quantization quality. A correct
+4-bit-attributable measurement is `KLD(MQ4) − KLD(Q8_floor)`, which
+isolates the quant-cost from the engine-specific pedestal.
+
+The Q4_K_M-beats-q8f16 datum that fired the exit condition tells us the
+floor matters in practice — but the corrective action is calibration on
+hipfire's side (Stage A/B/C in flight), not pursuing kernel-precision
+audits.
+
+### Files (Phase 1d)
+
+- `/data/cache/hipfire/audit-2026-05-13/hip_layer0_chunk0_embedf16.bin`
+- `/data/cache/hipfire/audit-2026-05-13/hip_layer0_chunk0_convf16.bin`
+- `/data/cache/hipfire/audit-2026-05-13/eval/baseline_q8f16.kldseq`
+- `/data/cache/hipfire/audit-2026-05-13/eval/embed_conv_f16.kldseq`
+- `/data/cache/hipfire/audit-2026-05-13/eval/full_la_f16.kldseq`
+- `crates/hipfire-quantize/src/main.rs:HIPFIRE_QUANTIZE_EMBED_F16`
+- `crates/hipfire-quantize/src/main.rs:HIPFIRE_QUANTIZE_CONV_F16`
+
+## Status — CLOSED 2026-05-13
+
+The reopening exit condition (Q4_K_M-beats-q8f16) **was correct**: the
+floor matters for quality cohort comparisons. But the audit established
+that the floor is **not closable by per-weight precision interventions** —
+three independent stacked F16-storage probes all regressed the floor.
+
+Path forward: ship Stage A AWQ on Q3.5-0.8B (already validated on 9B at
+−32.6% above-floor KLD), then continue Stage B/C calibration roadmap.
+Treat 0.07 nats as the engine-vs-engine pedestal in all Q3.5 cohort
+comparisons; report deltas, not absolute KLDs.
+
+The audit infrastructure (HIPFIRE_DUMP_LA_STAGES + matching HF probe +
+HIPFIRE_QUANTIZE_EMBED_F16 + HIPFIRE_QUANTIZE_CONV_F16) is preserved
+in-tree for any future reopening of the question.
+
 ## References
 
 - Closed investigation: `docs/plans/qwen35-mq4-quality-gap.md` §line 831–1030

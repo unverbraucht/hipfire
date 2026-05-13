@@ -2150,6 +2150,18 @@ fn kmap_resolve_mode(name: &str, n_layers: usize, is_moe: bool, kmap_mode: u8) -
         {
             return QuantLevel::F16;
         }
+        // 2026-05-13 — embedding-precision probe for the engine-drift-floor
+        // residual audit (Phase 1c follow-up). HIPFIRE_QUANTIZE_EMBED_F16=1
+        // stores the embed_tokens table as raw F16 instead of Q8, so the
+        // F16→F32 cast at load preserves ~10× more precision than Q8 dequant.
+        // Bisects whether the 0.005 stage-0 floor is Q8 embedding noise.
+        // Diagnostic-only.
+        let is_embed_name = name.contains("embed_tokens") || name.contains("token_embd");
+        if is_embed_name
+            && std::env::var("HIPFIRE_QUANTIZE_EMBED_F16").ok().as_deref() == Some("1")
+        {
+            return QuantLevel::F16;
+        }
         return QuantLevel::Q8;
     }
 
@@ -3214,6 +3226,16 @@ fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat, no_kmap: b
                 .flat_map(|&v| f32_to_f16(v).to_le_bytes())
                 .collect();
             (f16_bytes, QuantType::F16, 0u32, "F16")
+        } else if kmap_level == QuantLevel::F16 {
+            // Explicit F16 override from kmap_resolve_mode (LM_HEAD_F16 /
+            // EMBED_F16 env-gates). Must precede the Q8/embed arm so the
+            // `is_embed` short-circuit doesn't fire on F16 embeddings.
+            let f32_data = gguf_input::tensor_to_f32(info, raw);
+            let f16_bytes: Vec<u8> = f32_data
+                .iter()
+                .flat_map(|&v| f32_to_f16(v).to_le_bytes())
+                .collect();
+            (f16_bytes, QuantType::F16, 0u32, "F16")
         } else if kmap_level == QuantLevel::Q8 || is_embed {
             // K-map Q8 or embedding
             let f32_data = gguf_input::tensor_to_f32(info, raw);
@@ -4024,6 +4046,8 @@ fn main() {
                     || name.ends_with("in_proj_a.weight")
                     || name.ends_with("in_proj_b.weight")
                     || name.ends_with("out_proj.weight"));
+            let is_embed_name = name.contains("embed_tokens") || name.contains("token_embd");
+            let is_conv_weight = name.contains("linear_attn.conv1d.weight");
             let kmap_level = if (name.contains("lm_head") || name.ends_with("output.weight"))
                 && std::env::var("HIPFIRE_QUANTIZE_LM_HEAD_F16").ok().as_deref() == Some("1")
             {
@@ -4031,6 +4055,23 @@ fn main() {
             } else if is_la_weight
                 && std::env::var("HIPFIRE_QUANTIZE_LA_F16").ok().as_deref() == Some("1")
             {
+                QuantLevel::F16
+            } else if is_embed_name
+                && std::env::var("HIPFIRE_QUANTIZE_EMBED_F16").ok().as_deref() == Some("1")
+            {
+                // 2026-05-13 — embedding-precision probe for engine-drift audit.
+                // Forces embed_tokens to F16 storage; runtime's qt != 3/6/7
+                // fallback path casts F16→F32 at load. ~10× lower stage-0
+                // noise than Q8 dequant. Diagnostic-only.
+                QuantLevel::F16
+            } else if is_conv_weight
+                && std::env::var("HIPFIRE_QUANTIZE_CONV_F16").ok().as_deref() == Some("1")
+            {
+                // 2026-05-13 — conv1d-precision probe for engine-drift audit.
+                // Forces linear_attn.conv1d.weight to F16 storage. Stage 8/9
+                // showed 1.7-2× drift amplification on q/k under Q8 conv weight
+                // at LA layer 0; F16 should match HF's BF16→F32 path bit-exactly
+                // for values in BF16's representable range. Diagnostic-only.
                 QuantLevel::F16
             } else {
                 kmap.get(&**name).copied().unwrap_or(QuantLevel::Base)
