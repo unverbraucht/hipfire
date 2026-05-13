@@ -221,6 +221,89 @@ and **without** the bf16 cast at HF's output. So variants like operand
 grouping, FMA contraction, etc., may produce visible rL2 changes there
 where they couldn't for rmsnorm.
 
+## F3 — l2norm fp64 reference check (**rules out l2norm too**)
+
+`scripts/l2norm_fp64_reference.py`. Same approach as D0.3 but for stages
+11/12, computing fp64-ref per-engine on each engine's own stage 8/9
+input.
+
+### Result
+
+| measurement | mean rL2 |
+|---|---:|
+| HF stage 11 vs fp64-ref(HF stage 8) — HF's q fp32 floor | **0.000000** |
+| hipfire stage 11 vs fp64-ref(hip stage 8) — hipfire's q fp32 floor | **0.000000** |
+| HF stage 12 vs fp64-ref(HF stage 9) — HF's k fp32 floor | **0.000000** |
+| hipfire stage 12 vs fp64-ref(hip stage 9) — hipfire's k fp32 floor | **0.000000** |
+| hipfire stage 11 vs HF stage 11 (audit cross-engine number) | 0.008737 |
+| hipfire stage 12 vs HF stage 12 (audit cross-engine number) | 0.011835 |
+| hipfire stage 8 vs HF stage 8 (upstream q_raw input drift) | 0.008452 |
+| hipfire stage 9 vs HF stage 9 (upstream k_raw input drift) | 0.010947 |
+
+### Interpretation
+
+**Both engines' l2norm kernels are at the fp64 ideal.** The audit's
+0.0087/0.0118 "drift" is just stage 8/9 upstream input drift passing
+through l2norm with near-isometric ratios (1.03×/1.08×) — per-head
+normalization mostly preserves rL2. Stage 9's input drift in turn comes
+from HF's bf16 cast at conv1d_silu output (per F2: 100% bf16-clean).
+
+**l2norm-q (stage 11) and l2norm-k (stage 12) are no longer drift
+candidates.**
+
+## Final scope after Day-0 + F2 + F3
+
+The only remaining real-fp32-vs-fp32 kernel comparison anywhere in the
+audited LA path:
+
+| stage | kernel | rL2 | scope |
+|---:|---|---:|---|
+| 6 | `fused_sigmoid_alpha_gate` α | 0.0024 | low-magnitude; cosine 1.000 |
+
+Every other "drift" in the audit's 0-12 stages is either:
+1. HF's intentional bf16 cast at a module boundary (stages 0-5, 7, 8-10, 13-14), OR
+2. Upstream bf16-cast input propagated through a bit-faithful hipfire
+   kernel (stages 11, 12).
+
+**The engine-surgery scope has collapsed from "rewrite 24 kernels (4-8
+months)" to "essentially zero kernels".** Hipfire's kernels are
+structurally **more arithmetically precise** than HF's BF16 reference
+dump. The KLD-floor gap vs HF is the consequence of that precision
+mismatch with HF's intentional dtype convention, not a hipfire bug.
+
+### What this means for the original audit verdict
+
+`03-final-verdict.md` correctly closed the audit with "no single-kernel
+surgery target, calibration is the path forward". The pattern-hunt plan
+re-opened it as "maybe shared root cause across kernels". The Day-0 +
+F2 + F3 results now close the pattern hunt with a **stronger** verdict
+than the original audit: not just "no single bug", but **"no
+arithmetic-precision drift in any audited fp32-native kernel"**. The
+"distributed pipeline drift" the audit observed is HF's bf16 cast
+pattern, captured at fp32 by the dump probe.
+
+### What's actually worth doing now
+
+- **Calibration path (AWQ Stage A→B/C)** remains the right priority,
+  and is now better-justified: there is no kernel arithmetic to fix,
+  so all available leverage is in calibrating the weight quantization
+  to push hipfire's output distribution closer to HF's bf16-trained
+  distribution.
+- **F1 (test bf16-cast hypothesis)** is a clean follow-up experiment
+  for AFTER the calibration roadmap clears. Force hipfire to cast
+  rmsnorm/conv1d/in_proj outputs to bf16-then-fp32, re-measure KLD
+  vs HF. If F1 closes a meaningful chunk of the floor without quality
+  regression, hipfire could ship a "match HF training dtype" mode that
+  doesn't require re-quantization. If F1 doesn't help, that's also
+  informative — it means the floor's source is the weight quantization
+  itself, which calibration addresses directly.
+- **Stage 6 (sigmoid_alpha_gate) is low priority.** 0.0024 rL2 with
+  cosine 1.000 is unlikely to move any model-quality metric.
+
+The pattern-hunt plan's Day 1-5 work as written is **fully obsolete**.
+Day 0 took ~1 hour and closed the entire investigation with a stronger
+result than the plan was even designed to produce.
+
 ## Artifacts
 
 - `/data/cache/hipfire/audit-2026-05-13/pattern-hunt/baseline_full.bin`

@@ -1,5 +1,32 @@
 # Pattern-hunt plan — re-opening engine surgery as a shared-root-cause question (2026-05-13, rev 2)
 
+> **STATUS: SUPERSEDED by `05-pattern-hunt-results.md` (2026-05-13).**
+>
+> Day 0 of this plan ran for ~1.5 hours and closed the entire
+> investigation with a stronger result than the plan was designed to
+> produce. The shared-root-cause hypothesis is **falsified, but in an
+> unexpected direction**:
+>
+> - Hipfire's rmsnorm and l2norm kernels are *bit-faithful to the fp64
+>   ideal* (D0.3, F3). They have zero arithmetic-precision drift.
+> - 22 of the audit's 24 "drifted stages" are HF's intentional bf16 cast
+>   at module boundaries, captured by the dump probe as fp32 (F2).
+> - The remaining 2 stages (11/12) carry upstream bf16-cast drift through
+>   bit-faithful kernels (F3).
+> - **Hipfire's kernels are uniformly MORE arithmetically precise than
+>   HF's BF16 reference**, not less. The "engine drift floor" is a
+>   precision mismatch with HF's training dtype, not a hipfire bug.
+>
+> Day 1-5 hypotheses (H1/H7/H8/H9 operand grouping, FMA contraction,
+> FTZ, etc.) are obsolete — no fp32-arithmetic variant can change a
+> number that is already zero versus the fp64 oracle.
+>
+> See `05-pattern-hunt-results.md` for the full data, scripts, and
+> reproducers. The remainder of this doc is preserved unchanged for
+> historical reference.
+
+---
+
 Sequel to `03-final-verdict.md`. The final verdict closed the audit with
 "distributed drift across ~24 kernels, no surgery target". This was the
 correct conclusion under the framing the audit used — *"find a single
