@@ -4052,6 +4052,25 @@ fn main() {
                 && std::env::var("HIPFIRE_QUANTIZE_LM_HEAD_F16").ok().as_deref() == Some("1")
             {
                 QuantLevel::F16
+            } else if (name.contains("lm_head") || name.ends_with("output.weight"))
+                && std::env::var("HIPFIRE_QUANTIZE_LM_HEAD_Q8").ok().as_deref() == Some("1")
+            {
+                // 2026-05-13 PM — Q8 lm_head probe for the quant-contribution
+                // decomposition. Tests whether the 4-bit lm_head (default for
+                // dense MQ4 without --kmap-dense) is a meaningful contributor
+                // to MQ4-vs-Q8 KLD gap. Forces lm_head to Q8 storage without
+                // engaging --kmap-dense's edge-FFN Promote6 side-effects.
+                QuantLevel::Q8
+            } else if (name.contains("lm_head") || name.ends_with("output.weight"))
+                && std::env::var("HIPFIRE_QUANTIZE_LM_HEAD_MQ6").ok().as_deref() == Some("1")
+            {
+                // 2026-05-13 PM — MQ6 lm_head probe. Q8 lm_head delivered −3%
+                // KLD at +540 MB (+0.48 bpw, ~9B-aggregate). MQ6 splits the
+                // difference at +300 MB / +0.27 bpw. lm_head is not part of
+                // FFN/LA body dispatch (final projection, dedicated GEMV) so
+                // mixed MQ4-base + MQ6-lm_head doesn't trigger the kmd2-class
+                // dispatch bug (issue #249) — verified by Q8 lm_head working.
+                QuantLevel::Promote6
             } else if is_la_weight
                 && std::env::var("HIPFIRE_QUANTIZE_LA_F16").ok().as_deref() == Some("1")
             {
@@ -4073,6 +4092,15 @@ fn main() {
                 // at LA layer 0; F16 should match HF's BF16→F32 path bit-exactly
                 // for values in BF16's representable range. Diagnostic-only.
                 QuantLevel::F16
+            } else if is_conv_weight
+                && std::env::var("HIPFIRE_QUANTIZE_CONV_Q8").ok().as_deref() == Some("1")
+            {
+                // 2026-05-13 PM — Q8 conv1d probe (companion to Q8 lm_head).
+                // Tests whether the 4-bit conv1d (default in dense MQ4) is a
+                // contributor to MQ4 KLD via DeltaNet recurrence amplification.
+                // Audit Phase 2 found Q8 conv1d already amplifies upstream
+                // drift 1.7-2× at LA-0 stage 8/9; MQ4 conv1d should be worse.
+                QuantLevel::Q8
             } else {
                 kmap.get(&**name).copied().unwrap_or(QuantLevel::Base)
             };

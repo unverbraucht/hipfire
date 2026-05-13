@@ -1082,7 +1082,173 @@ Detailed diagnosis trace in `docs/plans/awq_fix_claude.md` (rebuttal + measured 
 
 The 0.8B → 9B scale dependence matches AWQ paper predictions: outlier preservation gains grow with model size because outlier severity scales with parameter count. **Stage A AWQ is a real Phase A quality lever on Qwen3.5-9B and beyond**, and the infrastructure (Phase 2a dispatch + Phase 2b call-site wiring + sidecar storage) carries forward into Stage B (GPTQ) and Stage C (MR-GPTQ) without rework — only the *calibration* algorithm changes.
 
-**Open follow-up (Option B from `awq_bug_hunt_glm5.md`):** add AWQ-aware variants of `rotate_x_mq` and `fused_silu_mul_rotate_mq` (4 new HIP kernels + dispatcher wiring) so `o_proj` / `out_proj` / `down_proj` can also benefit from AWQ. Literature suggests another few percent KLD reduction. Deferred until Stage B/C measure-up — if the AWQ+GPTQ+MR-GPTQ stack still leaves a meaningful gap to UD-Q3_K_XL at equal bpw, revisit then.
+#### Stage A — open follow-ups for the remaining cross-engine gap
+
+The 2026-05-13 PM measurements (master doc §1.1b–§1.1e) gave hipfire's
+Δ-above-own-Q8 a sharper signature. At BOTH 4-bit (MQ4+Q8conv1d
+Δ ≈ 0.232 vs llama.cpp Q4_K_M Δ ≈ 0.052, ~4.5× ratio) AND 6-bit
+(MQ6+Q8conv1d Δ ≈ 0.040 vs Q6_K Δ ≈ 0.009, ~4.4× ratio), hipfire's
+quantizer leaves the same multiplicative penalty over its own Q8 floor.
+A *constant* multiplier across bit-widths is the fingerprint of a
+**format-level** issue (group size, scale-fitting algorithm, AWQ
+coverage, asymmetry, alpha choice) rather than a bpw-specific one.
+Stage E (MQ4K wire format, §5 Phase A revised) addresses the group-size
+piece but is the largest-effort follow-up. The smaller follow-ups below
+are quantizer-side improvements on the existing MQ4G256 wire format and
+should land or be ruled out first.
+
+All are gated on Stage B (GPTQ) and Stage C (MR-GPTQ) measuring up — the
+dominant share of the remaining gap may close inside those stages
+alone. Listed here so they aren't re-derived later.
+
+##### F1 — AWQ alpha grid-search (highest expected return, lowest effort)
+
+Stage A landed AWQ with the AWQ-paper **default `alpha = 0.5`**
+(`crates/hipfire-quantize/src/main.rs:3512`). The AWQ paper itself
+grid-searches alpha per model over `[0.0, 1.0]` in 0.05 steps and
+reports per-model optima ranging 0.2–0.85 — the 0.5 default is a
+*Llama-2-7B-tuned* compromise, not a universal constant. Qwen 3.5's
+DeltaNet+attention hybrid has a substantially different
+activation-magnitude distribution from Llama (DeltaNet recurrence
+shifts mass into low-frequency components; alpha=0.5 over-pushes
+scale onto channels that are dominant by recurrence accumulation
+rather than by per-token outlier severity). The optimal alpha for
+Qwen 3.5 is almost certainly **not** 0.5.
+
+**Concrete experiment.** Bench 7 alpha values (0.0 / 0.25 / 0.4 / 0.5
+/ 0.6 / 0.75 / 1.0) on 9B MQ4 + Q8conv1d + AWQ. Use the existing
+cohort harness (n=256, q8-KV asym3) — each variant ~25 min wall,
+total ~3 hours. Pick KLD-minimizing alpha; bracket-refine if the
+optimum sits between two grid points (one more 4-value round at the
+refined granularity).
+
+**Expected lift.** +5–15% Δ-above-own-Q8 reduction on top of Stage A's
+already-measured −32.6%. The AWQ paper reports +0.5–1.5 PPL points on
+Llama-2-7B from tuning alpha away from 0.5; on a model with
+recurrence-dominated activation distributions the effect should be
+larger.
+
+**Why this is essentially free.** `compute_awq_scales`
+(`main.rs:2766`) geo-mean-normalizes per-channel scales to 1, so
+changing alpha doesn't change average weight magnitude — only the
+per-channel scale distribution. Varying alpha is a pure quality
+knob with no quantization-noise overshoot/undershoot tradeoff and no
+infrastructure change (the `--awq-alpha <f>` CLI flag already exists).
+
+**Diagnostic signal.** If the bench curve is sharply peaked (e.g.,
+0.3 is 10% better than 0.5 and 10% better than 0.4), Qwen 3.5 has a
+genuinely different outlier distribution from Llama and F3 below
+(per-layer-class alpha) is worth pursuing. If the curve is flat
+across `[0.3, 0.7]`, the alpha lever is exhausted and the gap is
+elsewhere (F2/F4/F5/Stage E).
+
+##### F2 — AWQ on post-projection paths (was "Option B" from awq_bug_hunt_glm5.md)
+
+Stage A's AWQ pre-scaling is whitelisted to weights whose runtime
+path applies the activation divide *before* the rotation kernel
+(`fused_rmsnorm_mq_rotate_awq`). The post-projection paths
+(`o_proj`, `out_proj`, `down_proj`) use `rotate_x_mq` and
+`fused_silu_mul_rotate_mq` and currently get NO AWQ benefit. Stage A
+chose the whitelist over kernel work because the receiving-side AWQ
+gain was projected smaller (input channels are already mixed by the
+prior gemm), but the master-doc finding that conv1d Q8 alone moved
+KLD by 26% suggests the post-projection paths may carry more weight
+than originally assumed.
+
+**Concrete work.** Add AWQ-aware variants of 2 kernel families:
+`rotate_x_mq_awq` (input divide → FWHT → existing rotate path) and
+`fused_silu_mul_rotate_mq_awq` (silu_mul → input divide → FWHT). ~4
+new HIP kernels + dispatcher wiring, ~3–4 days. Estimated +3–7%
+Δ-above-own-Q8 reduction on top of F1.
+
+##### F3 — Per-layer-class AWQ alpha (extension of F1)
+
+If F1 shows a sharp alpha optimum, the natural next step is
+**per-class alpha**: separate values for attention QKV/QKVZA,
+gate/up FFN, and (after F2) post-projection `o_proj`/`down_proj`.
+DeltaNet's recurrence accumulator weights have a different
+post-FWHT distribution from the dense FFN gate/up, and the alpha
+that minimizes KLD for one class may not minimize it for the others.
+
+**Concrete work.** Generalize `AWQ_ALPHA` (`main.rs:3521`) from
+`OnceCell<f32>` to a `HashMap<TensorClass, f32>` populated by either
+(i) a 3-class grid search (~3 × the F1 cost = ~9 hours wall) or
+(ii) per-tensor alpha fit by forward-pass loss minimization
+(~1 week eng + 1 GPU-day per fit, AWQ paper's "Sec. 3.3" variant).
+
+Skip if F1 is flat. Run if F1 is sharply peaked at a value that
+itself disagrees with the AWQ-paper Llama range, which would
+strongly suggest different optima across the model's tensor
+classes.
+
+##### F4 — Weighted-LS scale fitting for MQ4 base format (retro-fit L4a/L4b)
+
+Phase A Step 1 (L4a UE8M0 chooser, commit `1c6f9ef0`) and Step 2
+(L4b FP16 row scale chooser) implemented activation-weighted LS
+scale fitting for HFP4G32 and MFP4G32. **They were never retro-fit
+onto MQ4 base format.** MQ4G256's per-block scale is still computed
+via simple max-abs (the Q4_0-style heuristic). Llama.cpp's Q4_K
+does an iterative LS scale fit (`scale_fit_loop` in
+`ggml-quants.c`) — part of why Q4_K_M tracks the activation-aware
+optimum better than a simple max-abs format would.
+
+**Concrete work.** Port `weighted_ls_choose_block_scale` from the
+HFP4/MFP4 code path to the MQ4G256 quantizer. The math is identical
+(`min_s Σ_i act²[i] (w[i] − dequant(round(w[i]/s)) · s)²`); only the
+dequant function changes (uniform int4 instead of E2M1 LUT).
+~1 week, quantizer-side only, no kernel changes. Estimated +3–8%
+Δ-above-own-Q8 reduction. Stacks additively with F1/F2/F3 (it
+targets the scale-fitting axis, they target the channel-distribution
+axis).
+
+##### F5 — Asymmetric per-block zero-point on post-FWHT MQ4
+
+MQ4 is **symmetric** (mid-tread, signed `[-8, 7]` × scale). The
+FWHT-256 rotation zeroes per-block mean *in expectation* (it's a
+Hadamard, a basis rotation, mean-preserving for the input
+distribution), but per-block-*realized* post-FWHT mean is non-zero
+for typical Qwen weights — sampled `~5% of scale` magnitude on
+9B inspection logs. A 4-bit asymmetric quant with per-block
+zero-point captures that residual mean and gains ~0.4 effective bit
+of dynamic range on the realized distribution. This is approximately
+what Q4_K's "min" field does inside each 32-element sub-block.
+
+**Concrete work.** Add per-block zero-point to MQ4G256: +4 bits per
+256-element block in header → **+0.016 bpw** (negligible).
+The cost is the kernel change — every MMQ + WMMA + dp4a MQ4 kernel
+needs a `subtract zp` step after the LUT-decode, before the dot
+product. ~6 kernel families × ~2 days each = ~2 weeks.
+Estimated +5–10% Δ-above-own-Q8 reduction.
+
+**Gate this behind F1+F2+F4 measurement.** If F1+F2+F4 close the
+gap to within 1.5× of llama.cpp's Δ-above-own-Q8, F5 is unnecessary.
+F5 is also the natural last step before deciding whether to commit
+to Stage E (MQ4K wire format with per-32 sub-block scale + zp) — if
+F5 alone closes the gap, the full MQ4K rewrite isn't needed; if
+F5 leaves >2× ratio, group-size (g=256 → g=32) is the structural
+cause and Stage E is the answer.
+
+##### F-stack — combined expected lift
+
+Targets are decorrelated by design (F1/F3 = channel-scale
+distribution, F2 = AWQ coverage, F4 = block-scale fitting accuracy,
+F5 = block-zp dynamic range), so additive stacking is a reasonable
+prior. Combined expected reduction on Δ-above-own-Q8: ~25–40%,
+bringing hipfire MQ4's penalty ratio from ~4.5× llama.cpp Q4_K_M
+down to ~2.5–3.5×. The residual is then most likely group-size
+structural (MQ4 g=256 vs Q4_K sub-block g=32), addressed by Stage E.
+
+**Decision rule.**
+- Run F1 first (cheapest, no infra change, no risk).
+- If F1 lift <5%: structural gap dominates; skip F2-F5, proceed to
+  Stage C measurement and Stage E decision.
+- If F1 lift 5–15%: run F4 (next-cheapest, quantizer-side, ~1 wk),
+  then F2 (4 kernels, ~4 days). Re-measure cross-engine gap.
+- If F1 lift >15%: F1 is doing dominant work; run F3 to per-class
+  the alpha (cheap), then F2, then F4. Defer F5 unless the residual
+  ratio is still >2×.
+- Stage E only if F1+F2+F4 (+F5) collectively leave >2× ratio
+  against llama.cpp on identically-bench'd Δ-above-own-Q8.
 
 **What the Steps 1-7 work above bought us even though the pivot reframes the plan:** the infrastructure to MEASURE all of this is in place — `quant_cohort.sh`, `eval_hipfire`, `imatrix_collect`, `ud_decompile`, BF16 kldref files for 9B and 0.8B. The bench loop is ~25 minutes per cohort variant on 9B. Stage A AWQ can iterate against measurement at that cadence, which is the engineering velocity needed to actually validate a calibration lever empirically (not just predict its impact from a lever-decomposition spreadsheet).
 
