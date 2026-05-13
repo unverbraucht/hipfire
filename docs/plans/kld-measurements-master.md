@@ -9,6 +9,16 @@ This doc is the single place to look for every KLD/PPL number we've measured aga
 
 ---
 
+## TL;DR — strategic headline (2026-05-13)
+
+**At matched Q8-KV conditions on Qwen3.5-0.8B, llama.cpp's Q4_K_M (0.035 KLD) beats hipfire's q8f16 (0.080 KLD).** The 4-bit imatrix-calibrated GGUF achieves lower KLD than hipfire's 8-bit weights — meaning **the hipfire engine drift dominates the format-quality cost** at this scale. Even a hypothetical perfect 4-bit hipfire quant could not get below 0.08 KLD on 0.8B without first attacking the ~0.07 nats of cumulative pipeline imprecision documented in [`project_engine_drift_floor_decomposition.md`](../../memory/project_engine_drift_floor_decomposition.md).
+
+Scoring-mode adjustment: hipfire's 0.0806 was measured per-token (issue-113 §5.3 says ~7% inflated vs prefill on 9B). Prefill-equivalent estimate ≈ 0.075, vs Q4_K_M's 0.035 → still **~2.1× worse**, well outside the per-token-vs-prefill bias.
+
+**Strategic implication.** Phase A/B/C calibration levers (AWQ, GPTQ, Lloyd, MR-GPTQ) all sit above this floor and cannot close the cross-engine gap on their own. The 0.07 nats of "cumulative pipeline imprecision over 24 layers" is now the binding constraint, not the 4-bit format. Re-prioritization candidates: (a) accept engine drift as the moat and ship a single-engine roadmap, (b) chase the kernel-by-kernel accumulator audit that was tabled when the floor investigation closed, (c) re-bench whether the per-token vs prefill kernel-path divergence (§5.3) is the dominant component.
+
+---
+
 ## 0. Reading conventions
 
 - **All hipfire rows are POST-RoPE-fix** (commit `1805d820` flipped halfsplit RoPE to default; 2026-05-12 evening) unless explicitly marked `PRE-FIX`. Pre-fix hipfire numbers are ~3–5× inflated due to the interleaved-vs-halfsplit RoPE pair-convention bug — see [`project_engine_drift_floor_decomposition.md`](../../memory/project_engine_drift_floor_decomposition.md).
@@ -80,7 +90,14 @@ Source: `benchmarks/quality-baselines/results/2026-05-13-cohort-post-rope-fix-0.
 |---|---|---:|---:|---:|
 | mq4-base | 0.2675 (0.2650–0.2699) | 2.366 | 22.088 | −0.0666 (−20%) |
 | mq4-awq | **0.2531** (0.2506–0.2556) | 2.305 | 22.149 | −0.0469 (−16%) |
-| q8f16 | not measured yet (deferred — kernel-perf work in flight) | | | |
+| **q8f16** | **0.0806** (n=20, per-token, gfx1151) | — | — | −0.0450 (−36%) ⚠ scoring-mode mismatch — see §2.4 |
+
+**q8f16 q8-KV caveat (load-bearing).** The 0.0806 came from the closed floor-decomposition investigation (`benchmarks/quality-baselines/results/2026-05-12-deltanet-discriminator/per-seq/qwen3.5-0.8b.q8f16__gfx1151__kv-q8__per-token__c20__halfsplit-rope-v2.kldseq`). Three asymmetries vs the rest of §2.2:
+1. **Per-token scoring** (not prefill). Per issue-113 §5.3 the per-token path runs ~7% higher KLD than prefill on 9B gfx1100. Prefill-equivalent estimate ≈ 0.0806/1.07 ≈ 0.0753.
+2. **n=20 chunks** (vs 512 quick-slice for the rest of §2.2). Wide CI; per-seq variance not bootstrapped here.
+3. **gfx1151** (vs gfx1100 for the rest). Cross-arch parity is documented in issue-113 §V3 — not expected to move KLD by more than ~1%.
+
+A clean prefill q8f16 q8-KV measurement at gfx1100 quick-slice 512 is on the punchlist (§4.3) but deferred while kernel-perf work runs.
 
 ### 2.3 llama.cpp GGUF anchors (0.8B)
 
@@ -105,6 +122,33 @@ At matched 4-bit + KV mode (q8 vs q8):
 **AWQ uplift is KV-mode-dependent.** At asym3 KV, AWQ improved 0.8B mq4 by −10.2% KLD; at q8 KV it's only −5.4%. Interpretation: AWQ partially compensates for KV-rotation noise (asym3 K rotation precision interacts with per-channel outliers); when the KV cache is less lossy, AWQ has less to clean up. The 9B picture (where AWQ closed −30% above-floor at asym3) may show similar shrinkage if re-measured at q8 KV — worth flagging for the Stage A retrospective.
 
 **PPL is roughly unchanged by AWQ on this slice.** mq4-base PPL 22.088, mq4-awq PPL 22.149 — within slice noise. KLD improvement comes from tail-distribution matching, not top-1 probability, which is exactly what AWQ targets (outlier preservation in heavy channels). Consistent with §2 of issue-113 ("PPL collapses the full output distribution... KLD surfaces tail").
+
+### 2.4.1 Q8-weights vs Q4_K_M cross-engine — the binding finding
+
+Including the hipfire q8f16 q8-KV row (§2.2 caveats apply — per-token, n=20, gfx1151):
+
+| Engine | Variant | bpw | KV | KLD | Notes |
+|---|---|---:|---|---:|---|
+| **llama.cpp** | Q4_K_M | 5.07 | q8 | **0.0351** | full slice, prefill-equivalent |
+| **hipfire** | q8f16 | 8.50 | q8 | **0.0806** | per-token, n=20, gfx1151, post-RoPE-fix |
+| | | | | (≈ 0.0753 prefill-equivalent after §5.3 −7% adjustment) | |
+
+**llama.cpp Q4_K_M (5.07 bpw, 4-bit imatrix-calibrated) achieves lower KLD than hipfire q8f16 (8.5 bpw, 8-bit weights)** at matched Q8 KV. Even after the per-token scoring-mode adjustment, the gap is ~2.1× and well outside any plausible measurement noise.
+
+This means: **at 0.8B, hipfire's engine-drift residual (~0.075 prefill-equivalent KLD) already exceeds llama.cpp's combined engine + 4-bit-quant cost (0.035 KLD).** The format-quality investment (Stage A AWQ, Stage B GPTQ, Stage C MR-GPTQ, Lloyd codebooks, MQ4K sub-scales) is sitting above an engine-drift floor that cannot be reduced via format work.
+
+Per [`project_engine_drift_floor_decomposition.md`](../../memory/project_engine_drift_floor_decomposition.md), the closed-investigation attribution of the ~0.075 was:
+- 0.07 nats: cumulative pipeline imprecision over 24 layers (no single bug found, multi-day kernel-by-kernel accumulator audit was tabled)
+- 0.01 nats: Q8 weight quant + cross-engine inherent
+
+That 0.07 is now the **binding constraint** on cross-engine KLD competitiveness — not 4-bit format work.
+
+**Re-prioritization candidates:**
+1. **Accept the engine-drift moat and ship a single-engine roadmap.** Compare hipfire 4-bit vs hipfire q8f16 as the within-engine quality metric; stop chasing apples-to-apples llama.cpp parity.
+2. **Pick up the tabled accumulator audit.** Closed-investigation memory notes "tabled until a sensitive downstream metric demands it" — this measurement IS that metric. The 0.07 nats is now load-bearing.
+3. **Investigate whether the ~7% per-token-vs-prefill bias on 9B (§5.3) is concentrated in per-layer accumulator paths.** If yes, a prefill-only path with consistent kernel layout might recover most of the floor without per-kernel surgery.
+
+Phase A/B/C continue to make sense as **within-engine quality work** (AWQ → GPTQ → MR-GPTQ + Lloyd all reduce 4-bit cost relative to q8f16 in the same engine), but the **cross-engine quality claim** needs reframing.
 
 The 0.8B picture is **substantially worse than 9B** for hipfire's MQ4
 relative to llama.cpp:
@@ -266,6 +310,7 @@ SHA in the row's "Notes" field (e.g. "engine=PR#197@<sha>").
 - **2026-05-13 — Engine-drift floor investigation closed.** No further single-localizable bugs in the post-RoPE-fix residual ~0.08 nats. Decomposed as 0.07 (cumulative pipeline imprecision, 24 layers) + 0.01 (Q8 weight + cross-engine inherent). Refuted GLM-5's F16-LA-weights claim along the way. See memory entry.
 - **2026-05-13 — Cohort humaneval/smoke bug fixed.** `HIPFIRE_DEFAULT_MODEL` → `HIPFIRE_MODEL` in `scripts/bench_humaneval_completion.sh` and `scripts/quant_cohort.sh`. KLD/PPL/MSE data unaffected (eval_hipfire path doesn't use the daemon).
 - **2026-05-13 — asym3 KV vs q8 KV delta is smaller than pre-fix estimate.** Empirically 0.07 nats at 0.8B mq4-base, not the 0.20 implied by the pre-RoPE-fix decomposition.
+- **2026-05-13 — Cross-engine 4-bit-beats-8-bit finding.** llama.cpp Q4_K_M (0.035 KLD) beats hipfire q8f16 (0.080 KLD, ≈0.075 prefill-equivalent) on Q3.5-0.8B at matched Q8 KV. Hipfire engine drift now exceeds llama.cpp's engine + 4-bit-quant cost combined. The 0.07 nats "cumulative pipeline imprecision" from the closed floor investigation is the binding constraint on cross-engine KLD competitiveness, not the 4-bit format. See §2.4.1.
 
 ---
 
