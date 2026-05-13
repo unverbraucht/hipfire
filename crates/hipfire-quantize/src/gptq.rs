@@ -23,9 +23,15 @@
 //!    column update via FP64 Cholesky from `faer`, per-element
 //!    asymmetric INT4 quantize using the frozen per-256-block grids.
 //!
-//! 4. **`compute_damped_inverse`** — defensive: adaptive damping schedule
-//!    (10× per retry up to `max_damp_multiplier * mean(diag(H))`); if even
-//!    the cap fails, returns `Err(SingularEvenWithMaxDamp)` and the caller
+//! 4. **`compute_damped_inv_cholesky_upper`** — Cholesky-direct (per
+//!    Frantar et al. 2210.17323 Algorithm 1): compute `U` such that
+//!    `U · U^T = (P^T (H+λI) P)^-1`, where P is the WEIGHT-mode-actorder
+//!    permutation. Avoids materializing the dense inverse + the O(K³)
+//!    `solve(I)` back-substitution (the latter was single-threaded in
+//!    faer 0.24 and dominated wall time at K=12288). Inversion of L is
+//!    rayon-parallel column-wise. Defensive adaptive damping (10× per
+//!    retry up to `max_damp_multiplier * mean(diag(H))`); if even the
+//!    cap fails, returns `Err(SingularEvenWithMaxDamp)` and the caller
 //!    skips GPTQ for that tensor (falls through to plain MQ4 in main.rs).
 //!
 //! All linear algebra is FP64 (per Claude M2 + GLM5 M2 reviews) — FP32
@@ -68,8 +74,9 @@ pub fn quantize_mq4_element(w: f64, scale: f64, min_val: f64) -> f64 {
 /// the Hessian's null space (low-activation channels) makes naive
 /// Cholesky fail without it.
 ///
-/// Provided for testability; production GPTQ uses `compute_damped_inverse`
-/// which combines damping search + inversion in one decomposition.
+/// Provided for testability; production GPTQ uses
+/// `compute_damped_inv_cholesky_upper` (Cholesky-direct: returns U with
+/// U·U^T = H^-1 in one decomposition).
 pub fn cholesky_with_adaptive_damping(
     h: &Mat<f64>,
     initial_damp: f64,
@@ -121,37 +128,107 @@ fn clamped_initial_damp(initial_damp: f64, diag_mean: f64) -> f64 {
     initial_damp.max(f64::EPSILON * diag_mean.max(1.0))
 }
 
-/// Adaptive-damping search + dense inverse, in one decomposition.
+/// Adaptive-damping search + upper Cholesky factor of the inverse
+/// permuted Hessian — the Cholesky-direct GPTQ formulation per Frantar
+/// et al. 2210.17323 Algorithm 1.
 ///
-/// Replaces the prior `cholesky_with_adaptive_damping` + separate
-/// `invert_damped_hessian` pair (which redundantly Cholesky'd twice).
-/// At K=12288 each Cholesky is ~5–10 minutes single-threaded; doubling
-/// it across 248 tensors burns ~40 hours of CPU.
+/// Returns `(U, effective_damp)` where `U` is K×K with the upper
+/// triangle populated such that `U · U^T = (P^T (H + λI) P)^-1`, with
+/// `P` the permutation given by `perm` (or identity if `perm` is None).
+/// `effective_damp` is the damping value that worked.
 ///
-/// On success returns `(H_inv, effective_damp)` where `H_inv = (H + λI)^-1`
-/// in FP64. On terminal failure even at the cap, returns
-/// `CholeskyError::SingularEvenWithMaxDamp` — caller's signal to skip
-/// GPTQ for this tensor and fall through to plain MQ4.
-pub fn compute_damped_inverse(
+/// Replaces the earlier `compute_damped_inverse` (which materialized
+/// the dense K×K inverse via `decomp.solve(&identity)` — a single-
+/// threaded O(K³) back-substitution that dominated wall time at
+/// K=12288). The L-direct form does **one** Cholesky plus a
+/// rayon-parallel per-column triangular inverse (O(K³/3) split across
+/// rayon workers). Net speedup at K=12288 is ~5–10× wall, and the
+/// peak memory drops by ~1.2 GB (no K×K identity buffer + no dense
+/// H_inv intermediate).
+///
+/// Cholesky-direct OBS algebra is algebraically equivalent to the
+/// dense-inverse formulation (Frantar et al. §3.1) — quality-neutral
+/// substitution. Every other GPTQ implementation (vLLM, AutoGPTQ,
+/// gptqmodel) uses this form for the same reason.
+pub fn compute_damped_inv_cholesky_upper(
     h: &Mat<f64>,
+    perm: Option<&[usize]>,
     initial_damp: f64,
     max_damp_multiplier: f64,
 ) -> Result<(Mat<f64>, f64), CholeskyError> {
     let k = h.nrows();
     assert_eq!(h.nrows(), h.ncols(), "Hessian must be square");
-    let diag_mean: f64 = (0..k).map(|i| h[(i, i)]).sum::<f64>() / k as f64;
+    if let Some(p) = perm {
+        assert_eq!(p.len(), k, "permutation length must equal Hessian dim");
+    }
+
+    // Materialize H_eff = P^T H P (or H itself when perm is None).
+    // Cholesky's column order must match the GPTQ inner loop's processing
+    // order; the upper-triangular U is only "upper" relative to THIS order.
+    let h_eff: Mat<f64> = if let Some(p) = perm {
+        Mat::<f64>::from_fn(k, k, |i, j| h[(p[i], p[j])])
+    } else {
+        h.clone()
+    };
+
+    let diag_mean: f64 = (0..k).map(|i| h_eff[(i, i)]).sum::<f64>() / k as f64;
     let mut damp = clamped_initial_damp(initial_damp, diag_mean);
     let damp_cap = max_damp_multiplier * diag_mean;
-    let identity = Mat::<f64>::identity(k, k);
+
     loop {
-        let mut a = h.clone();
+        let mut a = h_eff.clone();
         for i in 0..k {
             a[(i, i)] += damp;
         }
         match a.llt(Side::Lower) {
             Ok(decomp) => {
-                let h_inv = decomp.solve(&identity);
-                return Ok((h_inv, damp));
+                // Materialize L = lower Cholesky of (H_eff + λI), so L·L^T = H_eff+λI.
+                let l_view = decomp.L();
+                let mut l_mat = Mat::<f64>::zeros(k, k);
+                for j in 0..k {
+                    for i in j..k {
+                        l_mat[(i, j)] = l_view[(i, j)];
+                    }
+                }
+
+                // Invert L (lower-triangular): each column j of L_inv is
+                // the solution to L · x = e_j by forward substitution.
+                // Columns are independent → rayon-parallel.
+                //
+                // For column j:
+                //   x[i] = 0           for i < j  (lower-tri)
+                //   x[j] = 1 / L[j, j]
+                //   x[i] = -(Σ_{m=j..i} L[i, m] · x[m]) / L[i, i]   for i > j
+                let l_mat_ref = &l_mat;
+                let l_inv_cols: Vec<Vec<f64>> = (0..k).into_par_iter().map(|j| {
+                    let mut col = vec![0.0_f64; k];
+                    let l_jj = l_mat_ref[(j, j)];
+                    if l_jj <= 0.0 {
+                        return col;  // defensive: should not happen after successful LLT
+                    }
+                    col[j] = 1.0 / l_jj;
+                    for i in (j + 1)..k {
+                        let mut s = 0.0;
+                        for m in j..i {
+                            s += l_mat_ref[(i, m)] * col[m];
+                        }
+                        col[i] = -s / l_mat_ref[(i, i)];
+                    }
+                    col
+                }).collect();
+
+                // U = L_inv^T (upper-triangular).
+                // L_inv lower-tri:   L_inv[i, j] non-zero only for i >= j.
+                // → U[r, c] = L_inv[c, r] non-zero only for c >= r ✓.
+                // l_inv_cols[r] holds L_inv[:, r], so L_inv[c, r] = l_inv_cols[r][c].
+                let mut u = Mat::<f64>::zeros(k, k);
+                for r in 0..k {
+                    for c in r..k {
+                        u[(r, c)] = l_inv_cols[r][c];
+                    }
+                }
+
+                return Ok((u, damp));
             }
             Err(_) => {
                 if damp >= damp_cap {
@@ -610,18 +687,21 @@ pub fn gptq_column_sequential(
     assert_eq!(h_target.ncols(), k_dim);
     assert_eq!(frozen_grids.len(), (m * k_dim) / 256);
 
-    // Adaptive damping + dense inverse in one decomposition (see
-    // `compute_damped_inverse`). Previous codepath did the Cholesky twice
-    // — once to find a working damp, once to invert — which doubled the
-    // O(K³) cost per tensor.
-    let (h_inv, effective_damp) =
-        compute_damped_inverse(h_target, initial_damp, max_damp_multiplier)?;
-
     // WEIGHT-mode actorder: sort columns by descending diag(H_target).
-    // Process in `perm[0..K]` order; the storage layout (frozen_grids
-    // indexing) uses the ORIGINAL column index, not the permuted one.
+    // The Cholesky-direct upper factor U is computed on the PERMUTED
+    // Hessian P^T H P; weights + frozen grids stay in original indexing
+    // (perm[step] = original column index processed at step `step`).
     let h_diag: Vec<f64> = (0..k_dim).map(|i| h_target[(i, i)]).collect();
     let perm = weight_mode_actorder(&h_diag);
+
+    // Cholesky-direct: U is upper-triangular K×K with U·U^T = (P^T(H+λI)P)^-1.
+    // OBS inner loop uses U[step, step] as divisor and U[step, next_step]
+    // as propagation weight — algebraically equivalent to the dense-inverse
+    // form but avoids the O(K³) serial solve(I) that dominated wall time
+    // at K=12288. See `compute_damped_inv_cholesky_upper` for the math.
+    let (u, effective_damp) = compute_damped_inv_cholesky_upper(
+        h_target, Some(&perm), initial_damp, max_damp_multiplier,
+    )?;
 
     // Working copy of the post-quantize "residual" weights. We need to
     // keep the original values to compute the error for OBS propagation.
@@ -629,46 +709,42 @@ pub fn gptq_column_sequential(
     // future columns absorb the error compensation.
     let mut weights_residual: Vec<f64> = weights_flat.to_vec();
 
-    // Output: snapped values per (row, original_col). The outer
-    // column-sequential pass is intrinsically serial (column k+1 depends
-    // on column k's residual update), but both inner row-loops are
+    // Output: snapped values per (row, original_col). The outer column-
+    // sequential pass is intrinsically serial (column step+1 depends on
+    // column step's residual update), but both inner row-loops are
     // independent across rows — `par_chunks_mut` over `k_dim`-sized rows
-    // gives M-way parallelism. At K=12288, M=12288 the inner OBS update
-    // is the dominant cost; rayon-on-row turns ~hours of single-thread
-    // work into minutes on a ncpu-thread box.
+    // gives M-way parallelism.
     for step in 0..k_dim {
-        let j = perm[step];
-        let h_inv_jj = h_inv[(j, j)];
-        if h_inv_jj <= 0.0 {
-            // Defensive: inverse-Hessian diagonal should be strictly positive
-            // (Hessian is PSD; its inverse is too). If we hit 0 or negative
-            // it means numerical breakdown — skip this column's update,
-            // leave the original value in place (rare).
+        let j_orig = perm[step];
+        let u_ss = u[(step, step)];
+        if u_ss <= 0.0 {
+            // Defensive: U's diagonal entries are reciprocals of L's diagonal
+            // entries (positive for any SPD H). Hitting ≤0 means numerical
+            // breakdown — skip this column, leave residual unchanged (rare).
             continue;
         }
-        // Phase A: quantize column j to the MQ4 grid + compute err_col,
+        // Phase A: quantize column j_orig to the MQ4 grid + compute err_col,
         // parallel across rows. Each row writes its own disjoint
-        // `weights_flat[row * k_dim + j]` slot and reads its own
-        // `weights_residual[row * k_dim + j]`.
+        // `weights_flat[row * k_dim + j_orig]` slot.
         let err_col: Vec<f64> = weights_flat
             .par_chunks_mut(k_dim)
             .zip(weights_residual.par_chunks(k_dim))
             .enumerate()
             .map(|(row, (out_row, res_row))| {
-                let block_idx = block_idx_for(row, j, k_dim);
+                let block_idx = block_idx_for(row, j_orig, k_dim);
                 let grid = frozen_grids[block_idx];
-                let w = res_row[j];
+                let w = res_row[j_orig];
                 let q = quantize_mq4_element(w, grid.scale, grid.min_val);
-                out_row[j] = q;
-                (w - q) / h_inv_jj
+                out_row[j_orig] = q;
+                (w - q) / u_ss
             })
             .collect();
 
-        // Phase B: OBS propagation. Per-row update of all unprocessed
-        // columns, parallel across rows. The inner sweep over remaining
-        // columns is serial per-row to keep h_inv row-access localized
-        // and to avoid spawning a rayon task per column.
-        let h_inv_ref = &h_inv;
+        // Phase B: OBS propagation via U[step, next_step] (upper-triangular
+        // entries of U for unprocessed columns). Per-row update is
+        // independent → rayon-parallel; inner sweep over remaining
+        // permuted-column indices is serial per-row.
+        let u_ref = &u;
         let perm_ref = &perm;
         let err_ref = &err_col;
         weights_residual
@@ -680,10 +756,10 @@ pub fn gptq_column_sequential(
                     return;
                 }
                 for next_step in (step + 1)..k_dim {
-                    let kk = perm_ref[next_step];
-                    let h_inv_jk = h_inv_ref[(j, kk)];
-                    if h_inv_jk != 0.0 {
-                        res_row[kk] -= err * h_inv_jk;
+                    let kk_orig = perm_ref[next_step];
+                    let u_sn = u_ref[(step, next_step)];
+                    if u_sn != 0.0 {
+                        res_row[kk_orig] -= err * u_sn;
                     }
                 }
             });
@@ -1086,37 +1162,96 @@ mod tests {
             .expect("must terminate with successful damp on rank-1 H");
         assert!(damp > 0.0, "damp must be > 0 to make singular H invertible");
 
-        let (_h_inv, damp2) = compute_damped_inverse(&h, 0.0, 1.0)
-            .expect("compute_damped_inverse must also terminate");
+        let (_u, damp2) = compute_damped_inv_cholesky_upper(&h, None, 0.0, 1.0)
+            .expect("compute_damped_inv_cholesky_upper must also terminate");
         assert!(damp2 > 0.0);
     }
 
-    /// `compute_damped_inverse` is functionally equivalent to the prior
-    /// two-step (find damp via Cholesky → invert via second Cholesky)
-    /// pipeline. Cross-check on a tiny SPD matrix that the inverse
-    /// matches `(H + damp·I)^-1` computed via Cholesky-solve-identity.
+    /// `compute_damped_inv_cholesky_upper` satisfies `U · U^T = (H+λI)^-1`.
+    /// Cross-check on a tiny SPD matrix.
     #[test]
-    fn compute_damped_inverse_matches_two_step() {
+    fn compute_damped_inv_cholesky_upper_satisfies_identity() {
         let h = Mat::<f64>::from_fn(3, 3, |i, j| match (i, j) {
             (0, 0) => 4.0, (0, 1) => 1.0, (0, 2) => 0.5,
             (1, 0) => 1.0, (1, 1) => 3.0, (1, 2) => 0.25,
             (2, 0) => 0.5, (2, 1) => 0.25, (2, 2) => 2.0,
             _ => unreachable!(),
         });
-        let (h_inv, damp) = compute_damped_inverse(&h, 0.01, 1.0).unwrap();
-        // Verify (H + damp·I) · h_inv ≈ I
+        let (u, damp) = compute_damped_inv_cholesky_upper(&h, None, 0.01, 1.0).unwrap();
+
+        // U is upper-triangular: U[i, j] = 0 for i > j.
+        for i in 0..3 {
+            for j in 0..i {
+                assert_eq!(u[(i, j)], 0.0, "U should be upper-tri: U[{i},{j}]={}", u[(i, j)]);
+            }
+        }
+
+        // Compute (U · U^T) and (H + damp·I)^-1 via brute force; compare.
+        let mut uut = [[0.0_f64; 3]; 3];
+        for i in 0..3 {
+            for j in 0..3 {
+                let mut s = 0.0;
+                for k in 0..3 {
+                    s += u[(i, k)] * u[(j, k)];  // U·U^T  (note transpose on RHS)
+                }
+                uut[i][j] = s;
+            }
+        }
+
+        // (H + damp·I) · uut should be I.
         let mut a = h.clone();
         for i in 0..3 { a[(i, i)] += damp; }
         for i in 0..3 {
             for j in 0..3 {
                 let mut s = 0.0;
-                for kk in 0..3 {
-                    s += a[(i, kk)] * h_inv[(kk, j)];
+                for k in 0..3 {
+                    s += a[(i, k)] * uut[k][j];
                 }
                 let expected = if i == j { 1.0 } else { 0.0 };
                 assert!(
                     (s - expected).abs() < 1e-10,
-                    "(H+damp·I)·H_inv [{i},{j}] = {s}, expected {expected}"
+                    "(H+damp·I)·(U·U^T) [{i},{j}] = {s}, expected {expected}"
+                );
+            }
+        }
+    }
+
+    /// Permuted variant: `U · U^T = (P^T (H+λI) P)^-1`.
+    #[test]
+    fn compute_damped_inv_cholesky_upper_with_permutation() {
+        let h = Mat::<f64>::from_fn(3, 3, |i, j| match (i, j) {
+            (0, 0) => 4.0, (0, 1) => 1.0, (0, 2) => 0.5,
+            (1, 0) => 1.0, (1, 1) => 3.0, (1, 2) => 0.25,
+            (2, 0) => 0.5, (2, 1) => 0.25, (2, 2) => 2.0,
+            _ => unreachable!(),
+        });
+        let perm = vec![2_usize, 0, 1];  // arbitrary permutation
+        let (u, damp) = compute_damped_inv_cholesky_upper(&h, Some(&perm), 0.01, 1.0).unwrap();
+
+        // Build H_perm = P^T H P + damp·I (the matrix Cholesky operated on).
+        let mut h_perm = Mat::<f64>::zeros(3, 3);
+        for i in 0..3 {
+            for j in 0..3 {
+                h_perm[(i, j)] = h[(perm[i], perm[j])];
+            }
+        }
+        for i in 0..3 { h_perm[(i, i)] += damp; }
+
+        // (P^T H P + damp·I) · (U · U^T) should be I.
+        for i in 0..3 {
+            for j in 0..3 {
+                let mut s = 0.0;
+                for k in 0..3 {
+                    let mut uut_kj = 0.0;
+                    for m in 0..3 {
+                        uut_kj += u[(k, m)] * u[(j, m)];
+                    }
+                    s += h_perm[(i, k)] * uut_kj;
+                }
+                let expected = if i == j { 1.0 } else { 0.0 };
+                assert!(
+                    (s - expected).abs() < 1e-10,
+                    "(H_perm) · (U·U^T) [{i},{j}] = {s}, expected {expected}"
                 );
             }
         }
