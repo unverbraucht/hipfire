@@ -386,7 +386,7 @@ print(s)
     if command -v hipfire >/dev/null 2>&1; then
         # Default mode
         hipfire stop 2>&1 | head -1 || true; sleep 2
-        HIPFIRE_DEFAULT_MODEL="$HFQ_PATH" hipfire serve 8080 -d 2>&1 | tail -1 >/dev/null
+        HIPFIRE_MODEL="$HFQ_PATH" hipfire serve 8080 -d 2>&1 | tail -1 >/dev/null
         if ! wait_for_model_ready "$HFQ_PATH" 300; then
             SMOKE_DEFAULT="ERR_DAEMON_NOT_READY"
             SMOKE_WORKAROUND="ERR_DAEMON_NOT_READY"
@@ -423,7 +423,7 @@ except Exception as e:
 
         # Workaround mode (HIPFIRE_QWEN_MOE_FINAL_NORM_RAW=1)
         sleep 2
-        HIPFIRE_QWEN_MOE_FINAL_NORM_RAW=1 HIPFIRE_DEFAULT_MODEL="$HFQ_PATH" hipfire serve 8080 -d 2>&1 | tail -1 >/dev/null
+        HIPFIRE_QWEN_MOE_FINAL_NORM_RAW=1 HIPFIRE_MODEL="$HFQ_PATH" hipfire serve 8080 -d 2>&1 | tail -1 >/dev/null
         if ! wait_for_model_ready "$HFQ_PATH" 300; then
             SMOKE_WORKAROUND="ERR_DAEMON_NOT_READY"
             hipfire stop 2>&1 | head -1 || true

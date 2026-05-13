@@ -57,7 +57,7 @@ mkdir -p "$(dirname "$OUT")"
 hipfire stop 2>&1 | head -1 || true
 sleep 2
 echo "Starting daemon with model: $HFQ_PATH"
-HIPFIRE_DEFAULT_MODEL="$HFQ_PATH" hipfire serve 8080 -d 2>&1 | tail -2
+HIPFIRE_MODEL="$HFQ_PATH" hipfire serve 8080 -d 2>&1 | tail -2
 
 # Wait until /v1/models reports the requested model is registered. The CLI's
 # own `serve -d` polls /health before returning, but /v1/models is the
