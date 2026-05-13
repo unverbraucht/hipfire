@@ -137,6 +137,96 @@ A four-row 9B strip (q8f16, mq4-base, mq4-awq @ q8 KV + one Q4_K_M GGUF @ q8 KV)
 
 ---
 
+## 4A. Open format-coverage measurement gaps
+
+The current cohort runs only cover MQ4 / HFP4 / MFP4 family. Sub-4-bit
+formats and the Lloyd codebook variants have NOT been measured against
+the post-RoPE-fix BF16 reference. Per CLAUDE.md and the format roadmap,
+several of these are theorized to deliver meaningful quality lifts and
+need to be benched before strategic decisions get cemented.
+
+### 4A.1 Sub-4-bit and Lloyd variants — unmeasured
+
+| Format | bpw | Status on disk | Gated by | KLD against current ref? |
+|---|---:|---|---|---|
+| MQ3G256 (uniform 3-bit) | 3.25 | `~/.hipfire/models/qwen3.5-9b.mq3` exists | — | **NOT MEASURED** |
+| MQ3G256-Lloyd (3-bit + per-block Lloyd-Max 8-entry FP16 codebook) | 3.50 | `~/.hipfire/models/qwen3.5-9b.mq3-lloyd` exists | — | **NOT MEASURED** |
+| MQ4G256-Lloyd (4-bit + Lloyd codebook, prefill kernel) | ~4.5 | not quantized | PR [#197](https://github.com/Kaden-Schutt/hipfire/pull/197) (`feat/issue-182-mq4-lloyd`, open) | **NOT MEASURED** |
+| MQ2G256-Lloyd (2-bit + Lloyd codebook) | ~2.5 | check `~/.hipfire/models/` | — | **NOT MEASURED** |
+
+### 4A.2 Lloyd-transform uplift — investigation note
+
+The Lloyd-Max per-block codebook (used in mq3-lloyd / mq4-lloyd /
+mq2-lloyd) replaces the uniform 4/8/16-codepoint grid with K
+data-driven centroids fit to each post-FWHT block's value distribution.
+Theory: for post-FWHT weights with heavy-tailed kurtosis, a uniform
+grid wastes codepoints on tail bins while under-resolving the dense
+center. Lloyd codebooks should claw back precision proportional to
+how non-uniform the post-FWHT distribution is.
+
+**Expected uplift to measure (against current post-RoPE-fix ref):**
+1. **MQ3 → MQ3-Lloyd at 9B.** Lloyd at 3-bit is theorized to be the
+   bigger lever (MQ3 uniform is on the cliff of where 3-bit becomes
+   unusable; codebook adaptation may rescue it). Direct A/B since both
+   .hfq files already exist on disk.
+2. **MQ4 → MQ4-Lloyd at 9B.** Gated on PR #197 merging or being
+   checked out temporarily. Smaller theoretical uplift than MQ3-Lloyd
+   (MQ4 uniform is already in the well-behaved zone) but worth a
+   measurement to know the order of magnitude before committing
+   format/kernel work.
+3. **Stacking interaction with AWQ.** AWQ pre-scaling reshapes the
+   per-channel value distribution before FWHT; whether Lloyd codebooks
+   trained on post-AWQ post-FWHT blocks deliver the same uplift as on
+   non-AWQ blocks is open. The Stage A → Stage B → Stage C roadmap
+   currently treats AWQ + GPTQ + Lloyd as orthogonal levers; measuring
+   them as additive vs interfering is part of the design validation.
+
+**Highest-leverage measurement order:**
+1. mq3 + mq3-lloyd at 9B (no PR gating, no quantize required, ~30 min wall)
+2. mq3 + mq3-lloyd at 0.8B (need to quantize first; ~10 min quantize + ~15 min eval)
+3. mq4-lloyd at 9B (gated on PR #197 — see below)
+4. mq4-lloyd + AWQ stack at 9B (Phase A Step 5c follow-up)
+
+### 4A.3 How to measure mq4-lloyd (gated on PR #197)
+
+PR `Kaden-Schutt/hipfire#197` (`feat/issue-182-mq4-lloyd`, OPEN) ships
+the MQ4-Lloyd WMMA prefill kernels. To measure mq4-lloyd KLD without
+merging:
+
+```bash
+# Save current branch
+git checkout -b backup-feat-mq-v2 feat/mq-v2-quant-format
+
+# Fetch + check out the PR
+gh pr checkout 197 -R Kaden-Schutt/hipfire
+
+# Quantize a candidate
+cargo run --release -p hipfire-quantize -- \
+    --hf <bf16-path> --format mq4-lloyd \
+    --out ~/.hipfire/models/qwen3.5-9b.mq4-lloyd
+
+# Eval against the existing ref
+./target/release/examples/eval_hipfire \
+    --model ~/.hipfire/models/qwen3.5-9b.mq4-lloyd \
+    --ref benchmarks/quality-baselines/refs/qwen3.5-9b-bf16.kldref.bin \
+    --output benchmarks/quality-baselines/results/<dated>/qwen35-9b-mq4-lloyd__gfx1100.kldseq \
+    --kv-mode asym3 --scoring-mode prefill --max-chunks 512
+
+# Reduce + copy results back to feat/mq-v2-quant-format
+# (the .kldseq file is engine-version-agnostic; row can be appended
+#  to the master doc without re-running on the main branch)
+
+# Restore working branch
+git checkout feat/mq-v2-quant-format
+```
+
+The `.kldseq` artifact + reduced KLD/PPL values are portable across
+engine versions (the slice is the slice; the reference is the
+reference). Result row goes into §1 of this doc; flag the engine
+SHA in the row's "Notes" field (e.g. "engine=PR#197@<sha>").
+
+---
+
 ## 5. Key findings catalog
 
 - **2026-05-12 — RoPE fix flips defaults.** Halfsplit (HF convention) becomes default; interleaved relegated to `HIPFIRE_ROPE_INTERLEAVED_LEGACY=1`. Drops 0.8B Q8 floor from ~0.49 to ~0.13. Commit `1805d820`.
