@@ -307,6 +307,15 @@ required-features = ["arch-qwen35", "deltanet"]
 name = "recurrence_matched_input"
 required-features = []
 
+# rmsnorm_isolated — pattern-hunt Day 0/1 workhorse. Reads HF stage-0 from a
+# HIPFIRE_DUMP_LA_STAGES dump, runs a single rmsnorm kernel variant against
+# the model's input_layernorm weight, writes stage-1 records for comparison.
+# Variants selected via --kernel <entry>. See
+# docs/investigations/2026-05-13-engine-drift-residual-audit/04-pattern-hunt-plan.md.
+[[example]]
+name = "rmsnorm_isolated"
+required-features = []
+
 # Tokenizer-parity helper: reads a .hfq's tokenizer + tokenizes a text slice.
 # No GPU / arch features needed (tokenizer is pure CPU).
 [[example]]

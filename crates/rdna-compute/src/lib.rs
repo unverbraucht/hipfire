@@ -10,3 +10,4 @@ pub mod profiler;
 pub use compiler::KernelCompiler;
 pub use dispatch::{gemv_dp4a_enabled, DType, Gpu, GpuTensor};
 pub use kernels::GEMV_SRC;
+pub use kernels::RMSNORM_SRC;
