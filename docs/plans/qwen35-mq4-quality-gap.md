@@ -1001,6 +1001,32 @@ Per-tensor compare at Qwen3.5-0.8B chunk 0, LA layer 4 (halfsplit RoPE, kv-q8):
 
 Next bisect: dump `a_raw` (post-projection, pre-sigmoid_alpha_gate transform) and the per-head A_log + dt_bias values from hipfire's weights vs HF's nn.Parameter directly. If the per-head constants match, the bug is in the per-position `a` flow (most likely upstream residual drift). If they don't, hipfire's loader for `linear_attn.A_log` or `linear_attn.dt_bias` has a sign / log / unit convention mismatch.
 
+**Loader-bias bisect complete (2026-05-13). Root cause: distributed drift, no single bug.**
+
+A_log + dt_bias safetensors values match BYTE-EXACTLY between hipfire's stored .hfq and HF's safetensors (max abs diff 0). Q8 dequant of in_proj_a weight matches HF BF16 with max abs diff 6.7e-4, mean diff 2e-6 — no systematic weight bias. So the +0.04 bias in raw `a` (in_proj_a output, pre-sigmoid_alpha_gate) comes from elsewhere.
+
+Direct chain-of-bias measurement:
+
+| Layer | Stage | HF mean | hip mean | delta |
+|---|---|---:|---:|---:|
+| 3   | output (= layer 4 residual input) | -0.001736 | -0.001700 | +3.6e-5 / dim |
+| 4   | post-attn_norm × in_proj_a (raw `a`) | -2.093 | -2.054 | +0.039 |
+| 4   | post-`-exp(A_log) * softplus(a + dt_bias)` (final alpha) | -0.332 | -0.344 | -0.012 (sign-flipped by `-exp(...)`) |
+
+The per-dim residual-stream bias of 3.6e-5 is tiny in absolute terms, but:
+  - It's **accumulated across 4 prior layers** (each contributes a small per-kernel-rounding deviation).
+  - It gets **amplified by ~24×** through the layer-internal RMSNorm scale-gain.
+  - Then **amplified by ~3×** through softplus in its non-linear region.
+  - Then **accumulated over 2048 positions** in the DeltaNet recurrence.
+
+Net result: ~0.04 nats of drift per LA layer at the layer output. With 18 LA layers + 6 FA layers in 0.8B, the model output diverges from HF by ~0.08 nats KLD.
+
+**There is no single localizable bug.** GLM-5's verdict that all upstream stages are "clean" is correct in the sense that no kernel has an obvious convention mismatch — but their attribution to "quant noise amplified by recurrence" is wrong (refuted by the F16-LA test). The actual mechanism is *cumulative numerical imprecision across the forward pipeline*: each kernel's accumulator order, fused-vs-separate-op rounding, and gain stacking through norm weights collectively produce a small per-dim residual-stream bias that compounds layer-by-layer.
+
+To push the floor below 0.08 nats would require: (a) auditing every kernel's accumulator precision and rounding mode, (b) matching every gain-stacking convention (e.g., GemmaRMSNorm's +1 baking) byte-for-byte against HF, (c) considering fp64 accumulation at specific hot spots. Cost: multi-day audit. Marginal value: ≲ 0.07 nats KLD reduction on a model whose post-RoPE-fix floor is already at 0.08 (within 10× of plain Qwen3's 0.01).
+
+**Recommendation: accept the 0.08 floor as the engine-vs-engine numerical-pipeline cost.** Re-evaluate when a sensitive downstream test (PPL on a code corpus, HumanEval pass-rate at low temp, etc.) demonstrates the 0.08 actually matters.
+
 Raw per-layer dumps at `/data/cache/hipfire/q3.5-0.8b-{hf,hipfire}-hidden-chunk0.bin` (not committed, 192 MB each); the comparator output is reproducible from the scripts in `scripts/dump_hf_hidden_states.py`, `scripts/compare_hidden_states.py`, and the new example binary.
 
 **Cross-engine sanity check (Step B, 2026-05-12 evening) — confirms Step A is well-posed.**

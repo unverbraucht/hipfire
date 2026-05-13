@@ -5987,6 +5987,38 @@ fn dump_dn_inputs(
     Ok(())
 }
 
+/// Companion to `dump_dn_inputs` — captures only the raw post-w_alpha
+/// projection alpha (i.e. `s.dn_alpha` BEFORE `fused_sigmoid_alpha_gate`).
+/// Same file format as dump_dn_inputs but only the alpha slot is written
+/// (Q/K/V/beta slots are zero-padded for layout compatibility).
+fn dump_a_raw(
+    gpu: &mut Gpu,
+    path: &str,
+    layer_idx: usize,
+    pos: usize,
+    dn_alpha: &GpuTensor,
+    n_v_heads: usize,
+) -> HipResult<()> {
+    use std::io::Write;
+    let a_host = gpu.download_f32(dn_alpha)?;
+    assert_eq!(a_host.len(), n_v_heads, "dn_alpha size mismatch in dump_a_raw");
+    let mut f = std::fs::OpenOptions::new()
+        .create(true).append(true).open(path)
+        .unwrap_or_else(|e| panic!("dump_a_raw open {path}: {e}"));
+    let hdr = [
+        layer_idx as u32, pos as u32,
+        n_v_heads as u32, 0u32,
+        0u32, n_v_heads as u32,
+        0u32, 0u32,
+    ];
+    for w in hdr.iter() { f.write_all(&w.to_le_bytes()).unwrap(); }
+    let bytes = unsafe {
+        std::slice::from_raw_parts(a_host.as_ptr() as *const u8, a_host.len() * 4)
+    };
+    f.write_all(bytes).unwrap();
+    Ok(())
+}
+
 /// Layer loop using scratch buffers. Zero alloc/free per token.
 ///
 /// `hidden_rb`: if Some, the layer loop extracts post-residual hidden states
@@ -6085,6 +6117,19 @@ fn forward_scratch_layers(
                     weight_gemv_prerotated(gpu, &layer.w_beta, &s.tmp, x_rot, &s.dn_beta)?;
                     weight_gemv_prerotated(gpu, &layer.w_alpha, &s.tmp, x_rot, &s.dn_alpha)?;
                 }
+                // Probe (in-place): HIPFIRE_DUMP_A_RAW=<path> +
+                // HIPFIRE_DUMP_DN_LAYER=<idx> captures the post-w_alpha-projection
+                // alpha scalar-per-head value BEFORE the sigmoid_alpha_gate
+                // transform fires. Bisects whether alpha drift originates in
+                // projection or in the softplus/A_log/dt_bias transform.
+                if let Some(p) = std::env::var("HIPFIRE_DUMP_A_RAW").ok().as_deref() {
+                    let target = std::env::var("HIPFIRE_DUMP_DN_LAYER")
+                        .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(4);
+                    if layer_idx == target {
+                        dump_a_raw(gpu, p, layer_idx, pos, &s.dn_alpha, n_v_heads)?;
+                    }
+                }
+
                 // Fused sigmoid(dn_beta) + alpha_gate(dn_alpha). Both ops are
                 // elementwise scalar transforms on independent buffers of size
                 // n_v_heads — merging into one launch shaves one dispatch per LA.
