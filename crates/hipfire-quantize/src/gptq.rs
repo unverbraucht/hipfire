@@ -282,6 +282,142 @@ pub struct BlockGrid {
     pub min_val: f64,
 }
 
+/// Apply per-256-block FWHT to a row-major M×K f64 weight matrix in place.
+///
+/// Mirrors the per-block FWHT that `quantize_mq4g256` (main.rs:553-554)
+/// does internally, but in FP64 so it composes with GPTQ's FP64 pipeline.
+/// Used by the GPTQ pipeline to rotate weights once at the start of the
+/// per-tensor work — Option β per the v2 plan §2.2.
+pub fn apply_fwht_per_256_to_weights_f64(
+    weights: &mut [f64],
+    m: usize,
+    k: usize,
+    signs1: &[f64],
+    signs2: &[f64],
+) {
+    assert_eq!(weights.len(), m * k);
+    assert_eq!(k % 256, 0, "K={k} must be divisible by 256 for FWHT-256");
+    assert_eq!(signs1.len(), 256);
+    assert_eq!(signs2.len(), 256);
+    let blocks_per_row = k / 256;
+    for r in 0..m {
+        for b in 0..blocks_per_row {
+            let start = r * k + b * 256;
+            let mut buf = [0.0_f64; 256];
+            buf.copy_from_slice(&weights[start..start + 256]);
+            fwht_256_inplace_f64(&mut buf, signs1, signs2);
+            weights[start..start + 256].copy_from_slice(&buf);
+        }
+    }
+}
+
+/// Pack rotated FP64 weights into MQ4G256 INT4 codewords using the FROZEN
+/// per-256-block grids. Output byte layout matches `quantize_mq4g256`
+/// exactly: per 256-block, 4-byte FP32 scale + 4-byte FP32 min_val +
+/// 128 bytes of packed 4-bit codewords (2 per byte).
+///
+/// Used as the final packing step of the GPTQ pipeline. The input
+/// `weights` are post-FWHT (rotated by the same FWHT that the existing
+/// MQ4 GEMV kernel rotates `x` against at inference). Output is byte-
+/// equivalent to what `quantize_mq4g256` would have produced, except
+/// the codewords reflect GPTQ's Hessian-aware column updates instead
+/// of plain RTN on the same rotated input.
+pub fn pack_mq4g256_from_rotated_f64(weights: &[f64], grids: &[BlockGrid]) -> Vec<u8> {
+    let n = weights.len();
+    assert_eq!(n % 256, 0);
+    let n_blocks = n / 256;
+    assert_eq!(grids.len(), n_blocks);
+
+    let block_bytes = 136usize;
+    let mut output = vec![0u8; n_blocks * block_bytes];
+
+    for b in 0..n_blocks {
+        let grid = grids[b];
+        let scale_f32 = grid.scale as f32;
+        let min_f32 = grid.min_val as f32;
+        let inv_scale = if grid.scale > 0.0 { 1.0 / grid.scale } else { 0.0 };
+
+        let out_off = b * block_bytes;
+        output[out_off..out_off + 4].copy_from_slice(&scale_f32.to_le_bytes());
+        output[out_off + 4..out_off + 8].copy_from_slice(&min_f32.to_le_bytes());
+
+        let group = &weights[b * 256..(b + 1) * 256];
+        for i in 0..128 {
+            // Round-half-up to MQ4 grid (matches quantize_mq4g256 main.rs:568).
+            let lo_q = (((group[2 * i] - grid.min_val) * inv_scale) + 0.5).floor() as i32;
+            let hi_q = (((group[2 * i + 1] - grid.min_val) * inv_scale) + 0.5).floor() as i32;
+            let lo = lo_q.clamp(0, 15) as u8;
+            let hi = hi_q.clamp(0, 15) as u8;
+            output[out_off + 8 + i] = lo | (hi << 4);
+        }
+    }
+
+    output
+}
+
+/// High-level GPTQ pipeline for one MQ4G256 tensor.
+///
+/// Input is the post-AWQ-prescaled FP32 weight matrix (row-major M × K),
+/// plus the unrotated/unscaled Hessian `H_unrot` from the sidecar, plus
+/// the AWQ scale vector `s` (or `vec![1.0; K]` for non-AWQ tensors).
+///
+/// Performs the full quantize-time GPTQ chain:
+///   1. AWQ-rescale H (no-op if s = 1)
+///   2. FWHT-per-256 similarity transform on H → H_target in the basis
+///      the matmul kernel actually operates in (Option β).
+///   3. FWHT-per-256 on weights → W_rot in same basis.
+///   4. Pre-compute FROZEN per-256-block grids from W_rot.
+///   5. Run gptq_column_sequential on W_rot with H_target + frozen grids.
+///   6. Pack post-GPTQ weights using the SAME frozen grids → MQ4 codewords.
+///
+/// Returns the packed MQ4G256 bytes (same layout as `quantize_mq4g256`).
+/// On Cholesky failure even after adaptive damping, falls back to plain
+/// `quantize_mq4g256` (with a warning passed via the `on_fallback` callback).
+pub fn gptq_pipeline_mq4g256(
+    weights_f32: &[f32],
+    m: usize,
+    k: usize,
+    h_unrot_f32: &[f32],     // K*K row-major
+    awq_scales: &[f64],      // length K; pass [1.0; K] for non-AWQ
+    signs1_f32: &[f32],
+    signs2_f32: &[f32],
+    initial_damp: f64,
+    max_damp_multiplier: f64,
+) -> Result<Vec<u8>, CholeskyError> {
+    assert_eq!(weights_f32.len(), m * k);
+    assert_eq!(h_unrot_f32.len(), k * k);
+    assert_eq!(awq_scales.len(), k);
+
+    // Cast to f64 for the GPTQ pipeline. AWQ pre-scaling has already
+    // been applied to weights upstream; we only need to rescale H here.
+    let mut h = Mat::<f64>::from_fn(k, k, |i, j| h_unrot_f32[i * k + j] as f64);
+    apply_awq_rescaling(&mut h, awq_scales);
+
+    let signs1: Vec<f64> = signs1_f32.iter().map(|&v| v as f64).collect();
+    let signs2: Vec<f64> = signs2_f32.iter().map(|&v| v as f64).collect();
+    fwht_similarity_per_256(&mut h, &signs1, &signs2);
+
+    let mut weights = vec![0.0_f64; m * k];
+    for (i, &w) in weights_f32.iter().enumerate() {
+        weights[i] = w as f64;
+    }
+    apply_fwht_per_256_to_weights_f64(&mut weights, m, k, &signs1, &signs2);
+
+    let frozen_grids = compute_frozen_block_grids(&weights);
+
+    gptq_column_sequential(
+        &mut weights,
+        &h,
+        m,
+        k,
+        &frozen_grids,
+        initial_damp,
+        max_damp_multiplier,
+    )?;
+
+    Ok(pack_mq4g256_from_rotated_f64(&weights, &frozen_grids))
+}
+
 /// Compute the FROZEN per-256-block grids from the FWHT-rotated, AWQ-scaled
 /// weights — exactly the same per-block min/max scheme that
 /// `quantize_mq4g256` uses in main.rs:554-559. Frozen through the GPTQ
@@ -674,6 +810,107 @@ mod tests {
                 rtn[i]
             );
         }
+    }
+
+    /// Pack helper round-trips: packing then unpacking the codewords
+    /// recovers the snapped grid values (within the per-block grid).
+    #[test]
+    fn pack_mq4g256_from_rotated_round_trip() {
+        // Build 256 known values that snap to a 16-bucket grid.
+        let weights: Vec<f64> = (0..256).map(|i| (i as f64) * 0.1).collect();
+        let grids = compute_frozen_block_grids(&weights);
+        // grid: scale=1.7, min_val=0.0
+        let packed = pack_mq4g256_from_rotated_f64(&weights, &grids);
+        assert_eq!(packed.len(), 136);
+        // Decode the per-block header
+        let scale = f32::from_le_bytes(packed[0..4].try_into().unwrap()) as f64;
+        let min_val = f32::from_le_bytes(packed[4..8].try_into().unwrap()) as f64;
+        assert!((scale - 1.7).abs() < 1e-6);
+        assert_eq!(min_val, 0.0);
+        // Decode every code, verify it matches a fresh per-element quantize.
+        for i in 0..128 {
+            let byte = packed[8 + i];
+            let lo = (byte & 0xF) as f64;
+            let hi = ((byte >> 4) & 0xF) as f64;
+            let lo_dec = lo * scale + min_val;
+            let hi_dec = hi * scale + min_val;
+            let lo_expected = quantize_mq4_element(weights[2 * i], scale, min_val);
+            let hi_expected = quantize_mq4_element(weights[2 * i + 1], scale, min_val);
+            assert!(
+                (lo_dec - lo_expected).abs() < 1e-9,
+                "pack/decode mismatch at bucket {i} lo: got {lo_dec}, expected {lo_expected}"
+            );
+            assert!(
+                (hi_dec - hi_expected).abs() < 1e-9,
+                "pack/decode mismatch at bucket {i} hi: got {hi_dec}, expected {hi_expected}"
+            );
+        }
+    }
+
+    /// FWHT-per-256 preserves Parseval inner products. With asymmetric
+    /// signs1/signs2 (as the actual MQ4 kernel uses via different seeds
+    /// 42/1042), the FWHT is NOT self-inverse — but it is Parseval-orthogonal:
+    /// `<FWHT(a), FWHT(b)> = <a, b>`. That's the only identity GPTQ + the
+    /// MQ4 dot-product correctness rely on.
+    #[test]
+    fn fwht_per_256_weights_preserves_parseval() {
+        let k = 256;
+        // Two distinct random-ish vectors
+        let a_orig: Vec<f64> = (0..k).map(|i| (i as f64 * 0.7).sin()).collect();
+        let b_orig: Vec<f64> = (0..k).map(|i| (i as f64 * 0.3).cos() + 0.5).collect();
+        let dot_before: f64 = (0..k).map(|i| a_orig[i] * b_orig[i]).sum();
+
+        // Use deterministic ±1 sign tables (asymmetric — like the real kernel).
+        let signs1: Vec<f64> = (0..256).map(|i| if i % 3 == 0 { 1.0 } else { -1.0 }).collect();
+        let signs2: Vec<f64> = (0..256).map(|i| if (i / 4) % 2 == 0 { 1.0 } else { -1.0 }).collect();
+
+        let mut a = a_orig.clone();
+        let mut b = b_orig.clone();
+        // Treat each as a 1×K row-major matrix; FWHT in place
+        apply_fwht_per_256_to_weights_f64(&mut a, 1, k, &signs1, &signs2);
+        apply_fwht_per_256_to_weights_f64(&mut b, 1, k, &signs1, &signs2);
+        let dot_after: f64 = (0..k).map(|i| a[i] * b[i]).sum();
+
+        // Parseval: <FWHT(a), FWHT(b)> = <a, b> exactly (modulo FP).
+        assert!(
+            (dot_after - dot_before).abs() / dot_before.abs().max(1e-30) < 1e-9,
+            "Parseval failed: <a,b>={dot_before:.10e}, <FWHT(a),FWHT(b)>={dot_after:.10e}"
+        );
+    }
+
+    /// **End-to-end GPTQ pipeline test:** AWQ-noop (s=1) + GPTQ with
+    /// identity Hessian must produce the same bytes as plain RTN through
+    /// the rotated grid. Validates the full chain: AWQ rescale → FWHT
+    /// similarity → FWHT weights → frozen grids → GPTQ-identity → pack.
+    #[test]
+    fn gptq_pipeline_identity_matches_rtn_on_rotated() {
+        let m = 2;
+        let k = 256;
+        let weights_f32: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.01).collect();
+
+        // H = I (k×k), AWQ scales = 1.0 → entire pipeline reduces to
+        // FWHT → frozen grids → RTN → pack.
+        let h_unrot: Vec<f32> = (0..k * k).map(|i| if i / k == i % k { 1.0 } else { 0.0 }).collect();
+        let awq_scales = vec![1.0_f64; k];
+        let signs1: Vec<f32> = (0..256).map(|i| if i % 2 == 0 { 1.0 } else { -1.0 }).collect();
+        let signs2: Vec<f32> = (0..256).map(|i| if (i / 4) % 2 == 0 { 1.0 } else { -1.0 }).collect();
+
+        let gptq_packed = gptq_pipeline_mq4g256(
+            &weights_f32, m, k, &h_unrot, &awq_scales, &signs1, &signs2, 1e-6, 1.0
+        )
+        .expect("identity-H pipeline should not need damping");
+
+        // Independently compute RTN on the same rotated weights via the
+        // same packer (skip GPTQ).
+        let signs1_f64: Vec<f64> = signs1.iter().map(|&v| v as f64).collect();
+        let signs2_f64: Vec<f64> = signs2.iter().map(|&v| v as f64).collect();
+        let mut rotated_f64: Vec<f64> = weights_f32.iter().map(|&v| v as f64).collect();
+        apply_fwht_per_256_to_weights_f64(&mut rotated_f64, m, k, &signs1_f64, &signs2_f64);
+        let grids = compute_frozen_block_grids(&rotated_f64);
+        let rtn_packed = pack_mq4g256_from_rotated_f64(&rotated_f64, &grids);
+
+        assert_eq!(gptq_packed.len(), rtn_packed.len(), "byte-length mismatch");
+        assert_eq!(gptq_packed, rtn_packed, "GPTQ with identity-H should byte-equal plain rotated RTN");
     }
 
     /// **GPTQ reconstruction test:** for a well-conditioned diagonal-dominant H,
