@@ -35,6 +35,7 @@
 
 use faer::linalg::solvers::{DenseSolveCore, Solve};
 use faer::{Mat, Side};
+use rayon::prelude::*;
 
 /// Per-element asymmetric MQ4 quantize step.
 ///
@@ -628,9 +629,13 @@ pub fn gptq_column_sequential(
     // future columns absorb the error compensation.
     let mut weights_residual: Vec<f64> = weights_flat.to_vec();
 
-    // Output: snapped values per (row, original_col).
-    // We accumulate into `weights_flat` as we go; the algorithm only
-    // needs the residual for propagation.
+    // Output: snapped values per (row, original_col). The outer
+    // column-sequential pass is intrinsically serial (column k+1 depends
+    // on column k's residual update), but both inner row-loops are
+    // independent across rows — `par_chunks_mut` over `k_dim`-sized rows
+    // gives M-way parallelism. At K=12288, M=12288 the inner OBS update
+    // is the dominant cost; rayon-on-row turns ~hours of single-thread
+    // work into minutes on a ncpu-thread box.
     for step in 0..k_dim {
         let j = perm[step];
         let h_inv_jj = h_inv[(j, j)];
@@ -641,29 +646,47 @@ pub fn gptq_column_sequential(
             // leave the original value in place (rare).
             continue;
         }
-        // Quantize column j to the MQ4 grid.
-        let mut err_col = vec![0.0_f64; m];
-        for row in 0..m {
-            let flat_idx = row * k_dim + j;
-            let block_idx = block_idx_for(row, j, k_dim);
-            let grid = frozen_grids[block_idx];
-            let w = weights_residual[flat_idx];
-            let q = quantize_mq4_element(w, grid.scale, grid.min_val);
-            err_col[row] = (w - q) / h_inv_jj;
-            weights_flat[flat_idx] = q;
-        }
-        // OBS propagation: for each unprocessed column k > j (in perm order),
-        // subtract err * H_inv[j, k] from W[:, k].
-        for next_step in (step + 1)..k_dim {
-            let kk = perm[next_step];
-            let h_inv_jk = h_inv[(j, kk)];
-            if h_inv_jk == 0.0 {
-                continue;
-            }
-            for row in 0..m {
-                weights_residual[row * k_dim + kk] -= err_col[row] * h_inv_jk;
-            }
-        }
+        // Phase A: quantize column j to the MQ4 grid + compute err_col,
+        // parallel across rows. Each row writes its own disjoint
+        // `weights_flat[row * k_dim + j]` slot and reads its own
+        // `weights_residual[row * k_dim + j]`.
+        let err_col: Vec<f64> = weights_flat
+            .par_chunks_mut(k_dim)
+            .zip(weights_residual.par_chunks(k_dim))
+            .enumerate()
+            .map(|(row, (out_row, res_row))| {
+                let block_idx = block_idx_for(row, j, k_dim);
+                let grid = frozen_grids[block_idx];
+                let w = res_row[j];
+                let q = quantize_mq4_element(w, grid.scale, grid.min_val);
+                out_row[j] = q;
+                (w - q) / h_inv_jj
+            })
+            .collect();
+
+        // Phase B: OBS propagation. Per-row update of all unprocessed
+        // columns, parallel across rows. The inner sweep over remaining
+        // columns is serial per-row to keep h_inv row-access localized
+        // and to avoid spawning a rayon task per column.
+        let h_inv_ref = &h_inv;
+        let perm_ref = &perm;
+        let err_ref = &err_col;
+        weights_residual
+            .par_chunks_mut(k_dim)
+            .enumerate()
+            .for_each(|(row, res_row)| {
+                let err = err_ref[row];
+                if err == 0.0 {
+                    return;
+                }
+                for next_step in (step + 1)..k_dim {
+                    let kk = perm_ref[next_step];
+                    let h_inv_jk = h_inv_ref[(j, kk)];
+                    if h_inv_jk != 0.0 {
+                        res_row[kk] -= err * h_inv_jk;
+                    }
+                }
+            });
     }
 
     Ok(effective_damp)
