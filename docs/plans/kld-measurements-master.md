@@ -79,20 +79,52 @@ Source: `benchmarks/quality-baselines/results/2026-05-13-cohort-post-rope-fix-0.
 | Variant | KLD (CI) | p99 | PPL | Δ vs asym3 |
 |---|---|---:|---:|---:|
 | mq4-base | 0.2675 (0.2650–0.2699) | 2.366 | 22.088 | −0.0666 (−20%) |
-| mq4-awq | _running 2026-05-13 10:40_ | | | |
+| mq4-awq | **0.2531** (0.2506–0.2556) | 2.305 | 22.149 | −0.0469 (−16%) |
 | q8f16 | not measured yet (deferred — kernel-perf work in flight) | | | |
 
-### 2.3 llama.cpp GGUF anchors
+### 2.3 llama.cpp GGUF anchors (0.8B)
 
-No 0.8B GGUF anchor data measured yet against `qwen3.5-0.8b-bf16.kldref.bin`. A Q4_K_M GGUF run with q8 KV cache is in flight (user reported 2026-05-13 10:40, ETA ~10 min).
+Run via `eval_gguf` against `qwen3.5-0.8b-bf16.kldref.bin`. **Full slice (1175 chunks), not the 512-chunk quick-slice used by the hipfire 0.8B rows.** The slice-mean KLD usually shifts <2% between 512 and 1175 chunks (wikitext slice converges fast), but flagged here so it can't be forgotten.
 
-| Variant | KV mode | KLD | PPL | Status |
-|---|---|---:|---:|---|
-| Q4_K_M | q8 | _pending_ | | external run, expected 2026-05-13 ~10:50 |
+| Variant | bpw | KV mode | KLD | PPL | Chunks | Source |
+|---|---:|---|---:|---:|---:|---|
+| Q4_K_M | ~5.07 | q8 | **0.0351** | 17.334 | 1175 (full) | user-reported 2026-05-13 |
 
-### 2.4 0.8B cross-engine summary
+Q8_0 / UD-* anchors at 0.8B not yet measured.
 
-Pending the in-flight Q4_K_M GGUF run. Once it lands, fill in §1.3-style analysis here.
+### 2.4 0.8B cross-engine summary (after Q4_K_M anchor)
+
+At matched 4-bit + KV mode (q8 vs q8):
+
+| Engine | Variant | bpw | KLD | PPL | Gap to llama.cpp Q4_K_M |
+|---|---|---:|---:|---:|---:|
+| **llama.cpp** | Q4_K_M | 5.07 | **0.0351** | **17.33** | (anchor) |
+| hipfire | mq4-base | 4.25 | 0.2675 | 22.088 | +0.232 nats KLD, +27.5% PPL at −0.82 bpw |
+| hipfire | **mq4-awq** | 4.25 | **0.2531** | **22.149** | **+0.218 nats KLD, +27.8% PPL** at −0.82 bpw |
+
+**AWQ uplift is KV-mode-dependent.** At asym3 KV, AWQ improved 0.8B mq4 by −10.2% KLD; at q8 KV it's only −5.4%. Interpretation: AWQ partially compensates for KV-rotation noise (asym3 K rotation precision interacts with per-channel outliers); when the KV cache is less lossy, AWQ has less to clean up. The 9B picture (where AWQ closed −30% above-floor at asym3) may show similar shrinkage if re-measured at q8 KV — worth flagging for the Stage A retrospective.
+
+**PPL is roughly unchanged by AWQ on this slice.** mq4-base PPL 22.088, mq4-awq PPL 22.149 — within slice noise. KLD improvement comes from tail-distribution matching, not top-1 probability, which is exactly what AWQ targets (outlier preservation in heavy channels). Consistent with §2 of issue-113 ("PPL collapses the full output distribution... KLD surfaces tail").
+
+The 0.8B picture is **substantially worse than 9B** for hipfire's MQ4
+relative to llama.cpp:
+
+- **9B mq4-awq vs UD-Q3_K_XL @ matched bpw:** +6.9% PPL gap
+- **0.8B mq4-base vs Q4_K_M @ near-matched bpw (−0.82 bpw):** +27.5% PPL gap
+  → mq4-awq will narrow this but unlikely to close even half of it
+  given the 9B AWQ improvement was 30% above-floor.
+
+Two interpretations (need data to disambiguate):
+
+1. **Small-model penalty on the MQ4 format.** Smaller models concentrate more information per parameter; per-256 single-FP32-scale (no sub-32 scales, no weighted-LS fit) loses more relative precision on dense small-model weights. The structural format-level disadvantage that's 7% at 9B might be 25%+ at 0.8B.
+2. **Engine-drift contribution doesn't scale uniformly.** The 0.8B q8f16 asym3 KLD is 0.126 (close to 9B's 0.146); the 4-bit gap inflates because the format-level cost compounds with engine-drift differently across scales.
+
+The clean disambiguation needs:
+- 0.8B q8f16 + q8 KV (to give the matching-mode floor → strip engine drift cleanly)
+- 0.8B Q8_0 GGUF at q8 KV (to give llama.cpp's matching-mode floor)
+- 0.8B GGUF UD-Q3_K_XL or UD-Q4_K_XL at q8 KV (for a bpw-matched 4-bit peer instead of Q4_K_M's 5.07 bpw)
+
+**Methodological note: slice mismatch (full vs quick).** The hipfire 0.8B rows use `--max-chunks 512`; the Q4_K_M GGUF was full-slice. Re-running mq4-base + mq4-awq on full slice (~30 min wall each on this gfx1100) would close the apples-to-apples residual; that's the cleanest cross-engine comparison we can produce post-RoPE-fix without waiting for the full anchor set.
 
 ---
 
