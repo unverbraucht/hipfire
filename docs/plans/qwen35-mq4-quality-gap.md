@@ -985,6 +985,22 @@ The residual ~0.08 KLD is **not** an inherent quant-noise floor. It's a real, fi
 
 Next concrete probe: dump Q/K/V/g/β tensors at the **input to `gated_delta_net_f32`** for chunk 0 from both hipfire and HF transformers; per-element compare. If they match byte-exactly, the bug is INSIDE the recurrence kernel after all (algorithmic). If they diverge, bisect the upstream stages by injecting HF-computed values via DMA at each stage boundary until the divergence localizes. Cost: ~half-day of instrumentation in `qwen35::forward_scratch_layers` + Python-side HF tensor capture.
 
+**DN-input dump complete (2026-05-13).** Added `dump_dn_inputs` helper in `crates/hipfire-arch-qwen35/src/qwen35.rs` (env-gated by `HIPFIRE_DUMP_DN_INPUTS=<path>` + `HIPFIRE_DUMP_DN_LAYER=<idx>`, default layer 4) and `scripts/dump_hf_dn_inputs.py` (monkey-patches `chunk_gated_delta_rule` to capture call args, then replays the in-rule l2norm + scale on Q/K to align with hipfire's post-fused_qk_l2_norm_scale state). `scripts/compare_dn_inputs.py` does per-tensor compare.
+
+Per-tensor compare at Qwen3.5-0.8B chunk 0, LA layer 4 (halfsplit RoPE, kv-q8):
+
+| Tensor | mean rel_L2 | max rel_L2 | mean cos | pos 0..127 | pos 1024+ | pos 1920+ |
+|---|---:|---:|---:|---:|---:|---:|
+| Q     | 0.074 | 0.273 | 0.997 | 0.042 | 0.085 | 0.085 |
+| K     | 0.071 | 0.161 | 0.997 | 0.044 | 0.081 | 0.082 |
+| V     | 0.042 | 0.119 | 0.999 | 0.025 | 0.048 | 0.050 |
+| alpha | 0.075 | **0.291** | 0.999 | 0.030 | 0.094 | 0.099 |
+| beta  | 0.035 | 0.194 | 0.999 | 0.019 | 0.039 | 0.042 |
+
+**Every input to the recurrence diverges**, but with different magnitudes. V and beta are cleanest. Q and K have similar drift. **Alpha has the worst max (0.29) and a systematic sign-direction bias** — hipfire's alpha is ~3.5% more negative than HF (mean -0.3442 vs -0.3324, min -4.96 vs -4.80). Alpha = `softplus(a + dt_bias) * (-exp(A_log))`; the systematic shift implies one of these three components is wrong on hipfire's side. Most likely candidates: (a) A_log loader convention (e.g., hipfire loads `A_log` but HF stores `log(A)` directly — sign or exp/log convention mismatch), (b) dt_bias loader, (c) the `softplus(a + dt_bias)` order vs `softplus(a) + dt_bias` order, (d) systematic in_proj_a projection drift inherited from upstream-layer residual drift.
+
+Next bisect: dump `a_raw` (post-projection, pre-sigmoid_alpha_gate transform) and the per-head A_log + dt_bias values from hipfire's weights vs HF's nn.Parameter directly. If the per-head constants match, the bug is in the per-position `a` flow (most likely upstream residual drift). If they don't, hipfire's loader for `linear_attn.A_log` or `linear_attn.dt_bias` has a sign / log / unit convention mismatch.
+
 Raw per-layer dumps at `/data/cache/hipfire/q3.5-0.8b-{hf,hipfire}-hidden-chunk0.bin` (not committed, 192 MB each); the comparator output is reproducible from the scripts in `scripts/dump_hf_hidden_states.py`, `scripts/compare_hidden_states.py`, and the new example binary.
 
 **Cross-engine sanity check (Step B, 2026-05-12 evening) — confirms Step A is well-posed.**

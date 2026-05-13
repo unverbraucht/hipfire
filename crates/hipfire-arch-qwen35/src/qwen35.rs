@@ -5928,6 +5928,65 @@ pub fn forward_scratch_embed(
     forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch, None)
 }
 
+/// Diagnostic dump of the Q/K/V/α/β tensors at the input to
+/// `gated_delta_net_*` for one target LA layer per call. Used by the
+/// engine-drift-floor probe in `docs/plans/qwen35-mq4-quality-gap.md`
+/// (next-step bisect of upstream-of-DeltaNet drift). Triggered only when
+/// the caller has confirmed `HIPFIRE_DUMP_DN_INPUTS` is set and we're at
+/// the target layer; otherwise the hot path skips this entirely.
+///
+/// File layout (binary, append-mode, native endian f32):
+///   per call: 8 × u32 header { layer_idx, pos, n_v_heads, head_dim,
+///                              qkv_elems = n_v_heads*head_dim,
+///                              alphabeta_elems = n_v_heads, reserved×2 }
+///             then: q (qkv_elems f32), k (qkv_elems f32), v (qkv_elems f32),
+///                   alpha (alphabeta_elems f32), beta (alphabeta_elems f32)
+fn dump_dn_inputs(
+    gpu: &mut Gpu,
+    path: &str,
+    layer_idx: usize,
+    pos: usize,
+    dn_q: &GpuTensor, dn_k: &GpuTensor, dn_v: &GpuTensor,
+    dn_alpha: &GpuTensor, dn_beta: &GpuTensor,
+    n_v_heads: usize, head_dim: usize,
+) -> HipResult<()> {
+    use std::io::Write;
+    let qkv_elems = n_v_heads * head_dim;
+    let q_host = gpu.download_f32(dn_q)?;
+    let k_host = gpu.download_f32(dn_k)?;
+    let v_host = gpu.download_f32(dn_v)?;
+    let a_host = gpu.download_f32(dn_alpha)?;
+    let b_host = gpu.download_f32(dn_beta)?;
+    // Sanity-check sizes before serializing.
+    assert_eq!(q_host.len(), qkv_elems, "dn_q size mismatch");
+    assert_eq!(k_host.len(), qkv_elems, "dn_k size mismatch");
+    assert_eq!(v_host.len(), qkv_elems, "dn_v size mismatch");
+    assert_eq!(a_host.len(), n_v_heads, "dn_alpha size mismatch");
+    assert_eq!(b_host.len(), n_v_heads, "dn_beta size mismatch");
+
+    let mut f = std::fs::OpenOptions::new()
+        .create(true).append(true).open(path)
+        .unwrap_or_else(|e| panic!("dump_dn_inputs open {path}: {e}"));
+    let hdr = [
+        layer_idx as u32, pos as u32,
+        n_v_heads as u32, head_dim as u32,
+        qkv_elems as u32, n_v_heads as u32,
+        0u32, 0u32,
+    ];
+    for w in hdr.iter() {
+        f.write_all(&w.to_le_bytes()).unwrap();
+    }
+    let bytes_of = |v: &[f32]| unsafe {
+        std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4)
+    };
+    f.write_all(bytes_of(&q_host)).unwrap();
+    f.write_all(bytes_of(&k_host)).unwrap();
+    f.write_all(bytes_of(&v_host)).unwrap();
+    f.write_all(bytes_of(&a_host)).unwrap();
+    f.write_all(bytes_of(&b_host)).unwrap();
+    Ok(())
+}
+
 /// Layer loop using scratch buffers. Zero alloc/free per token.
 ///
 /// `hidden_rb`: if Some, the layer loop extracts post-residual hidden states
@@ -6072,6 +6131,25 @@ fn forward_scratch_layers(
                     // depend on a capturing blocking stream" under hipGraph.
                     gpu.memcpy_dtod_auto(&s.dn_q.buf, &s.dn_q_raw.buf, k_dim * 4)?;
                     gpu.memcpy_dtod_auto(&s.dn_k.buf, &s.dn_k_raw.buf, k_dim * 4)?;
+                }
+
+                // Probe: HIPFIRE_DUMP_DN_INPUTS=<path> + HIPFIRE_DUMP_DN_LAYER=<idx>
+                // captures Q/K/V/α/β at the recurrence input for one target LA
+                // layer per chunk. Used to bisect upstream-of-DeltaNet drift
+                // sources against an HF transformers oracle. Diagnostic-only,
+                // single-position-per-call append; the dispatcher is a wrapper
+                // function so the hot path stays branchless when the env-var
+                // is unset.
+                let dump_path = std::env::var("HIPFIRE_DUMP_DN_INPUTS").ok();
+                if let Some(path) = dump_path.as_deref() {
+                    let target = std::env::var("HIPFIRE_DUMP_DN_LAYER")
+                        .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(4);
+                    if layer_idx == target {
+                        dump_dn_inputs(gpu, path, layer_idx, pos,
+                            &s.dn_q, &s.dn_k, &s.dn_v, &s.dn_alpha, &s.dn_beta,
+                            n_v_heads, config.linear_value_head_dim,
+                        )?;
+                    }
                 }
 
                 match dn_state.quant {
