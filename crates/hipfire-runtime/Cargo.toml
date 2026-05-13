@@ -298,6 +298,15 @@ required-features = ["arch-llama"]
 name = "dump_qwen35_hidden_states"
 required-features = ["arch-qwen35", "deltanet"]
 
+# recurrence_matched_input — Phase 3a engine-drift residual audit probe.
+# Feeds HF transformers' bit-exact q/k/v/α/β tensors into hipfire's
+# gated_delta_net_f32 to isolate the recurrence kernel's intrinsic drift
+# from upstream input drift compounding. See
+# docs/investigations/2026-05-13-engine-drift-residual-audit/.
+[[example]]
+name = "recurrence_matched_input"
+required-features = []
+
 # Tokenizer-parity helper: reads a .hfq's tokenizer + tokenizes a text slice.
 # No GPU / arch features needed (tokenizer is pure CPU).
 [[example]]

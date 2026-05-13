@@ -120,17 +120,21 @@ with or below Q4_K_M llama.cpp at matched KV mode.
 - hipfire can claim quality parity with Unsloth Dynamic at matched bpw, or
   measure the remaining gap as genuinely calibration-attributable
 
-## Status board
+## Status board — CLOSED 2026-05-13
 
-| phase | status | result | commit |
-|---|---|---|---|
-| 1a — instrument hipfire LA pipeline | done | 16 stage dumps, gated by HIPFIRE_DUMP_LA_STAGES | (uncommitted) |
-| 1b — HF oracle for matching boundaries | done | `scripts/dump_hf_la_stages.py` | (uncommitted) |
-| 1c — measure + rank stages at layer 0 | done | see Phase 1c findings below | — |
-| 1d — repeat at layer 4 (cross-check) | pending | — | — |
-| 2 — FA pipeline | pending | — | — |
-| 3 — fix dominant stage(s) | pending | — | — |
-| 4 — re-eval | pending | target ≤ 0.02 KLD | — |
+| phase | status | result |
+|---|---|---|
+| 0 — pre-Phase-2 sanity checks | done | llama.cpp Q8_0 = 0.0015 KLD (100% engine drift); F16 dispatch correct; FA stage map verified |
+| 1c — LA layer 0 stages | done | distributed: all stages ≤ 0.012 rL2 |
+| 1d — F16 precision probes | done | all three regress KLD; "Q8 noise was load-bearing" |
+| 2 — FA-3 stages | done | distributed: every FA stage within 0.04-0.10 of input bias |
+| 3a — recurrence matched-input | done | recurrence kernel faithful (0.0025 rL2 with HF inputs) |
+| 4 — kernel rewrite | **NO-GO** | floor is distributed across ~24 kernels; per-weight-precision and single-kernel rewrite don't close it |
+
+**Verdict:** see `03-final-verdict.md`. Audit closed with calibration
+(AWQ Stage A → B/C) as the recommended path forward. Graph-level engine
+rewrite remains technically feasible per llama.cpp's evidence but is
+deferred (~4-8 months scope, not currently justified).
 
 ## Phase 1c — Stage localization at LA layer 0 (2026-05-13)
 

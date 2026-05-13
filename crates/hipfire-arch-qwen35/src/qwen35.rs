@@ -6023,6 +6023,42 @@ fn dump_la_stage(
     Ok(())
 }
 
+/// Phase 2 audit helper — analog of `dump_la_stage` for the FullAttention
+/// pipeline. Same on-disk format (u32×8 header + f32 payload), stage IDs
+/// 0-13 documented in
+/// `docs/investigations/2026-05-13-engine-drift-residual-audit/02-phase0-results.md`.
+/// Separate function name kept for documentation / grep-ability, even
+/// though the implementation is identical to dump_la_stage.
+fn dump_fa_stage(
+    gpu: &mut Gpu,
+    path: &str,
+    stage_id: u32,
+    layer_idx: usize,
+    pos: usize,
+    buf: &GpuTensor,
+    n_elems: usize,
+) -> HipResult<()> {
+    use std::io::Write;
+    let host = gpu.download_f32(buf)?;
+    assert!(host.len() >= n_elems,
+        "dump_fa_stage stage {stage_id}: host len {} < n_elems {n_elems}",
+        host.len());
+    let mut f = std::fs::OpenOptions::new()
+        .create(true).append(true).open(path)
+        .unwrap_or_else(|e| panic!("dump_fa_stage open {path}: {e}"));
+    let hdr = [
+        layer_idx as u32, pos as u32,
+        stage_id, n_elems as u32,
+        0u32, 0u32, 0u32, 0u32,
+    ];
+    for w in hdr.iter() { f.write_all(&w.to_le_bytes()).unwrap(); }
+    let bytes = unsafe {
+        std::slice::from_raw_parts(host.as_ptr() as *const u8, n_elems * 4)
+    };
+    f.write_all(bytes).unwrap();
+    Ok(())
+}
+
 /// Companion to `dump_dn_inputs` — captures only the raw post-w_alpha
 /// projection alpha (i.e. `s.dn_alpha` BEFORE `fused_sigmoid_alpha_gate`).
 /// Same file format as dump_dn_inputs but only the alpha slot is written
@@ -6086,6 +6122,7 @@ fn forward_scratch_layers(
     let dump_dn_inputs_path = std::env::var("HIPFIRE_DUMP_DN_INPUTS").ok();
     let dump_a_raw_path = std::env::var("HIPFIRE_DUMP_A_RAW").ok();
     let dump_la_stages_path = std::env::var("HIPFIRE_DUMP_LA_STAGES").ok();
+    let dump_fa_stages_path = std::env::var("HIPFIRE_DUMP_FA_STAGES").ok();
     let dump_target_layer = std::env::var("HIPFIRE_DUMP_DN_LAYER")
         .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(4);
 
@@ -6406,10 +6443,24 @@ fn forward_scratch_layers(
             }
 
             (LayerWeights::FullAttn(layer), LayerType::FullAttention) => {
+                // Phase 2 audit — FA stage 0 (pre-rmsnorm residual).
+                if let Some(p) = dump_fa_stages_path.as_deref() {
+                    if layer_idx == dump_target_layer {
+                        dump_fa_stage(gpu, p, 0, layer_idx, pos, &s.x, dim)?;
+                    }
+                }
+
                 // Fused rmsnorm + FWHT rotation for wq/wk/wv (all share input).
                 let x_rot = fused_rmsnorm_rotate_for_mq(
                     gpu, &layer.wq, &s.x, &layer.attn_norm, &s.tmp, &s.x_rot, config.norm_eps,
                 )?;
+
+                // Phase 2 audit — FA stage 1 (post-rmsnorm).
+                if let Some(p) = dump_fa_stages_path.as_deref() {
+                    if layer_idx == dump_target_layer {
+                        dump_fa_stage(gpu, p, 1, layer_idx, pos, &s.tmp, dim)?;
+                    }
+                }
                 // Cross-arch fast path: fused 3-way projection for wq+wk+wv.
                 // Works for MQ4 and HF4 — same kernel math as the LA 4-way.
                 let dt = layer.wq.gpu_dtype;
@@ -6459,13 +6510,43 @@ fn forward_scratch_layers(
                     weight_gemv_prerotated(gpu, &layer.wv, &s.tmp, x_rot, &s.fa_v)?;
                 }
 
+                // Phase 2 audit — FA stages 2/3/4 (post-q/k/v_proj).
+                if let Some(p) = dump_fa_stages_path.as_deref() {
+                    if layer_idx == dump_target_layer {
+                        let q_full_n = config.n_heads * config.head_dim * 2;
+                        let k_n = config.n_kv_heads * config.head_dim;
+                        let v_n = config.n_kv_heads * config.head_dim;
+                        dump_fa_stage(gpu, p, 2, layer_idx, pos, &s.fa_q_full, q_full_n)?;
+                        dump_fa_stage(gpu, p, 3, layer_idx, pos, &s.fa_k, k_n)?;
+                        dump_fa_stage(gpu, p, 4, layer_idx, pos, &s.fa_v, v_n)?;
+                    }
+                }
+
                 // Split interleaved Q+gate (single kernel instead of per-head memcpy loop)
                 gpu.deinterleave_f32(&s.fa_q_full, &s.fa_q, &s.fa_gate, config.n_heads, config.head_dim)?;
+
+                // Phase 2 audit — FA stages 5/6 (post-deinterleave Q + gate).
+                if let Some(p) = dump_fa_stages_path.as_deref() {
+                    if layer_idx == dump_target_layer {
+                        let q_n = config.n_heads * config.head_dim;
+                        dump_fa_stage(gpu, p, 5, layer_idx, pos, &s.fa_q, q_n)?;
+                        dump_fa_stage(gpu, p, 6, layer_idx, pos, &s.fa_gate, q_n)?;
+                    }
+                }
 
                 gpu.rmsnorm_batched(&s.fa_q, &layer.q_norm, &s.fa_q, config.n_heads, config.head_dim, config.norm_eps)?;
 
                 let kv_dim = config.n_kv_heads * config.head_dim;
                 gpu.rmsnorm_batched(&s.fa_k, &layer.k_norm, &s.fa_k, config.n_kv_heads, config.head_dim, config.norm_eps)?;
+
+                // Phase 2 audit — FA stages 7/8 (post-q_norm + post-k_norm).
+                if let Some(p) = dump_fa_stages_path.as_deref() {
+                    if layer_idx == dump_target_layer {
+                        let q_n = config.n_heads * config.head_dim;
+                        dump_fa_stage(gpu, p, 7, layer_idx, pos, &s.fa_q, q_n)?;
+                        dump_fa_stage(gpu, p, 8, layer_idx, pos, &s.fa_k, kv_dim)?;
+                    }
+                }
 
                 if hipfire_runtime::triattn::tap_enabled() {
                     let gpu_handled = hipfire_runtime::triattn::record_prerope_q_batch_gpu_if_applicable(
@@ -6495,6 +6576,15 @@ fn forward_scratch_layers(
                 if kv_cache.compact_offset > 0 {
                     let phys = pos as i32;
                     gpu.hip.memcpy_htod(&s.pos_buf, &phys.to_ne_bytes())?;
+                }
+
+                // Phase 2 audit — FA stages 9/10 (post-RoPE Q + K).
+                if let Some(p) = dump_fa_stages_path.as_deref() {
+                    if layer_idx == dump_target_layer {
+                        let q_n = config.n_heads * config.head_dim;
+                        dump_fa_stage(gpu, p, 9, layer_idx, pos, &s.fa_q, q_n)?;
+                        dump_fa_stage(gpu, p, 10, layer_idx, pos, &s.fa_k, kv_dim)?;
+                    }
                 }
 
                 if kv_cache.quant_asym4 {
@@ -6570,10 +6660,34 @@ fn forward_scratch_layers(
                     )?;
                 }
 
+                // Phase 2 audit — FA stage 11 (post-attention, pre-gate).
+                if let Some(p) = dump_fa_stages_path.as_deref() {
+                    if layer_idx == dump_target_layer {
+                        let attn_n = config.n_heads * config.head_dim;
+                        dump_fa_stage(gpu, p, 11, layer_idx, pos, &s.fa_attn_out, attn_n)?;
+                    }
+                }
+
                 // Fused: fa_attn_out *= sigmoid(fa_gate). Two launches → one.
                 gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
+
+                // Phase 2 audit — FA stage 12 (post-sigmoid-mul gate).
+                if let Some(p) = dump_fa_stages_path.as_deref() {
+                    if layer_idx == dump_target_layer {
+                        let attn_n = config.n_heads * config.head_dim;
+                        dump_fa_stage(gpu, p, 12, layer_idx, pos, &s.fa_attn_out, attn_n)?;
+                    }
+                }
+
                 // Fused wo GEMV + residual add: s.x += layer.wo * s.fa_attn_out
                 weight_gemv_residual(gpu, &layer.wo, &s.fa_attn_out, &s.x)?;
+
+                // Phase 2 audit — FA stage 13 (block exit, post-wo + residual).
+                if let Some(p) = dump_fa_stages_path.as_deref() {
+                    if layer_idx == dump_target_layer {
+                        dump_fa_stage(gpu, p, 13, layer_idx, pos, &s.x, dim)?;
+                    }
+                }
 
                 // FFN: fused rmsnorm + rotate for w_gate/w_up.
                 let x_rot = fused_rmsnorm_rotate_for_mq(
