@@ -279,6 +279,16 @@ required-features = []
 name = "eval_hipfire"
 required-features = ["arch-qwen35", "deltanet"]
 
+# dump_qwen35_hidden_states — per-layer hidden-state dump for the
+# engine-drift-floor investigation tooling (see
+# docs/investigations/2026-05-12-engine-drift-floor/). Reuses the
+# existing HiddenStateRingBuffer from spec-decode infra, overrides
+# extract_layers to span the full layer range. Output is consumed by
+# scripts/compare_hidden_states.py against an HF transformers oracle.
+[[example]]
+name = "dump_qwen35_hidden_states"
+required-features = ["arch-qwen35", "deltanet"]
+
 # Tokenizer-parity helper: reads a .hfq's tokenizer + tokenizes a text slice.
 # No GPU / arch features needed (tokenizer is pure CPU).
 [[example]]

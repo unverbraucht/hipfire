@@ -3159,7 +3159,46 @@ fn main() {
             } else {
 
             // ── K-map override ──────────────────────────────────────────────
-            let kmap_level = kmap.get(&**name).copied().unwrap_or(QuantLevel::Base);
+            //
+            // Diagnostic env-gates for the engine-drift-floor investigation
+            // (see `docs/investigations/2026-05-12-engine-drift-floor/`).
+            // Both are off by default. When set to "1":
+            //
+            //   HIPFIRE_QUANTIZE_LM_HEAD_F16=1
+            //     Forces `lm_head.weight` / `output.weight` to QuantLevel::F16
+            //     storage regardless of K-map state. Lets a dense Q8 model
+            //     get an FP16 lm_head without engaging --kmap-dense's other
+            //     Promote6 side-effects. Used to A/B whether lm_head Q8
+            //     storage contributes to model-output divergence vs a BF16
+            //     reference (it does not — < 0.001 nats on Q3.5-9B).
+            //
+            //   HIPFIRE_QUANTIZE_LA_F16=1
+            //     Forces all `linear_attn.{in_proj_qkv,in_proj_z,in_proj_a,
+            //     in_proj_b,out_proj}.weight` tensors to QuantLevel::F16.
+            //     Used to A/B whether DeltaNet-input Q8 weight noise drives
+            //     the LinearAttention-layer per-position drift via
+            //     recurrence amplification (it does not — F16 LA weights
+            //     reduce layer-4 rel_L2 by only -0.012 on Q3.5-0.8B).
+            //
+            // Diagnostic-only; do not enable in production cohort runs (it
+            // bloats the .hfq by the F16-vs-Q8 size delta on the affected
+            // tensors and is not load-bearing for any normal workflow).
+            let is_lm_head = name.contains("lm_head") || name.ends_with("output.weight");
+            let is_la_weight = name.contains("linear_attn.")
+                && (name.ends_with("in_proj_qkv.weight")
+                    || name.ends_with("in_proj_z.weight")
+                    || name.ends_with("in_proj_a.weight")
+                    || name.ends_with("in_proj_b.weight")
+                    || name.ends_with("out_proj.weight"));
+            let force_f16 = (is_lm_head
+                    && std::env::var("HIPFIRE_QUANTIZE_LM_HEAD_F16").ok().as_deref() == Some("1"))
+                || (is_la_weight
+                    && std::env::var("HIPFIRE_QUANTIZE_LA_F16").ok().as_deref() == Some("1"));
+            let kmap_level = if force_f16 {
+                QuantLevel::F16
+            } else {
+                kmap.get(&**name).copied().unwrap_or(QuantLevel::Base)
+            };
 
             let (quantized, qt, gs, label) = if kmap_level == QuantLevel::Q8 {
                 // K-map says Q8 (embed, lm_head, router)

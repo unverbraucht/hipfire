@@ -1212,6 +1212,13 @@ pub const GATED_NORM_SRC: &str = include_str!("../../../kernels/src/gated_norm.h
 #[cfg(feature = "deltanet")]
 pub const GATED_DELTA_NET_SRC: &str = include_str!("../../../kernels/src/gated_delta_net.hip");
 
+/// FP64-internal-state variant of `gated_delta_net_f32` — same algorithm,
+/// state tile held as double across the per-token loop. Probe-only;
+/// dispatched by `gated_delta_net_f32` under HIPFIRE_DELTANET_F64=1.
+/// See `docs/investigations/2026-05-12-engine-drift-floor/`.
+#[cfg(feature = "deltanet")]
+pub const GATED_DELTA_NET_F64ACC_SRC: &str = include_str!("../../../kernels/src/gated_delta_net_f64acc.hip");
+
 
 /// GDN Q8 — tiled LDS + warp-shuffle. Dequant tile into LDS, recurrence, requant back.
 /// Tile = TILE_ROWS × 128 × 4B = 4KB. Same tiling as FP32 variant.

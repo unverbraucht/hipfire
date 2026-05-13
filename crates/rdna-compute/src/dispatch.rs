@@ -12517,7 +12517,15 @@ impl Gpu {
         batch: usize, n: usize, eps: f32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel("rmsnorm", kernels::RMSNORM_SRC, "rmsnorm_f32")?;
+        // Probe: HIPFIRE_RMSNORM_F64=1 swaps the fp32-accumulating kernel
+        // for an fp64-accumulating one. Inputs/outputs stay fp32. Used by
+        // the engine-drift-floor investigation tooling to rule out QK-norm
+        // accumulation precision as a per-layer drift source (see
+        // `docs/investigations/2026-05-12-engine-drift-floor/`). Default
+        // (unset / 0) is unchanged.
+        let f64_acc = std::env::var("HIPFIRE_RMSNORM_F64").ok().as_deref() == Some("1");
+        let entry = if f64_acc { "rmsnorm_f32_f64acc" } else { "rmsnorm_f32" };
+        self.ensure_kernel("rmsnorm", kernels::RMSNORM_SRC, entry)?;
 
         let mut x_ptr = x.buf.as_ptr();
         let mut w_ptr = weight.buf.as_ptr();
@@ -12534,11 +12542,12 @@ impl Gpu {
         ];
 
         let block_size = 256u32.min(n as u32);
-        let shared_mem = block_size * 4;
+        // f64 accumulator needs 8 bytes per slot vs 4 for f32.
+        let shared_mem = block_size * if f64_acc { 8 } else { 4 };
         let bytes = crate::profile::rmsnorm_bytes(batch * n);
         let timer = crate::profile::begin_timer(&self.hip, "rmsnorm", "rmsnorm_batched", bytes);
         let result = self.launch_maybe_blob(
-            "rmsnorm_f32",
+            entry,
             [batch as u32, 1, 1],
             [block_size, 1, 1],
             shared_mem,
@@ -16090,8 +16099,21 @@ impl Gpu {
         n_tokens: usize, n_heads: usize, head_dim: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel("gated_delta_net", kernels::GATED_DELTA_NET_SRC, "gated_delta_net_f32")?;
-        let func = &self.functions["gated_delta_net_f32"];
+        // Probe: HIPFIRE_DELTANET_F64=1 swaps the fp32-accumulating
+        // recurrence for an fp64-internal-state variant. Same input/output
+        // dtypes (fp32). Used by the engine-drift-floor investigation
+        // tooling to test whether DeltaNet recurrent state precision
+        // contributes to per-position drift (it does not — see
+        // `docs/investigations/2026-05-12-engine-drift-floor/`). Default
+        // (unset / 0) dispatches the original fp32 kernel unchanged.
+        let f64_acc = std::env::var("HIPFIRE_DELTANET_F64").ok().as_deref() == Some("1");
+        let (cache_key, src, entry) = if f64_acc {
+            ("gated_delta_net_f64acc", kernels::GATED_DELTA_NET_F64ACC_SRC, "gated_delta_net_f64acc")
+        } else {
+            ("gated_delta_net", kernels::GATED_DELTA_NET_SRC, "gated_delta_net_f32")
+        };
+        self.ensure_kernel(cache_key, src, entry)?;
+        let func = &self.functions[entry];
         let mut qp = q.buf.as_ptr();
         let mut kp = k.buf.as_ptr();
         let mut vp = v.buf.as_ptr();
