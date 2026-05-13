@@ -1,4 +1,4 @@
-# Pattern-hunt plan — re-opening engine surgery as a shared-root-cause question (2026-05-13)
+# Pattern-hunt plan — re-opening engine surgery as a shared-root-cause question (2026-05-13, rev 2)
 
 Sequel to `03-final-verdict.md`. The final verdict closed the audit with
 "distributed drift across ~24 kernels, no surgery target". This was the
@@ -8,297 +8,440 @@ dominant kernel"* — but missed a third possibility:
 **A single root cause expressed in many kernels.**
 
 If every hipfire kernel makes the same implementation choice (e.g., a
-particular reduction order, an FP16 intermediate, a particular FMA
-grouping) that differs from HF/llama.cpp's choice, every kernel will
-diverge by similar magnitude — exactly what we measured. The data
-clusters tightly (most kernels contribute ~0.005 rL2 per stage); this
-is the signature of common cause, not 24 independent bugs.
+particular reduction order, an FMA grouping, a denormal flush behavior)
+that differs from HF/llama.cpp's choice, every kernel will diverge by
+similar magnitude — exactly what we measured. The data clusters tightly
+(most kernels contribute ~0.005 rL2 per stage); this is the signature
+of common cause, not 24 independent bugs.
 
-This doc plans a 5-day exploration that either:
+This doc plans a 5-day exploration. Either outcome closes a major
+decision unknown:
 
-- **Finds the common pattern on rmsnorm**, generalizes it across ~24
-  kernels, and collapses the original "4-8 months graph-level rewrite"
-  estimate to ~4-6 weeks of mostly mechanical porting. OR
+- **Finds the common pattern**, generalizes across ~24 kernels, and
+  collapses the original "4-8 months graph-level rewrite" estimate to
+  ~4-6 weeks of mostly mechanical porting. OR
 - **Conclusively falsifies the shared-root-cause hypothesis**,
   confirming the 4-8 month estimate stands, and engine surgery remains
   deferred behind the calibration roadmap.
 
-Either outcome closes a major decision unknown that the audit didn't
-resolve.
+**Plan revisions from combined adversarial review** (see
+`04-pattern-hunt_rev_combined.md`): added Day 0 prerequisites,
+incorporated 3 new hypotheses (H7/H8/H9), demoted 2 (H3/H5 for
+rmsnorm), corrected H2 framing, expanded Day 4 to include
+non-norm kernels.
 
 ## Why rmsnorm is the right starting point
 
 The audit data shows every non-trivial kernel contributes per-stage rL2
 in a tight ~0.005 cluster:
 
-| stage | kernel | rL2 with bit-exact input |
-|---|---|---:|
-| 1 | `rmsnorm_f32` (LA-0 input layernorm) | 0.0017 |
-| 2 | `gemv_q8_0` (in_proj_qkv) | 0.0037 |
-| 8/9 | `conv1d_silu_split_f32` | 0.0048/0.0055 (F16 weight) |
-| 11/12 | `fused_qk_l2_norm_scale_f32` | 0.0050/0.0059 (F16 weight) |
+| stage | kernel | rL2 with bit-exact input | path |
+|---|---|---:|---|
+| 1 | `rmsnorm_f32` (LA-0 input layernorm) | 0.0017 | q8f16 path |
+| 1 | `fused_rmsnorm_mq_rotate` Phase 1c | (TBD Day 0) | MQ4 path (production) |
+| 2 | `gemv_q8_0` (in_proj_qkv) | 0.0037 | both |
+| 8/9 | `conv1d_silu_split_f32` | 0.0048/0.0055 (F16 weight) | both |
+| 11/12 | `fused_qk_l2_norm_scale_f32` | 0.0050/0.0059 (F16 weight) | both |
 
 **Rmsnorm is the cleanest target** because:
 
-- Single input vector (no GQA, no quantization, no fusion with FWHT)
-- Output shape matches input — no reshaping noise
-- Math is well-defined and short: `out = x * weight * rsqrt(mean(x²) + eps)`
-- Stage 1 measurement at LA-0 with bit-exact input gives 0.0017 rL2 — a
-  single number to drive against
+- Single input vector (no GQA, no quantization, simplest formula)
+- Math is well-defined: `out = x * weight * rsqrt(mean(x²) + eps)`
+- Stage 1 measurement at LA-0 with bit-exact input gives 0.0017 rL2
 - HF reference is `Qwen3_5RMSNorm.forward` — 4 lines of Python, readable
 - llama.cpp reference is `ggml-cuda/norm.cu` — short and self-contained
 
-If a common root cause exists, rmsnorm should expose it most clearly
-because the math is least obscured by other concerns. Whatever fix gets
-rmsnorm from 0.0017 → ≤0.0005 is then tested on q_norm, k_norm, l2norm
-(other reduction-based kernels). If those also drop to ≤0.0005 with the
-same fix, the pattern is real and we apply it across remaining kernels.
+**Two production paths for rmsnorm** (revision from combined review):
 
-## Candidate root causes (priority ranked)
+- **q8f16 / plain path**: input → `rmsnorm_f32` → `s.tmp` → next kernel.
+  The 0.0017 measurement is this path.
+- **MQ4 / fused path**: input → `fused_rmsnorm_mq_rotate` (rmsnorm +
+  FWHT rotation in one kernel) → `s.x_rot` → next kernel.
 
-### H1 — Operation order in the output multiplication
+Any rmsnorm fix must address BOTH paths. Day 1 measurements collect
+baselines for both.
 
-**Hipfire** (`kernels/src/rmsnorm.hip:23`):
+## Day 0 — prerequisites (1-2 hours, before any kernel rewrite)
+
+Three quick falsifications and a derived threshold. Each can rule out
+a hypothesis or set the budget for subsequent days.
+
+### D0.1 — Run existing `rmsnorm_f32_f64acc` probe (30 min)
+
+This kernel already exists in `kernels/src/rmsnorm.hip:33-56` from the
+closed investigation's probe c.3. It computes sum-of-squares and rms
+in fp64, casts back to fp32 for output. Triggered by env-gate
+`HIPFIRE_RMSNORM_F64=1`.
+
+**Test:** measure stage-1 rL2 with `HIPFIRE_RMSNORM_F64=1` on
+Q3.5-0.8B q8f16 LA-0 chunk 0.
+
+**Outcomes:**
+- If stage-1 rL2 drops 0.0017 → ≤0.0003: **reduction precision is the
+  dominant source**. H2/H5 are the targets. Skip H1/H4/H7/H8/H9 hypotheses
+  about operation order — those are in the noise.
+- If stage-1 rL2 stays ~0.0017: **reduction precision is NOT the source**.
+  H2/H5 are falsified. Focus Day 1-3 on H1/H7/H8/H9 (operation-order
+  hypotheses).
+
+### D0.2 — FP32-weight control experiment (1 hour)
+
+Adversarial premise: maybe the uniform ~0.005 rL2 isn't a kernel bug
+at all but the **quantization SNR floor** of Q8 weights × F32
+activations. Any kernel doing a reduction over Q8-dequantized weights
+would hit this limit regardless of kernel implementation.
+
+**Test:** rmsnorm operates on a `[hidden_dim]` vector with no
+quantization (the rmsnorm weight is F16 already, not Q8). So the
+direct test would target a different kernel like `in_proj_qkv` gemv.
+For Day 0 we run a simpler version: re-quantize with FP32 weights
+storage on rmsnorm's `attn_norm` tensor and measure stage 1.
+
+If stage-1 rL2 disappears (drops to ~fp64 noise floor): rmsnorm drift
+was driven by F16-vs-BF16 storage of the norm weight, not kernel
+implementation. Pattern hunt is unnecessary; just upgrade norm-weight
+storage to BF16.
+
+If stage-1 rL2 persists: rmsnorm drift is in the kernel math, not the
+weight storage. Pattern hunt proceeds.
+
+### D0.3 — Derive the real win threshold (1 hour)
+
+Run a CPU fp64 reference rmsnorm on the same bit-exact input as HF's
+forward used. Specifically:
+
+1. Read the chunk-0 stage-0 (input residual) from
+   `/data/cache/hipfire/audit-2026-05-13/hf_layer0_chunk0.bin`
+2. Compute rmsnorm in fp64 with the exact HF formula
+3. Compare:
+   - `(HF stage 1 fp32) - (fp64 reference)` rL2 → HF's own fp32 noise floor
+   - `(hipfire stage 1 fp32) - (fp64 reference)` rL2 → hipfire's full drift
+
+The first number is the irreducible fp32-arithmetic floor for ANY
+implementation. The plan's success threshold becomes:
+
+**Day 5 success target: hipfire's rL2 vs fp64 reference ≤ 2× HF's rL2 vs fp64 reference.**
+
+This replaces the arbitrary "≤0.0005". If HF-vs-fp64 is 0.0002, target
+is 0.0004. If HF-vs-fp64 is 0.0008, target is 0.0016 (and ≤0.0005 was
+unachievable from the start).
+
+### D0.4 — Build the isolated rmsnorm probe (2 hours)
+
+Write `crates/hipfire-runtime/examples/rmsnorm_isolated.rs`. Inputs:
+HF stage-0 (input residual from the existing dump) + the norm weight
+tensor from the .hfq file. Output: a HIPFIRE_DUMP_LA_STAGES-format
+file with stage 1 only.
+
+Why isolated rather than full-model dump:
+- One kernel under test, no upstream noise
+- Each hypothesis variant tests in seconds, not minutes
+- Direct A/B comparison without full-forward overhead
+
+This is the workhorse for Day 1-3.
+
+---
+
+## Day 1 — operand-grouping + low-cost falsifications (~1 day)
+
+Run multiple hypothesis tests in parallel, all quick. Each is at most
+a few lines of kernel code; together they test 4 hypotheses and
+generate per-variant rL2 measurements via the isolated probe.
+
+### H1 — Operand grouping (rewritten per CR2)
+
+**Three groupings to test**, each on BOTH the plain kernel
+(`rmsnorm.hip:24`) AND the fused kernel (`fused_rmsnorm_mq_rotate.hip:79`):
+
+| variant | expression | provenance |
+|---|---|---|
+| H1a | `(x[i] * rms) * weight[i]` | torch reference order |
+| H1b | `x[i] * (weight[i] * rms)` | minimum-rounding shortcut |
+| H1c | `x[i] * weight[i] * rms` | left-to-right (current hipfire) |
+
+3 variants × 2 paths = 6 builds. Each is a 5-line change. The fused
+kernel's modification is more invasive due to its 153-line structure,
+but the change is local to the line that does the multiplication.
+
+**Coverage requirement** (per SR2): mirror variants in
+`fused_rmsnorm_mq_rotate_awq.hip` so AWQ-calibrated models are also
+covered. Same change pattern, different file.
+
+### H7 — FMA contraction (added per CR4)
+
+Hipfire's `sum_sq += v * v` is almost certainly compiled to
+`v_fma_f32` (one rounding step). PyTorch's `x.pow(2).mean()` may be
+two operations (one MUL, one ADD) with two rounding steps. For a
+1024-element reduction, missing one rounding per step is non-trivial.
+
+**Tests:**
+- **H7a:** Add `#pragma clang fp contract(off)` around the reduction
+  loop. Compile, measure rL2.
+- **H7b:** Use explicit `__fadd_rn(sum_sq, __fmul_rn(v, v))` — forces
+  two separately-rounded operations.
+- **H7c:** Build with `-ffp-contract=off` HIP compiler flag globally.
+
+Why this is high-priority: FMA contraction would manifest uniformly
+across every reduction kernel (gemv, attention softmax sum, conv1d,
+norms). This is the strongest single candidate for the shared root
+cause.
+
+### H8 — FTZ / denormal handling (added per CR4)
+
+Many GPU kernels are compiled with flush-to-zero on denormals (FTZ).
+If hipfire flushes small `v*v` products to zero but HF (especially on
+CPU eager) does not, the variance accumulates differently for inputs
+with very small magnitude entries.
+
+**Tests:**
+- Check the build flags for hipcc in `kernels/src/build.rs` /
+  `crates/rdna-compute/Cargo.toml`.
+- If FTZ is on, rebuild with `-fno-denormal-fp-math` and measure.
+- Conversely, force FTZ in CPU reference and measure HF's drift change.
+
+Probably <30 min of investigation, mostly reading build configuration.
+
+### H9 — Eps placement (added per CR4)
+
+Verify the formula matches exactly between hipfire and HF:
+
+**Hipfire (`rmsnorm.hip:21`):**
 ```c
-out[idx] = x[idx] * weight[i] * rms;     // = (x * weight) * rms
+float rms = rsqrtf(sdata[0] / (float)n + eps);
 ```
 
-**HF reference** (torch RMSNorm equivalent):
+**HF (`Qwen3_5RMSNorm.forward`):**
 ```python
-x_normalized = x * torch.rsqrt(variance + eps)
-return x_normalized * weight                # = (x * rms) * weight
+variance = x.pow(2).mean(-1, keepdim=True)
+x = x * torch.rsqrt(variance + eps)
 ```
 
-Different operand grouping in the multiplication: hipfire does
-`(x * weight) * rms`, HF does `(x * rms) * weight`. fp32 multiplication
-isn't strictly associative; the per-element rounding differs depending
-on which operands are paired first.
+Both apply eps to mean-of-squares before rsqrt. Match. **H9 is already
+verified for the plain kernel.** Check the fused kernel too — should
+also match. ~5 min source read.
 
-**Why this might be the dominant pattern:** every normalization kernel
-(rmsnorm, q_norm, k_norm, gated_norm, ffn_norm) does
-`x * weight * normfactor` in some order. If hipfire's convention is
-`(x * weight) * factor` and HF/llama.cpp use `(x * factor) * weight`,
-every normalization kernel inherits the same per-element rounding
-divergence.
+**Verdict on H9:** falsifiable by source inspection if it matches.
+Record as confirmed and move on.
 
-**Test:** rewrite to `out[idx] = (x[idx] * rms) * weight[i]`. Measure
-stage-1 rL2.
+### H4 — rsqrtf precision (kept, lower priority)
 
-### H2 — Reduction order in the variance sum
+`rsqrtf` is the hardware `v_rsq_f32` intrinsic with ~1 ULP precision.
+Some BLAS reductions use Newton-Raphson refinement to get to ~0.5 ULP.
 
-**Hipfire**: 8-pass tree reduce in `__shared__` memory with
-`sdata[t] += sdata[t + s]` at each step. Each cell ends as a sum of 256
-fp32 values in a specific binary-tree order.
+**Test:** replace `rsqrtf(x)` with `1.0f / sqrtf(x)`. Measure.
 
-**HF (eager mode)**: dispatches to CPU `aten::mean` or GPU BLAS sum;
-both typically use sequential or different-tree accumulation.
+Lower priority because: rsqrt is used in norms but NOT in projection
+gemv or conv. If rsqrt were the dominant pattern, norms would have
+worse drift than gemv. Data shows the opposite. Probably not it, but
+cheap to test.
 
-**llama.cpp**: warp-shuffle reduction (`__shfl_xor_sync` butterfly)
-followed by cross-warp shared-memory reduce. Different tree shape than
-hipfire's pure shared-memory tree.
+---
 
-**Why this might be a pattern:** every kernel with a reduction
-(variance for norms, dot product for gemv, softmax denominator for
-attention) uses the same tree-reduce primitive. If the tree shape
-differs from HF/llama.cpp's, every reduction-based kernel inherits the
-same per-element fp32 accumulation drift.
+## Day 2 — reduction tree shape (only if Day 0 confirms reduction matters)
 
-**Test:** rewrite rmsnorm to use a warp-shuffle reduce
-(`__shfl_xor_sync`) matching llama.cpp's pattern. Measure stage-1 rL2.
+Conditional on D0.1 outcome. **If `rmsnorm_f32_f64acc` significantly
+reduces stage-1 rL2, Day 2 proceeds; otherwise skip and use this day
+for additional Day 1 variants.**
 
-### H3 — FP16 intermediate accumulation somewhere
+### H2 — Reduction tree shape (corrected per CR6)
 
-Some HIP kernels use `__half` (FP16) for intermediates to fit more data
-in shared memory or registers. If any of rmsnorm's intermediates use
-FP16 where HF uses F32, error compounds.
+**NOT** sequential vs tree (the original framing was wrong — HF on
+CUDA/ROCm uses parallel reduction too, just a different tree shape).
+The actual comparison is **hipfire's shared-memory tree vs other
+parallel-reduction trees**.
 
-**Why this might be a pattern:** hipfire's gemv kernels for Q8 weights
-do all internal math in F32 per the kernel source — should not be the
-issue for rmsnorm. But `attention_q8_0_kv` and conv kernels might use
-FP16 accumulators in some paths. If any normalization kernel has an
-FP16 intermediate, error per element is ~3 ULP at FP16 = ~3e-4 relative.
+Hipfire's current pattern (`rmsnorm.hip:17-19`):
+```c
+for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+    __syncthreads();
+}
+```
 
-**Test:** read all rmsnorm-adjacent intermediate types in the kernel
-source. If F32 throughout, this hypothesis is ruled out for rmsnorm
-specifically. (Still possible for conv/attention.)
+Variants to test:
 
-### H4 — `rsqrtf` precision differs from PyTorch's `torch.rsqrt`
+| variant | tree shape |
+|---|---|
+| H2a | Current shared-memory binary tree (baseline) |
+| H2b | Warp-shuffle butterfly: `__shfl_xor_sync` with xor 1,2,4,8,16 (wave32) |
+| H2c | Warp-shuffle linear: `__shfl_down_sync` with 16,8,4,2,1 |
+| H2d | Hybrid: warp-shuffle within warp + shared-memory across warps |
+| H2e | Direct llama.cpp port (matches their `ggml-cuda/norm.cu` exactly) |
 
-`rsqrtf` is an intrinsic with ~1 ULP precision on AMD GPUs.
-`torch.rsqrt` calls the same underlying instruction OR uses a Newton
-iteration to refine. If hipfire uses `rsqrtf` directly and PyTorch
-uses `1.0 / sqrtf(x)` (or vice versa), per-element error is ~1-2 ULP.
+Each variant is a self-contained kernel file. Coexist for A/B testing
+(no rebuild penalty per MR1).
 
-**Why this might NOT be a dominant pattern:** rsqrtf is used in
-rmsnorm, l2norm, scale operations — but not in projection gemv or
-conv. So if rsqrtf were the cause, gemv and conv drift would be
-*lower* than norm drift. Data shows opposite (norms are cleaner than
-projections). H4 is *probably not* the dominant pattern but worth
-testing.
+**H5 (wave32 vs wave64) was demoted** (per CR5): rmsnorm uses no
+warp-size-specific intrinsics, so wave-size doesn't apply. H5 stays in
+scope for kernels that DO use `__shfl_xor_sync` with hardcoded
+width — gemv kernels, attention.
 
-**Test:** replace `rsqrtf(x)` with `1.0f / sqrtf(x)`. Measure stage-1 rL2.
+**H3 (FP16 intermediates) was demoted** (per CR5): rmsnorm.hip uses
+`float` throughout (verified by source inspection). H3 stays in scope
+for attention softmax and conv1d kernels where FP16 accumulators are
+possible.
 
-### H5 — Wavefront-32 vs wavefront-64 reduction layout
+---
 
-gfx1151 is wave32 (32 threads per warp). gfx906 / CDNA is wave64.
-Hipfire's reductions may have been originally designed for wave64 with
-specific shared-memory layouts; on wave32 they still work but produce
-different per-thread workload and reduction order.
+## Day 3 — H6 (direct llama.cpp port) or fallback
 
-**Why this might be a pattern:** every kernel that uses warp reductions
-inherits wavesize-dependent ordering. If hipfire's kernels were tuned
-on gfx906 (wave64) and never re-tuned for wave32, they'd all share the
-same wave-mismatch pattern.
+If Days 0-2 haven't produced a variant that hits the threshold (D0.3),
+port llama.cpp's rmsnorm kernel one-for-one to HIP. Keep their exact
+thread/block layout, reduction order, and operand grouping. Build,
+run, measure.
 
-**Test:** explicit wave32-specific reduction in rmsnorm_v2 (use
-`__shfl_xor_sync` with width=32). Measure stage-1 rL2.
+If llama.cpp's port hits ≤ target rL2, we know the *exact* combination
+of choices that works. Then enumerate the differences from hipfire's
+current implementation — that diff is the fix recipe.
 
-### H6 — Reading and matching llama.cpp's rmsnorm
+If llama.cpp's port ALSO hits ~0.0017: rmsnorm drift is not in any
+implementation choice we can find. Either the fp64 reference reveals
+the irreducible floor IS ~0.0017 (rarely the case at the math level)
+or we missed a hypothesis. Time for a fresh look at HF's exact
+reduction primitive.
 
-Llama.cpp's `ggml-cuda/norm.cu` implementation is short. The fastest
-way to find the pattern may be to literally port llama.cpp's rmsnorm
-to HIP and compare. If the port produces ≤0.0005 rL2, then llama.cpp's
-specific implementation choices (whatever they are) are the answer —
-and we just enumerate the differences.
+---
 
-**Test:** port llama.cpp's rmsnorm kernel to HIP one-for-one. Measure
-stage-1 rL2.
+## Day 4 — generalization (expanded per SR1, SR3)
 
-## Methodology — 5-day exploration
+If Days 0-3 found a fix for rmsnorm, test whether it generalizes.
 
-### Day 1 — Setup + H1/H4 quick wins
+### Generalization to norm cluster (per SR3 — budget per-kernel)
 
-- Build `rmsnorm_v2.hip` with hypothesis-toggleable env-gates
-  (`HIPFIRE_RMSNORM_OP_ORDER`, `HIPFIRE_RMSNORM_RSQRT_NEWTON`, etc.)
-- Add `dump_la_stage` call right after `fused_rmsnorm_mq_rotate` at LA-0
-  to measure stage-1 rL2 in isolation
-- Run baseline measurement: current rmsnorm rL2 = 0.0017
-- Test H1 (operation order): build variant, measure
-- Test H4 (rsqrtf alternatives): build variant, measure
-- Both are 5-minute kernel changes. Quick falsification.
+| target kernel | structure | adaptation needed |
+|---|---|---|
+| `rmsnorm_batched` (q_norm/k_norm in FA) | batched across heads | adjust thread/block geometry |
+| `fused_qk_l2_norm_scale_f32` | L2 norm formula `x / sqrt(sum(x²) / n)` | no `weight` term, slightly different output |
+| `gated_norm_f32` | rmsnorm+gate fused | adapt to fused form |
+| `fused_rmsnorm_mq_rotate.hip` | rmsnorm + FWHT (production) | apply fix; verify FWHT path unchanged |
+| `fused_rmsnorm_mq_rotate_awq.hip` | rmsnorm + AWQ divide + FWHT | same fix + AWQ path |
 
-### Day 2 — H2/H5 (reduction patterns)
+Each is ~half a day of adaptation + measurement. The "same fix" applied
+literally won't always compile — each kernel needs targeted edits in
+the equivalent operand-grouping / reduction / FMA-contraction spot.
 
-- Build `rmsnorm_v2_warpshfl.hip` using `__shfl_xor_sync` warp reduction
-  + shared-memory cross-warp reduce
-- Variant A: butterfly tree (xor 1, 2, 4, 8, 16 across 32-thread warp)
-- Variant B: linear shfl_down (16, 8, 4, 2, 1)
-- Variant C: hybrid matching llama.cpp's specific pattern
-- Measure stage-1 rL2 for each
+### Generalization to non-norm kernels (added per SR1)
 
-### Day 3 — H6 (direct llama.cpp port)
+Test one non-norm kernel to verify the pattern isn't norm-specific.
+Recommended: **`weight_gemv_residual`** — pure gemv with in-place
+residual add. It's the FA-block's wo + residual fusion. If the same
+pattern reduces its drift (currently part of stages 12→13 in FA), the
+pattern is genuinely a shared root cause across all reduction
+operations.
 
-- Find llama.cpp's `ggml-cuda/norm.cu` (or `rms_norm_f32` variant)
-- Translate one-for-one to HIP, keeping their exact thread/block layout,
-  reduction order, and operand grouping
-- Build, run, measure. If result ≤0.0005 rL2, mark a milestone.
+If `weight_gemv_residual` does NOT respond to the same fix: the
+pattern is norm-specific, and the engine-surgery estimate revises to
+"norm-cluster rewrite ~2 weeks, projection/gemv cluster requires
+separate investigation."
 
-### Day 4 — Generalization test
+### Generalization outcome decision
 
-If any variant from Days 1-3 produces rL2 ≤0.0005 on rmsnorm:
+| signal | meaning | action |
+|---|---|---|
+| Same fix drops all 5 norm kernels' rL2 below target + drops `weight_gemv_residual` too | **outcome A** | Schedule 4-6 week graph rewrite |
+| Same fix drops all norms but not gemv-residual | norm-cluster only | Ship norm fix (~2 weeks). Engine surgery for non-norm cluster needs separate plan |
+| Same fix drops rmsnorm only | **outcome B** | Ship rmsnorm fix as a side project. Defer broader surgery |
+| No variant on Day 3 hit the threshold | **outcome C** | Confirms graph-level scope; defer surgery |
 
-- Apply the **same pattern** to:
-  - `q_norm` / `k_norm` (per-head RMSNorm in FA)
-  - `l2_norm` in `fused_qk_l2_norm_scale_f32`
-  - `gated_norm_f32` (after recurrence in LA)
-- Measure those stage rL2s. Target: each drops from ~0.005-0.012 to
-  ≤0.0005 with the same fix.
-- If all three norm kernels respond uniformly to the same fix, the
-  pattern is real and we expect it to generalize across other reduction
-  kernels (gemv, softmax) too.
+---
 
-### Day 5 — Decision review
+## Day 5 — decision review (no work, just calibration of next step)
 
-Outcomes ranked:
+Outcome A: write a formal "Phase 4 — graph rewrite" proposal doc with
+the discovered pattern, the list of all kernels needing the fix, the
+4-6 week timeline including AWQ re-calibration, and a kickoff plan.
 
-- **(A) Pattern found and generalizes to all norms:** schedule a
-  multi-week graph rewrite. Estimated 4-6 weeks total: 2-3 weeks
-  applying pattern across remaining kernels (projection gemv, conv1d,
-  attention softmax, sigmoid-mul), 1-2 weeks per-kernel validation,
-  1 week AWQ re-calibration.
+Outcome B: ship the rmsnorm fix as a standalone PR (test, coherence-gate,
+land). Quality eval before+after.
 
-- **(B) Pattern found on rmsnorm but doesn't generalize:** rmsnorm fix
-  ships as a 1-week side project (small per-layer gain, modest model
-  KLD impact). Engine surgery scope returns to 4-8 month estimate;
-  defer.
+Outcome C: write `05-pattern-hunt-results.md` documenting which
+hypotheses were falsified. Audit closes definitively.
 
-- **(C) No variant drops rmsnorm rL2 below 0.001:** strong evidence
-  drift is in F32 accumulation precision itself, not in any single
-  implementation choice. Confirms graph-level rewrite is the only
-  path; defer.
+---
 
-## Decision criteria
+## Decision criteria (revised per CR1, S2)
 
-| outcome | rmsnorm rL2 reduction | generalization | action |
+| outcome | criterion (vs fp64 reference) | generalization | action |
 |---|---|---|---|
-| A — pattern + generalizes | 0.0017 → ≤0.0005 | ≥2 other norm kernels drop similarly | GO — graph rewrite, 4-6 weeks |
-| B — pattern, no generalization | 0.0017 → ≤0.0005 | only rmsnorm drops | ship rmsnorm fix, defer rest |
-| C — no significant reduction | 0.0017 → ≥0.001 | n/a | NO-GO — confirms graph-level scope |
+| A — pattern + generalizes | hipfire rL2 vs fp64 ≤ 2× (HF fp32 vs fp64) on rmsnorm | ≥3 other norm kernels + 1 non-norm kernel drop similarly | GO — 4-6 week graph rewrite |
+| B — pattern, narrow | rmsnorm hits target | only norm kernels | Ship norm fix; defer rest |
+| C — no significant rmsnorm reduction | rmsnorm doesn't hit target | n/a | NO-GO — confirms graph-level scope |
 
-## What we learn from "no pattern"
+---
 
-A negative result (outcome C) is also valuable. It would mean:
+## What we learn from "no pattern" (outcome C)
+
+A negative result is also valuable. It would mean:
 
 - Hipfire's per-kernel implementations DON'T share a fixable pattern
 - Each kernel's drift is independent — driven by per-kernel reduction
   shape, per-kernel data layout, per-kernel accumulator choice
-- The ~0.005 rL2 uniformity is a *coincidence* of fp32 arithmetic with
+- The ~0.005 rL2 uniformity is a coincidence of fp32 arithmetic with
   similar-sized inputs, not a shared cause
 - Closing the floor requires 24 independent kernel rewrites — the
   4-8 month estimate stands
 
 This conclusion is *useful*: it tells us calibration is genuinely the
 only short-horizon answer, and the calibration roadmap is the right
-priority. We've spent 5 days to definitively settle the question.
+priority. 5 days to settle the question.
 
-## Why this is the right next step
+---
 
-The audit's blind spot was framing engine drift as "single dominant
-kernel OR distributed = closed". A third path exists: **distributed
-manifestation of single shared cause.** The data signature (tight
-clustering of per-kernel drift at ~0.005 rL2) is exactly what shared
-cause would produce.
+## Sequencing with calibration work
 
-The cost (5 days, isolated to kernel rewrites, no model retraining) is
-small relative to the decision value (collapses or confirms the
-graph-rewrite estimate from 4-8 months to 4-6 weeks).
-
-Even if no pattern is found, the work produces a hardened rmsnorm
-kernel with documented design choices — useful documentation for
-future rewrites.
-
-## Sequencing
-
-- **Independent of calibration work.** rmsnorm rewrite doesn't conflict
-  with AWQ/GPTQ calibration on gfx1100. Both can proceed in parallel.
-- **Single env-gate**: each variant lives behind a HIPFIRE_RMSNORM_V2
-  env-gate so we can A/B compare without touching the default path.
+- **Independent of calibration.** rmsnorm rewrite doesn't conflict
+  with AWQ/GPTQ work on gfx1100. Both can proceed in parallel.
 - **Per-arch validation**: if the pattern works on gfx1151, verify it
-  also helps gfx1100 before landing as default (cross-arch consistency
-  check).
+  also helps gfx1100 before landing as default.
+- **Build-time budget** (per MR1): coexist variants as separate kernel
+  files so A/B comparisons don't require rebuilding. Estimated total
+  compile time across the 5 days: ~2 hours wasted-time absorbed into
+  the existing schedule.
 
-## Exit conditions for the pattern hunt
+---
+
+## Hypothesis ranking (final, revised)
+
+By falsification cost, cheapest-first:
+
+| rank | hypothesis | cost | day |
+|---:|---|---|---:|
+| 1 | f64acc reduction (existing kernel) | 30 min | 0 |
+| 2 | FP32 norm-weight control | 1 hour | 0 |
+| 3 | fp64 reference floor (target derivation) | 1 hour | 0 |
+| 4 | Isolated rmsnorm probe (workhorse) | 2 hours | 0 |
+| 5 | H9 eps placement (source inspection) | 15 min | 1 |
+| 6 | H8 FTZ / denormals | 30 min | 1 |
+| 7 | H4 rsqrtf precision | 1 hour | 1 |
+| 8 | H7 FMA contraction | 1 hour | 1 |
+| 9 | H1 operand grouping (3 variants × 2 paths) | 4 hours | 1 |
+| 10 | H2 reduction tree (5 variants) | 1 day | 2 (conditional) |
+| 11 | H6 direct llama.cpp port | 1 day | 3 |
+| — | H3 FP16 intermediates | falsified by inspection | dropped for rmsnorm |
+| — | H5 wave32 vs wave64 | falsified by inspection | dropped for rmsnorm |
+
+---
+
+## Files to create
+
+- `crates/hipfire-runtime/examples/rmsnorm_isolated.rs` — isolated
+  rmsnorm probe (required, Day 0)
+- `kernels/src/rmsnorm_v2_h1a.hip`, `_h1b.hip`, `_h2b.hip`, etc. —
+  per-variant kernels coexisting with the baseline
+- `kernels/src/rmsnorm_v2_llama.hip` — direct llama.cpp port (Day 3)
+- `crates/rdna-compute/src/dispatch.rs` — env-gated variant selection
+- `docs/investigations/2026-05-13-engine-drift-residual-audit/05-pattern-hunt-results.md`
+
+## Exit conditions
 
 - Day 5 decision review fires regardless of outcome
-- If outcome A or B at Day 5, write Phase 4 results doc (`05-`)
-  documenting which hypothesis won and what the cross-kernel propagation
-  looks like
-- If outcome C at Day 5, write Phase 4 results doc documenting which
-  hypotheses were falsified — provides forward roadmap for any future
-  re-exploration
-
-## Files to create during exploration
-
-- `kernels/src/rmsnorm_v2.hip` — env-gated variant matrix
-- `crates/rdna-compute/src/dispatch.rs` — env-gated dispatch
-- `crates/hipfire-runtime/examples/rmsnorm_isolated.rs` — isolated
-  rmsnorm probe with bit-exact input + per-variant rL2 measurement
-  against an in-tree fp64 reference
-- `docs/investigations/2026-05-13-engine-drift-residual-audit/05-pattern-hunt-results.md`
+- Outcome A or B at Day 5 → Phase 4 results doc + next step plan
+- Outcome C at Day 5 → results doc documenting falsified hypotheses,
+  audit closes definitively
 
 ## What this supersedes
 
 `03-final-verdict.md` closed the audit pending re-investigation of the
-shared-root-cause hypothesis. This plan opens that investigation.
-03's verdict remains accurate for the framing it used (single dominant
-kernel); 04 explores the alternative framing.
+shared-root-cause hypothesis. This plan (rev 2, post combined review)
+opens that investigation. 03's verdict remains accurate for the
+framing it used; 04 explores the alternative framing.
