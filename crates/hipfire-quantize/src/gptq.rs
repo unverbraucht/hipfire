@@ -23,8 +23,10 @@
 //!    column update via FP64 Cholesky from `faer`, per-element
 //!    asymmetric INT4 quantize using the frozen per-256-block grids.
 //!
-//! 4. **`condition_estimate`** — defensive: if `H + λI` has cond > cap
-//!    (default 1e8), skip GPTQ for this tensor (fall through to plain MQ4).
+//! 4. **`compute_damped_inverse`** — defensive: adaptive damping schedule
+//!    (10× per retry up to `max_damp_multiplier * mean(diag(H))`); if even
+//!    the cap fails, returns `Err(SingularEvenWithMaxDamp)` and the caller
+//!    skips GPTQ for that tensor (falls through to plain MQ4 in main.rs).
 //!
 //! All linear algebra is FP64 (per Claude M2 + GLM5 M2 reviews) — FP32
 //! Cholesky on K=12288 with cond=1e6+ has zero effective precision.
@@ -32,7 +34,7 @@
 #![cfg_attr(not(test), allow(dead_code))]  // suppress until main.rs wires it
 
 use faer::linalg::solvers::{DenseSolveCore, Solve};
-use faer::{Mat, MatRef, Side};
+use faer::{Mat, Side};
 
 /// Per-element asymmetric MQ4 quantize step.
 ///
@@ -58,11 +60,15 @@ pub fn quantize_mq4_element(w: f64, scale: f64, min_val: f64) -> f64 {
 /// Returns `(L, effective_damp)` where `L` is the lower-triangular
 /// Cholesky factor and `effective_damp` is the damping value that
 /// actually made `H + damp*I` PSD-decomposable. If even
-/// `damp = 1.0 * mean(diag(H))` fails, returns `Err(CholeskyError::SingularEvenWithMaxDamp)`.
+/// `damp = max_damp_multiplier * mean(diag(H))` fails, returns
+/// `Err(CholeskyError::SingularEvenWithMaxDamp)`.
 ///
 /// Per the GPTQ paper, damping is critical for numerical stability —
 /// the Hessian's null space (low-activation channels) makes naive
 /// Cholesky fail without it.
+///
+/// Provided for testability; production GPTQ uses `compute_damped_inverse`
+/// which combines damping search + inversion in one decomposition.
 pub fn cholesky_with_adaptive_damping(
     h: &Mat<f64>,
     initial_damp: f64,
@@ -72,20 +78,15 @@ pub fn cholesky_with_adaptive_damping(
     assert_eq!(h.nrows(), h.ncols(), "Hessian must be square");
     let diag_mean: f64 = (0..k).map(|i| h[(i, i)]).sum::<f64>() / k as f64;
 
-    // Try damping schedule: λ₀, 10·λ₀, 100·λ₀, ..., up to max_damp_multiplier · diag_mean.
-    let mut damp = initial_damp;
+    let mut damp = clamped_initial_damp(initial_damp, diag_mean);
     let damp_cap = max_damp_multiplier * diag_mean;
     loop {
-        // Build H + damp*I lazily — allocate a fresh matrix per attempt
-        // to keep the original H pristine for caller use.
         let mut a = h.clone();
         for i in 0..k {
             a[(i, i)] += damp;
         }
         match a.llt(Side::Lower) {
             Ok(decomp) => {
-                // Materialize L. faer's `L()` returns a MatRef view; copy
-                // to a fresh Mat so the caller doesn't pin the decomp.
                 let l_ref = decomp.L();
                 let mut l = Mat::<f64>::zeros(k, k);
                 for j in 0..k {
@@ -103,10 +104,63 @@ pub fn cholesky_with_adaptive_damping(
                         diag_mean,
                     });
                 }
-                damp *= 10.0;
-                if damp > damp_cap {
-                    damp = damp_cap;
+                damp = (damp * 10.0).min(damp_cap);
+            }
+        }
+    }
+}
+
+/// Snap `initial_damp` away from zero relative to the Hessian's scale.
+/// Without this, `damp *= 10` stays at 0 forever when the caller passes
+/// zero against a singular matrix. The clamp is inert for any practical
+/// non-zero `initial_damp` (it lives at the `f64::EPSILON * diag_mean`
+/// floor), so well-conditioned Cholesky outputs don't shift measurably.
+#[inline]
+fn clamped_initial_damp(initial_damp: f64, diag_mean: f64) -> f64 {
+    initial_damp.max(f64::EPSILON * diag_mean.max(1.0))
+}
+
+/// Adaptive-damping search + dense inverse, in one decomposition.
+///
+/// Replaces the prior `cholesky_with_adaptive_damping` + separate
+/// `invert_damped_hessian` pair (which redundantly Cholesky'd twice).
+/// At K=12288 each Cholesky is ~5–10 minutes single-threaded; doubling
+/// it across 248 tensors burns ~40 hours of CPU.
+///
+/// On success returns `(H_inv, effective_damp)` where `H_inv = (H + λI)^-1`
+/// in FP64. On terminal failure even at the cap, returns
+/// `CholeskyError::SingularEvenWithMaxDamp` — caller's signal to skip
+/// GPTQ for this tensor and fall through to plain MQ4.
+pub fn compute_damped_inverse(
+    h: &Mat<f64>,
+    initial_damp: f64,
+    max_damp_multiplier: f64,
+) -> Result<(Mat<f64>, f64), CholeskyError> {
+    let k = h.nrows();
+    assert_eq!(h.nrows(), h.ncols(), "Hessian must be square");
+    let diag_mean: f64 = (0..k).map(|i| h[(i, i)]).sum::<f64>() / k as f64;
+    let mut damp = clamped_initial_damp(initial_damp, diag_mean);
+    let damp_cap = max_damp_multiplier * diag_mean;
+    let identity = Mat::<f64>::identity(k, k);
+    loop {
+        let mut a = h.clone();
+        for i in 0..k {
+            a[(i, i)] += damp;
+        }
+        match a.llt(Side::Lower) {
+            Ok(decomp) => {
+                let h_inv = decomp.solve(&identity);
+                return Ok((h_inv, damp));
+            }
+            Err(_) => {
+                if damp >= damp_cap {
+                    return Err(CholeskyError::SingularEvenWithMaxDamp {
+                        max_damp: damp,
+                        k,
+                        diag_mean,
+                    });
                 }
+                damp = (damp * 10.0).min(damp_cap);
             }
         }
     }
@@ -266,11 +320,30 @@ pub fn apply_awq_rescaling(h: &mut Mat<f64>, awq_scales: &[f64]) {
     let k = h.nrows();
     assert_eq!(h.nrows(), h.ncols());
     assert_eq!(awq_scales.len(), k);
+    for &s in awq_scales {
+        assert!(s > 0.0, "AWQ scales must be strictly positive (got {s})");
+    }
     for i in 0..k {
         let inv_i = 1.0 / awq_scales[i];
         for j in 0..k {
             let inv_j = 1.0 / awq_scales[j];
             h[(i, j)] *= inv_i * inv_j;
+        }
+    }
+}
+
+/// Symmetrize a square matrix in place: `M[i,j] = M[j,i] = (M[i,j] + M[j,i]) / 2`.
+/// Used to scrub the FP-error asymmetry that accumulates across the
+/// row-pass + col-pass of `fwht_similarity_per_256` (which is exactly
+/// symmetric in exact arithmetic but drifts by O(ε·K·log K) at K=12288).
+pub fn symmetrize_in_place(h: &mut Mat<f64>) {
+    let k = h.nrows();
+    assert_eq!(h.nrows(), h.ncols());
+    for i in 0..k {
+        for j in (i + 1)..k {
+            let avg = 0.5 * (h[(i, j)] + h[(j, i)]);
+            h[(i, j)] = avg;
+            h[(j, i)] = avg;
         }
     }
 }
@@ -397,6 +470,15 @@ pub fn gptq_pipeline_mq4g256(
     let signs2: Vec<f64> = signs2_f32.iter().map(|&v| v as f64).collect();
     fwht_similarity_per_256(&mut h, &signs1, &signs2);
 
+    // Defensive symmetrization. `F · diag(1/s) · H · diag(1/s) · F^T` is
+    // symmetric in exact arithmetic but the row-pass and col-pass in
+    // `fwht_similarity_per_256` accumulate FP error differently, so
+    // (i,j) and (j,i) can drift. faer's `llt(Side::Lower)` ignores the
+    // upper triangle but `gptq_column_sequential` reads `h_inv[(j, kk)]`
+    // for arbitrary (j, kk) — silent asymmetry there corrupts OBS
+    // propagation. Average them once here, cheap O(K²).
+    symmetrize_in_place(&mut h);
+
     let mut weights = vec![0.0_f64; m * k];
     for (i, &w) in weights_f32.iter().enumerate() {
         weights[i] = w as f64;
@@ -485,28 +567,6 @@ pub fn inverse_perm(perm: &[usize]) -> Vec<usize> {
     inv
 }
 
-/// Compute `(H_damped)^-1` as a dense Mat<f64>.
-///
-/// Used by `gptq_column_sequential` for the inner-loop error propagation.
-/// We need the FULL inverse (not just its diagonal or one column) because
-/// the loop accesses `H_inv[j, k]` for all `k > j`. faer's solver gives
-/// us this via `solve(I)` → `H_inv = (H+λI)^-1`.
-pub fn invert_damped_hessian(h: &Mat<f64>, damp: f64) -> Result<Mat<f64>, CholeskyError> {
-    let k = h.nrows();
-    let mut a = h.clone();
-    for i in 0..k {
-        a[(i, i)] += damp;
-    }
-    let llt = a.llt(Side::Lower).map_err(|_| CholeskyError::SingularEvenWithMaxDamp {
-        max_damp: damp,
-        k,
-        diag_mean: (0..k).map(|i| h[(i, i)]).sum::<f64>() / k as f64,
-    })?;
-    // Solve (H+λI) X = I → X = (H+λI)^-1
-    let identity = Mat::<f64>::identity(k, k);
-    Ok(llt.solve(&identity))
-}
-
 /// Core GPTQ column-sequential update.
 ///
 /// Mutates `weights_flat` (row-major M×K) in place: each column j is
@@ -549,12 +609,12 @@ pub fn gptq_column_sequential(
     assert_eq!(h_target.ncols(), k_dim);
     assert_eq!(frozen_grids.len(), (m * k_dim) / 256);
 
-    // Adaptive damping: find a `damp` that makes the Cholesky succeed,
-    // then materialize the dense inverse for the OBS column updates.
-    let (l, effective_damp) =
-        cholesky_with_adaptive_damping(h_target, initial_damp, max_damp_multiplier)?;
-    let _ = l; // we don't actually use L here — we use the inverse instead
-    let h_inv = invert_damped_hessian(h_target, effective_damp)?;
+    // Adaptive damping + dense inverse in one decomposition (see
+    // `compute_damped_inverse`). Previous codepath did the Cholesky twice
+    // — once to find a working damp, once to invert — which doubled the
+    // O(K³) cost per tensor.
+    let (h_inv, effective_damp) =
+        compute_damped_inverse(h_target, initial_damp, max_damp_multiplier)?;
 
     // WEIGHT-mode actorder: sort columns by descending diag(H_target).
     // Process in `perm[0..K]` order; the storage layout (frozen_grids
@@ -647,7 +707,11 @@ mod tests {
             _ => unreachable!(),
         });
         let (l, damp) = cholesky_with_adaptive_damping(&h, 0.0, 1.0).unwrap();
-        assert_eq!(damp, 0.0);  // no damping needed for SPD
+        // Effective damp is at the ε·diag_mean floor (clamped_initial_damp),
+        // not literally zero — that floor exists to prevent the damp=0
+        // infinite-loop on singular inputs. Cosmetic shift; the Cholesky
+        // result is unchanged to FP precision.
+        assert!(damp < 1e-14, "SPD damp should be at the ε·diag_mean floor, got {damp}");
         // L[0][0] = sqrt(4) = 2.0
         assert!((l[(0, 0)] - 2.0).abs() < 1e-12, "L[0][0] = {}", l[(0, 0)]);
         // L[1][0] = 2 / 2 = 1.0
@@ -788,7 +852,9 @@ mod tests {
 
         let mut weights = weights_orig.clone();
         let damp = gptq_column_sequential(&mut weights, &h, m, k, &frozen, 0.0, 1.0).unwrap();
-        assert_eq!(damp, 0.0, "identity H should need no damping");
+        // Identity H trivially Cholesky'd — effective damp lands on the
+        // ε·diag_mean=ε floor from clamped_initial_damp, not literally 0.
+        assert!(damp < 1e-14, "identity H damp should be at the ε floor, got {damp}");
 
         // Compare to plain RTN on the same weights+grids.
         let mut rtn = weights_orig.clone();
@@ -985,5 +1051,118 @@ mod tests {
             "GPTQ should match or beat RTN on activation-weighted error: \
              rtn={rtn_err:.6e}, gptq={gptq_err:.6e}"
         );
+    }
+
+    /// Regression guard for the `initial_damp = 0` + singular H infinite-loop
+    /// case. Prior to the `clamped_initial_damp` floor, `damp *= 10` stayed
+    /// at zero forever and this call never returned.
+    #[test]
+    fn cholesky_terminates_on_singular_h_with_zero_initial_damp() {
+        let h = Mat::<f64>::from_fn(4, 4, |_i, _j| 1.0);  // rank-1, singular
+        let (_l, damp) = cholesky_with_adaptive_damping(&h, 0.0, 1.0)
+            .expect("must terminate with successful damp on rank-1 H");
+        assert!(damp > 0.0, "damp must be > 0 to make singular H invertible");
+
+        let (_h_inv, damp2) = compute_damped_inverse(&h, 0.0, 1.0)
+            .expect("compute_damped_inverse must also terminate");
+        assert!(damp2 > 0.0);
+    }
+
+    /// `compute_damped_inverse` is functionally equivalent to the prior
+    /// two-step (find damp via Cholesky → invert via second Cholesky)
+    /// pipeline. Cross-check on a tiny SPD matrix that the inverse
+    /// matches `(H + damp·I)^-1` computed via Cholesky-solve-identity.
+    #[test]
+    fn compute_damped_inverse_matches_two_step() {
+        let h = Mat::<f64>::from_fn(3, 3, |i, j| match (i, j) {
+            (0, 0) => 4.0, (0, 1) => 1.0, (0, 2) => 0.5,
+            (1, 0) => 1.0, (1, 1) => 3.0, (1, 2) => 0.25,
+            (2, 0) => 0.5, (2, 1) => 0.25, (2, 2) => 2.0,
+            _ => unreachable!(),
+        });
+        let (h_inv, damp) = compute_damped_inverse(&h, 0.01, 1.0).unwrap();
+        // Verify (H + damp·I) · h_inv ≈ I
+        let mut a = h.clone();
+        for i in 0..3 { a[(i, i)] += damp; }
+        for i in 0..3 {
+            for j in 0..3 {
+                let mut s = 0.0;
+                for kk in 0..3 {
+                    s += a[(i, kk)] * h_inv[(kk, j)];
+                }
+                let expected = if i == j { 1.0 } else { 0.0 };
+                assert!(
+                    (s - expected).abs() < 1e-10,
+                    "(H+damp·I)·H_inv [{i},{j}] = {s}, expected {expected}"
+                );
+            }
+        }
+    }
+
+    /// `symmetrize_in_place` produces an exactly symmetric matrix from a
+    /// near-symmetric input — guard for the defensive scrub applied to
+    /// `H_target` before Cholesky.
+    #[test]
+    fn symmetrize_in_place_produces_exact_symmetry() {
+        let mut h = Mat::<f64>::from_fn(4, 4, |i, j| {
+            let base = ((i * 4 + j) as f64) * 0.1;
+            // Inject deterministic asymmetric perturbation
+            base + if i < j { 1e-12 } else { 0.0 }
+        });
+        symmetrize_in_place(&mut h);
+        for i in 0..4 {
+            for j in 0..4 {
+                assert_eq!(
+                    h[(i, j)], h[(j, i)],
+                    "after symmetrize: [{i},{j}] = {}, [{j},{i}] = {}",
+                    h[(i, j)], h[(j, i)]
+                );
+            }
+        }
+    }
+
+    /// FWHT similarity is symmetric in exact arithmetic but drifts in FP.
+    /// Verify our defensive `symmetrize_in_place` clamp restores exact
+    /// symmetry without changing the spectrum meaningfully (trace preserved).
+    #[test]
+    fn fwht_similarity_then_symmetrize_is_exactly_symmetric() {
+        let k = 256;
+        let mut h = Mat::<f64>::from_fn(k, k, |i, j| {
+            // Random-ish symmetric input
+            let v = ((i as f64) * 0.7 + (j as f64) * 0.31).sin();
+            v
+        });
+        // Ensure exact symmetry of the input
+        for i in 0..k {
+            for j in (i + 1)..k {
+                h[(j, i)] = h[(i, j)];
+            }
+        }
+        let trace_before: f64 = (0..k).map(|i| h[(i, i)]).sum();
+
+        let signs1: Vec<f64> = (0..256).map(|i| if i % 2 == 0 { 1.0 } else { -1.0 }).collect();
+        let signs2: Vec<f64> = (0..256).map(|i| if (i / 4) % 2 == 0 { 1.0 } else { -1.0 }).collect();
+        fwht_similarity_per_256(&mut h, &signs1, &signs2);
+        symmetrize_in_place(&mut h);
+
+        for i in 0..k {
+            for j in 0..k {
+                assert_eq!(h[(i, j)], h[(j, i)]);
+            }
+        }
+        let trace_after: f64 = (0..k).map(|i| h[(i, i)]).sum();
+        assert!(
+            (trace_after - trace_before).abs() < 1e-9,
+            "trace shifted: before={trace_before}, after={trace_after}"
+        );
+    }
+
+    /// `apply_awq_rescaling` panics defensively on a zero scale (would
+    /// otherwise produce inf entries and corrupt the Hessian silently).
+    #[test]
+    #[should_panic(expected = "AWQ scales must be strictly positive")]
+    fn apply_awq_rescaling_rejects_zero_scale() {
+        let mut h = Mat::<f64>::from_fn(2, 2, |_i, _j| 1.0);
+        apply_awq_rescaling(&mut h, &[1.0, 0.0]);
     }
 }
