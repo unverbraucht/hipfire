@@ -203,6 +203,20 @@ verify the caller actually sets a stream (fix pattern: create
 `gpu.active_stream` at the top of the caller — see da2753e for
 `spec_step_dflash`).
 
+**Token-attractor garbage (multilingual rare tokens, `����` bytes,
+`<unk>`/`<LM`/`{EIF` leaking into body) — clean rebuild FIRST.** Cargo
+incremental can relink examples against stale `.rlib`s, and JIT
+`.hsaco` cache can drift past the SipHash check, so the binary behaves
+like an older code path with `git diff HEAD` clean. Reproduced
+2026-05-14 on "AWQ gfx1100 gibberish" (binary 11 days stale, runtime
+fine). Reset:
+```
+cargo clean -p hipfire-runtime -p hipfire-arch-qwen35 -p rdna-compute
+rm -rf .hipfire_kernels/<arch>/  kernels/compiled/<arch>/
+cargo build --release --example <name> -p hipfire-runtime
+```
+If garbage persists post-clean, then chase the kernel.
+
 ## Skills (`docs/skills/`)
 
 Reusable how-tos kept out of CLAUDE.md to avoid bloat. Each skill is a
