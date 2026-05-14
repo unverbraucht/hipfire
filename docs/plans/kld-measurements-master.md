@@ -89,24 +89,44 @@ Source: 2026-05-13 PM, this session. HF4 = HFQ4G256 = same number format as MQ4 
 3. **No rotation bug found** — empirical pattern matches theoretical expectations cleanly.
 4. The PPL-vs-KLD divergence between rotated and unrotated paths is a new instance of the F2/F3 "more precise = worse KLD-vs-HF" pattern, this time at the format level rather than the engine level.
 
-### 1.1e MQ6+Q8conv1d anchor (gfx1151, KV=q8, prefill, n=?)
+### 1.1e MQ6+Q8conv1d anchor (gfx1151, KV=q8, prefill)
 
-Source: gfx1151 agent 2026-05-13 PM. Uniform MQ6G256 across all 4-bit-eligible projections + Q8 conv1d override + default Q8 lm_head + Q8 embed.
+Source: gfx1151 agent 2026-05-13 PM (smoke) + 2026-05-14 (full n=512). Uniform MQ6G256 across all 4-bit-eligible projections + Q8 conv1d override + default Q8 lm_head + Q8 embed.
 
-| Variant | bpw | KLD (CI) | p99 | PPL | Wall |
-|---|---:|---|---:|---:|---:|
-| **mq6-q8conv1d** | ~6.5 | **0.0568** (CI 0.0314–0.0950) | 12.13 | **9.281** | ~6 min |
+| Variant | n | bpw | KLD (CI) | p99 | PPL | Wall |
+|---|---:|---:|---|---:|---:|---:|
+| mq6-q8conv1d (smoke) | 20 | ~6.5 | 0.0568 (CI 0.0314–0.0950) | 12.13 | 9.281 | ~6 min |
+| **mq6-q8conv1d (n=512)** | **512** | ~6.5 | **0.0510** (CI **0.047–0.055**) | **8.68** | **9.186** | gfx1151 |
+
+**n=512 confirms the smoke and tightens the CI 10× without changing the headline conclusion.** The smoke's wide CI 0.0314–0.0950 now collapses to 0.047–0.055 — the point estimate moved down 10% (0.0568 → 0.0510) and the tail p99 dropped from 12.13 to 8.68 (smoke caught a few unrepresentative high-noise sequences). PPL 9.186 is +0.02% above the Tier-3 Q8 floor 9.189 — i.e., **indistinguishable from 8-bit predictive quality at 6.5 bpw**.
 
 **Hipfire's first format that genuinely competes with llama.cpp absolute-KLD-vs-HF:**
-- Hipfire MQ6+Q8conv1d 6.5 bpw KLD 0.0568 ≈ **Llama.cpp UD-Q4_K_XL** at 5.32 bpw KLD 0.0670 — hipfire matches at +1.2 bpw cost
-- Better than **Llama.cpp Q4_K_M** at 5.07 bpw KLD 0.1249 — hipfire wins by 2.2×
-- Worse than **Llama.cpp Q6_K** at 6.56 bpw KLD 0.0250 — hipfire 2.3× worse (Δ-above-Q8: 0.040 vs 0.009 = 4.4× worse)
+- Hipfire MQ6+Q8conv1d 6.5 bpw KLD 0.0510 ≈ **Llama.cpp UD-Q4_K_XL** at 5.32 bpw KLD 0.0670 — hipfire matches at +1.2 bpw cost
+- Better than **Llama.cpp Q4_K_M** at 5.07 bpw KLD 0.1249 — hipfire wins by 2.4×
+- Worse than **Llama.cpp Q6_K** at 6.56 bpw KLD 0.0250 — hipfire 2.0× worse (Δ-above-Q8: 0.034 vs 0.009 = 3.8× worse)
 
-**PPL: 9.281 vs Tier-3 Q8 9.189 = +1% PPL.** Predictive quality essentially same as 8-bit. **This is a viable shipping format for "high-quality 4-5 bpw" target.**
+**This is a viable shipping format for "high-quality 4-5 bpw" target.**
 
-Δ-above-Tier3-Q8: 0.0568 − 0.0173 = **0.0395** — pure 6-bit weight noise.
+Δ-above-Tier3-Q8: 0.0510 − 0.0173 = **0.0337** — pure 6-bit weight noise (down from smoke estimate 0.0395).
 
-**Cross-engine pattern: same ~4× Δ penalty at both 4-bit and 6-bit, suggesting format-level (per-block scale fitting, 32 vs 256 group, asymmetric vs symmetric) is the structural cause rather than any specific bpw quirk.**
+**Cross-engine pattern: same ~4× Δ penalty at both 4-bit and 6-bit, suggesting format-level (per-block scale fitting, 32 vs 256 group, asymmetric vs symmetric) is the structural cause rather than any specific bpw quirk.** See `qwen35-mq4-quality-gap.md` Stage A follow-ups F1-F5 for concrete fixes targeting this structural gap.
+
+#### 1.1e.i KLD-vs-PPL inversion: MQ6-q8conv1d wins KLD 6.1× but loses PPL by 1%
+
+Direct n=512 comparison of the two 9B variants the gfx1151 agent ran in the same sweep:
+
+| Variant | bpw | KLD (CI) | p99 | PPL | KLD rank | PPL rank |
+|---|---:|---|---:|---:|---:|---:|
+| MQ4-Lloyd | ~4.91 | 0.3114 (0.300–0.324) | 18.69 | **9.085** | 2nd | **1st** |
+| MQ6-q8conv1d | ~6.5 | **0.0510** (0.047–0.055) | 8.68 | 9.186 | **1st** | 2nd |
+
+**Both gaps are well outside their CIs** — this is not measurement noise. MQ6-q8conv1d's KLD is **6.1× lower** but its PPL is **1.1% higher**. The two metrics genuinely disagree on which variant is better.
+
+**Mechanism.** PPL is `exp(mean(-log p(y_true)))` — only the probability assigned to the *true* next token matters, regardless of the full distribution shape. KLD is `Σ p_ref(y) log(p_ref(y)/p_cand(y))` — measures full-distribution match against HF reference, including all the tail mass HF assigns probability to. MQ6-q8conv1d has lower per-weight noise → tighter tail-mass match to HF → much lower KLD. MQ4-Lloyd's per-block Lloyd codebook happens to nudge the argmax marginally toward the HF-bf16 reference's argmax token (without preserving tail shape), so PPL improves slightly even though the full distribution drifts harder.
+
+This is the same family of "more precise ≠ better PPL-vs-HF" effect documented in F2/F3 — HF's bf16 reference is itself noisy at module boundaries, and any quant whose argmax happens to align with HF-bf16's argmax wins PPL even if the rest of its distribution is worse-aligned.
+
+**Implication for ranking.** Exactly the PRD §2 case for KLD-primary scoring: KLD captures tail-mass quality (impacts coherence on rare-token contexts, multi-step reasoning where low-probability outputs matter); PPL only captures argmax confidence (impacts greedy decoding on common-token contexts). Models that win PPL but lose KLD are likely to win one-shot benchmarks (HumanEval, MMLU) while degrading on long-context reasoning. The shipping recommendation should weight by KLD.
 
 ### 1.1c MQ4-Lloyd anchor (gfx1151, KV=q8, prefill, n=512)
 
@@ -431,6 +451,14 @@ SHA in the row's "Notes" field (e.g. "engine=PR#197@<sha>").
   - **F16 conv1d ≈ Q8 conv1d (0.2388 vs 0.2360 at n=20, statistically indistinguishable):** F16 storage is actually FINER-grained than HF's BF16 reference (10 mantissa bits vs 7), so F16 conv1d weights are slightly more accurate than HF's training-dtype reference → forward pass diverges slightly → KLD-vs-HF slightly higher than Q8. Same F2/F3-pattern (more precise = worse KLD-vs-HF). Q8 dequant's ~7-effective-mantissa-bits precision is closer-to-BF16's grid than F16 storage is. Means Q8 (not F16) is the right default — also smaller.
   - **Q8 lm_head dropped from recommendation:** +540 MB for −3% KLD doesn't pencil out vs Q8 conv1d's near-zero cost for −26%. Cost-per-KLD-lift ratio: Q8 conv1d is **65,000× better** than Q8 lm_head.
 - **2026-05-13 PM — PR-#248 Tier-3 fused WMMA Q8 prefill closes the cross-engine floor gap.** 0.8B q8-KV q8f16 floor: 0.0796 (Tier-2 FP32-acc, n=20 gfx1151) → **0.0041** (Tier-3 FP16-acc WMMA, n=512 gfx1100); 9B q8-KV q8f16 floor: 0.1459 asym3-KV Tier-2 (n=512 gfx1100) → **0.0173** q8-KV Tier-3 (n=256 gfx1151). Hipfire 9B Tier-3 Q8 floor is **+6% above llama.cpp Q8_0's 0.0163** — essentially same precision class. The earlier "100% engine drift" claim (Phase 0 commit `13003256`) was 100% the FP32-vs-bf16 precision-class mismatch with HF's bf16 reference; Tier-3's FP16-accumulator WMMA kernels match HF's precision class, and the gap closes. PR-#248 was framed as a perf improvement (18× faster Q8 prefill) but the KLD-vs-HF impact is the bigger structural finding. **Implication for §1.1's "Above-floor" column:** it's path-mismatched (Tier-2 Q8 baseline subtracted from FP16-WMMA MQ4 measurements), understating true 4-bit weight noise by ~0.130 nats at 9B. The path-matched Δ-framework using Tier-3 floor gives the honest accounting.
+- **2026-05-14 — AWQ on 9B regressed since `1805d820` (catastrophic, KV-mode-agnostic).** Re-running `--format mq4 --imatrix --awq` at current HEAD (`91b775a7`) produces KLD **13.40 at q8-KV n=20** and **13.35 at asym3-KV n=20** — vs the master-doc §1.1 mq4-awq anchor of 0.2800 (asym3-KV n=512) measured at `1805d820`-era. This is **18× worse than baseline** and "model worse than random" (vocab 248K → uniform NLL=12.42 nats; observed NLL=15.2–16.3 means the model assigns *low* probability to the correct token). NLL is finite, no NaN, forward pass runs at normal speed — the failure is "logits in wrong basis" not "broken pipeline." **0.8B AWQ at q8-KV works (KLD 0.2531, n=512 cohort), so the bug is 9B-specific.** Bisect chain so far:
+  - Step 1 (current HEAD, q8-KV n=20): KLD 13.40 ✗
+  - Step 2 (same model, asym3-KV n=20): KLD 13.35 ✗ (rules out KV-mode interaction)
+  - Known-good: `1805d820` 2026-05-12 21:15:40 produced 9B AWQ KLD 0.2800 at asym3-KV n=512 (master-doc §1.1)
+  - Suspect commits (chronological, post-`1805d820`): `dcf3b18a` GPTQ algorithm core (touches main.rs AWQ branch), `5a91c027` GPTQ pipeline helpers, `bd1ca3e1` wire `--gptq` flag (touches main.rs AWQ branch in line 4241+), `0cf5cc45` GPTQ pre-launch fixes, `7dcde2df` parallelize column-sequential loop, `a9dde0de` Cholesky-direct OBS, then env-gated probes + `9b2a68f5` (mine).
+  - **Top hypothesis:** GPTQ infrastructure wiring (dcf3b18a/bd1ca3e1) refactored the AWQ pre-scaling path in main.rs:4241+ in a way that broke AWQ-only quantize. The 0.8B AWQ working post-RoPE-fix + 9B AWQ failing on current HEAD is consistent with a quantizer regression that disproportionately impacts a 9B-specific code path or 9B-specific weight statistic. Imatrix entries for share-input weights confirmed byte-identical (verified 2026-05-14), so the wqkv-only-x_rot dispatch is mathematically correct and not the cause. **Implication:** Stage A AWQ landing claim (master-doc §1.1 mq4-awq 0.2800) was real at the time of measurement but the recipe no longer reproduces. Re-running the bench at the bisected good commit confirms the master-doc anchor stays valid as a historical data point; fix needs to land before the master-doc number can be re-claimed for current HEAD.
+  - Working artifacts: `2026-05-13-q8-lmhead-conv-smoke/per-variant/qwen35-9b-mq4-awq-bisect__gfx1100__kv-q8__c20.kldseq` (step 1) and `qwen35-9b-mq4-awq-bisect__gfx1100__kv-asym3__c20.kldseq` (step 2).
+  - Git bisect not yet kicked off (each step is ~12 min build+quantize+smoke, expects 4 iterations to narrow). Recommended first test: `dcf3b18a` directly.
 
 ---
 
