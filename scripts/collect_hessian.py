@@ -284,6 +284,128 @@ def load_calibration_text(corpus: str, n_sequences: int, ctx_len: int,
     return seqs
 
 
+def _gen_fwht_signs(seed: int, n: int = 256) -> np.ndarray:
+    """Replicate hipfire's `gen_fwht_signs` (main.rs:537-543) — a tiny LCG
+    that produces ±1 signs from a u32 seed. Must match bit-for-bit so the
+    Python noise-injection round-trip is identical to runtime's FWHT."""
+    state = np.uint32(seed)
+    out = np.empty(n, dtype=np.float32)
+    mul = np.uint32(1103515245)
+    inc = np.uint32(12345)
+    mask = np.uint32(0x7fffffff)
+    for i in range(n):
+        state = (state * mul + inc) & mask
+        out[i] = 1.0 if ((state >> 16) & 1) == 1 else -1.0
+    return out
+
+
+def _fwht_butterflies_inplace(x: np.ndarray) -> None:
+    """Walsh-Hadamard transform butterflies on a length-256 array (no
+    scaling, no sign-flipping). Matches the inner loop of
+    `cpu_fwht_256` in main.rs:518-531."""
+    assert x.shape == (256,)
+    stride = 1
+    while stride < 256:
+        i = 0
+        while i < 256:
+            for j in range(stride):
+                a = x[i + j]
+                b = x[i + j + stride]
+                x[i + j] = a + b
+                x[i + j + stride] = a - b
+            i += stride * 2
+        stride <<= 1
+
+
+def _fwht_256_inplace(x: np.ndarray, signs1: np.ndarray, signs2: np.ndarray) -> None:
+    """Forward FWHT-256 with hipfire's sign/scale convention.
+    F(x) = D_s2 · (H · (D_s1 · x)) / 16.
+    Matches `cpu_fwht_256` in main.rs:515-534 bit-for-bit."""
+    assert x.shape == (256,)
+    x *= signs1
+    _fwht_butterflies_inplace(x)
+    x *= 0.0625 * signs2  # 1/16 = 1/sqrt(256)
+
+
+def _fwht_256_inplace_inverse(x: np.ndarray, signs1: np.ndarray, signs2: np.ndarray) -> None:
+    """Inverse of `_fwht_256_inplace`.
+    F^-1(y) = D_s1 · (H · (D_s2 · y)) / 16.
+    Matches `load_any_as_f32`'s inverse-FWHT path in qwen35.rs (the
+    runtime's MQ-load-time inverse rotation that recovers BF16-like
+    values from MQ4-stored bytes)."""
+    assert x.shape == (256,)
+    x *= signs2
+    _fwht_butterflies_inplace(x)
+    x *= 0.0625 * signs1
+
+
+def _quantize_mq4_block_roundtrip(block: np.ndarray, signs1: np.ndarray, signs2: np.ndarray) -> np.ndarray:
+    """Apply hipfire's MQ4G256 quant-then-dequant round-trip to a single
+    256-element block. Mirrors `quantize_mq4g256` (main.rs:549-587) for
+    one block: FWHT → per-block min/max → quant to 0..15 grid → dequant.
+    Returns the noisy (FP32) values that the runtime would observe.
+    """
+    assert block.shape == (256,)
+    rotated = block.copy()
+    _fwht_256_inplace(rotated, signs1, signs2)
+    min_val = float(rotated.min())
+    max_val = float(rotated.max())
+    rng = max_val - min_val
+    if rng <= 0.0:
+        return block.copy()
+    scale = rng / 15.0
+    inv_scale = 1.0 / scale
+    # Quantize → 4-bit grid index
+    q_idx = np.clip(np.floor((rotated - min_val) * inv_scale + 0.5), 0.0, 15.0)
+    dequant_rot = q_idx * scale + min_val
+    # Inverse FWHT recovers the BF16-like values in original basis with
+    # the structured 4-bit-quant noise baked in. Mirrors runtime's
+    # load_any_as_f32 path for qt=13 (MQ4G256).
+    out = dequant_rot.copy()
+    _fwht_256_inplace_inverse(out, signs1, signs2)
+    return out
+
+
+def _inject_conv1d_mq4_noise_in_place(model) -> None:
+    """For every `linear_attn.conv1d` weight in `model`, replace it with
+    the FWHT → MQ4 round-trip in-place. The resulting forward pass
+    produces activations matching what hipfire's runtime sees when conv1d
+    is stored as MQ4G256 (i.e., the default for `--format mq4` without
+    `HIPFIRE_QUANTIZE_CONV_Q8=1`).
+
+    Used by the calibration-mismatch experiment: collect Hessians with
+    MQ4-noisy conv1d activations so GPTQ's OBS corrections account for
+    the noise it'll face at inference. Hypothesis (2026-05-14): if
+    confirmed, fixes the GPTQ-regression-without-Q8-conv1d issue.
+    """
+    signs1 = _gen_fwht_signs(42, 256)
+    signs2 = _gen_fwht_signs(1042, 256)
+    count = 0
+    for mod_name, module in model.named_modules():
+        if not mod_name.endswith("linear_attn.conv1d"):
+            continue
+        w = module.weight.detach().to(torch.float32).cpu().numpy()
+        # Conv1d weight: [out_ch, in_ch=1, kernel=4] in PyTorch. Hipfire
+        # treats it as a flat array; we mirror that.
+        flat = w.reshape(-1).astype(np.float32, copy=True)
+        n = flat.shape[0]
+        assert n % 256 == 0, f"{mod_name}: numel {n} not divisible by 256"
+        for b in range(n // 256):
+            block = flat[b * 256:(b + 1) * 256]
+            flat[b * 256:(b + 1) * 256] = _quantize_mq4_block_roundtrip(block, signs1, signs2)
+        # Restore shape + dtype + device
+        noisy = torch.from_numpy(flat.reshape(w.shape)).to(
+            module.weight.dtype).to(module.weight.device)
+        with torch.no_grad():
+            module.weight.copy_(noisy)
+        max_err = float(np.abs(flat.reshape(w.shape) - w).max())
+        mean_abs = float(np.abs(flat.reshape(w.shape) - w).mean())
+        print(f"  {mod_name}: shape={tuple(w.shape)} max_err={max_err:.4e} "
+              f"mean_abs_err={mean_abs:.4e}")
+        count += 1
+    print(f"      injected MQ4 noise into {count} conv1d weights")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Collect per-tensor Hessians for Stage B GPTQ.")
     ap.add_argument("--model", required=True,
@@ -302,6 +424,21 @@ def main():
     ap.add_argument("--dtype", default="bfloat16",
                     choices=["bfloat16", "float16", "float32"],
                     help="Model dtype (default bfloat16).")
+    ap.add_argument("--inject-conv1d-mq4-noise", action="store_true",
+                    help="Round-trip every linear_attn.conv1d weight through "
+                         "FWHT-256 + MQ4-quantize-then-dequantize BEFORE the "
+                         "forward pass. Tests the calibration/inference "
+                         "distribution-mismatch hypothesis for GPTQ on "
+                         "Qwen3.5 DeltaNet (2026-05-14): default Hessian "
+                         "collection uses BF16 conv1d, but inference with "
+                         "--format mq4 (no --HIPFIRE_QUANTIZE_CONV_Q8) "
+                         "gets MQ4 conv1d → activation distribution shifts → "
+                         "GPTQ's OBS corrections amplify rather than dampen "
+                         "the noise. Injecting matching noise into the "
+                         "Hessian-collection forward pass should let GPTQ "
+                         "compensate correctly. See docs/plans/gptq_bug.md "
+                         "and master doc §5 calibration-mismatch entry "
+                         "(filed 2026-05-14).")
     args = ap.parse_args()
 
     print(f"=== Hessian collector — Stage B Phase 1.1 ===")
@@ -338,6 +475,11 @@ def main():
         print(f"      VRAM in use: "
               f"{torch.cuda.memory_allocated() / 1e9:.2f}/"
               f"{torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+
+    if args.inject_conv1d_mq4_noise:
+        print(f"\n[1.5/4] Injecting MQ4 noise into linear_attn.conv1d weights "
+              f"(seeds 42/1042, group=256)...")
+        _inject_conv1d_mq4_noise_in_place(model)
 
     print(f"\n[2/4] Registering Hessian hooks on GPTQ-target Linear modules...")
     # HF's AutoModelForCausalLM flattens multimodal submodules (e.g. Qwen3.5's
