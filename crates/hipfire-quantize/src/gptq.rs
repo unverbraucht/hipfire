@@ -101,8 +101,8 @@ pub fn quantize_mq4_element_with_clamp(w: f64, scale: f64, min_val: f64) -> (f64
 /// Cholesky fail without it.
 ///
 /// Provided for testability; production GPTQ uses
-/// `compute_damped_inv_cholesky_upper` (Cholesky-direct: returns U with
-/// U·U^T = H^-1 in one decomposition).
+/// `compute_damped_inv_cholesky_upper` (returns upper-tri U with
+/// U^T·U = H^-1 — the Frantar-Algorithm-1 invariant).
 pub fn cholesky_with_adaptive_damping(
     h: &Mat<f64>,
     initial_damp: f64,
@@ -154,28 +154,42 @@ fn clamped_initial_damp(initial_damp: f64, diag_mean: f64) -> f64 {
     initial_damp.max(f64::EPSILON * diag_mean.max(1.0))
 }
 
-/// Adaptive-damping search + upper Cholesky factor of the inverse
-/// permuted Hessian — the Cholesky-direct GPTQ formulation per Frantar
-/// et al. 2210.17323 Algorithm 1.
+/// Adaptive-damping search + the upper Cholesky factor of `H_inv` such
+/// that `U^T · U = H_inv` — the form Frantar et al. 2210.17323 Algorithm
+/// 1 uses for the OBS error-propagation cascade.
 ///
-/// Returns `(U, effective_damp)` where `U` is K×K with the upper
-/// triangle populated such that `U · U^T = (P^T (H + λI) P)^-1`, with
-/// `P` the permutation given by `perm` (or identity if `perm` is None).
-/// `effective_damp` is the damping value that worked.
+/// Returns `(U, effective_damp)` where `U` is K×K upper-triangular with
+/// `U^T · U = (P^T (H + λI) P)^-1`, P the permutation in `perm` (identity
+/// if None). `effective_damp` is the damping value that worked.
 ///
-/// Replaces the earlier `compute_damped_inverse` (which materialized
-/// the dense K×K inverse via `decomp.solve(&identity)` — a single-
-/// threaded O(K³) back-substitution that dominated wall time at
-/// K=12288). The L-direct form does **one** Cholesky plus a
-/// rayon-parallel per-column triangular inverse (O(K³/3) split across
-/// rayon workers). Net speedup at K=12288 is ~5–10× wall, and the
-/// peak memory drops by ~1.2 GB (no K×K identity buffer + no dense
-/// H_inv intermediate).
+/// **Why `U^T · U = H_inv` and not `U · U^T = H_inv`** (a bug fixed
+/// 2026-05-14). The seminal GPTQ algorithm propagates each step's
+/// quantization error using `U[step, next_step] / U[step, step]` of
+/// THIS upper Cholesky factor. The reason is the *Schur-complement
+/// submatrix property* — `(U[i:K, i:K])^T · (U[i:K, i:K]) =
+/// Schur_complement(H_inv, [0:i, 0:i])` — which makes the trailing
+/// rows of U the right factor of the residual Hessian for unprocessed
+/// columns. The transpose-flipped variant `U · U^T = H_inv` (which an
+/// earlier hipfire iteration returned via `L_H^{-T}`) IS a valid
+/// factorization of `H_inv`, but its trailing submatrix does NOT
+/// satisfy the Schur property — so the row-j ratios systematically
+/// differ from `H_inv[j, k] / H_inv[j, j]` by factors of 1.5–3.5×
+/// (verified numerically against direct dense H_inv). Using
+/// `L_H^{-T}` in the OBS loop produced GPTQ quality REGRESSIONS at
+/// every model size we tested (0.8B mq4-awq-gptq+Q8conv1d 0.198 vs
+/// AWQ-alone 0.137). Bug isolated by external review on 2026-05-14;
+/// fix lands here.
 ///
-/// Cholesky-direct OBS algebra is algebraically equivalent to the
-/// dense-inverse formulation (Frantar et al. §3.1) — quality-neutral
-/// substitution. Every other GPTQ implementation (vLLM, AutoGPTQ,
-/// gptqmodel) uses this form for the same reason.
+/// Computation:
+///   1. `L = chol(H + λI, lower)` so `L · L^T = H + λI`
+///   2. `L_inv = L^-1` (lower-tri, by forward sub)
+///   3. `H_inv = L_inv^T · L_inv` (materialize K×K, symmetric)
+///   4. `L_HI = chol(H_inv, lower)` so `L_HI · L_HI^T = H_inv`
+///   5. Return `U = L_HI^T` (upper-tri, `U^T · U = L_HI · L_HI^T = H_inv` ✓)
+///
+/// Cost vs prior `L_H^{-T}` form: +K²/2 storage (H_inv), +K³/3 flops
+/// (matmul + second Cholesky). At K=12288 that's ~1.2 GB + ~2 minutes
+/// extra per-tensor wall — acceptable for correctness.
 pub fn compute_damped_inv_cholesky_upper(
     h: &Mat<f64>,
     perm: Option<&[usize]>,
@@ -243,14 +257,65 @@ pub fn compute_damped_inv_cholesky_upper(
                     col
                 }).collect();
 
-                // U = L_inv^T (upper-triangular).
-                // L_inv lower-tri:   L_inv[i, j] non-zero only for i >= j.
-                // → U[r, c] = L_inv[c, r] non-zero only for c >= r ✓.
-                // l_inv_cols[r] holds L_inv[:, r], so L_inv[c, r] = l_inv_cols[r][c].
+                // Step 3: materialize H_inv = L_inv^T · L_inv (symmetric, K×K).
+                //
+                // `l_inv_cols[j]` holds column j of L_inv (lower-tri), i.e.
+                // L_inv[i, j] = l_inv_cols[j][i] for i >= j, 0 otherwise.
+                // (L_inv^T · L_inv)[i, j] = Σ_m L_inv[m, i] · L_inv[m, j].
+                // L_inv lower-tri ⇒ L_inv[m, i] != 0 only when m >= i, and
+                // L_inv[m, j] != 0 only when m >= j; intersection m >= max(i,j).
+                // Result is symmetric. Per-row parallel via rayon.
+                let l_inv_cols_ref = &l_inv_cols;
+                let h_inv_upper_rows: Vec<Vec<f64>> = (0..k).into_par_iter().map(|i| {
+                    let mut row = vec![0.0_f64; k];
+                    for j in i..k {  // upper triangle (incl. diagonal)
+                        let mut s = 0.0_f64;
+                        // m ranges over max(i,j)=j .. k (since j >= i in this loop)
+                        for m in j..k {
+                            s += l_inv_cols_ref[i][m] * l_inv_cols_ref[j][m];
+                        }
+                        row[j] = s;
+                    }
+                    row
+                }).collect();
+
+                let mut h_inv = Mat::<f64>::zeros(k, k);
+                for i in 0..k {
+                    for j in i..k {
+                        let v = h_inv_upper_rows[i][j];
+                        h_inv[(i, j)] = v;
+                        if i != j { h_inv[(j, i)] = v; }
+                    }
+                }
+
+                // Step 4: second Cholesky on H_inv → L_HI (lower-tri),
+                // L_HI · L_HI^T = H_inv. Should never fail by construction
+                // (H_inv is SPD), but propagate any failure as the adaptive
+                // damping cascade would for the outer Cholesky.
+                //
+                // Step 5: U = L_HI^T (upper-tri). U^T · U = L_HI · L_HI^T
+                // = H_inv, the correct Frantar-Algorithm-1 form.
+                //
+                // The decomp owns the underlying buffer; bind it for the
+                // entire scope of the materialization below so .L() stays
+                // valid while we read entries into our owned `u`.
+                let h_inv_decomp = match h_inv.llt(Side::Lower) {
+                    Ok(d) => d,
+                    Err(_) => {
+                        // Should not happen. If it does, signal failure
+                        // with the same SingularEvenWithMaxDamp variant the
+                        // outer Cholesky uses — caller falls back to plain
+                        // MQ4 RTN for this tensor (see main.rs:4336-4339).
+                        return Err(CholeskyError::SingularEvenWithMaxDamp {
+                            max_damp: damp, k, diag_mean,
+                        });
+                    }
+                };
+                let l_hi_view = h_inv_decomp.L();
                 let mut u = Mat::<f64>::zeros(k, k);
-                for r in 0..k {
-                    for c in r..k {
-                        u[(r, c)] = l_inv_cols[r][c];
+                for j in 0..k {
+                    for i in 0..=j {
+                        u[(i, j)] = l_hi_view[(j, i)];  // transpose: U[i,j] = L_HI[j,i]
                     }
                 }
 
@@ -723,11 +788,16 @@ pub fn gptq_column_sequential(
     let h_diag: Vec<f64> = (0..k_dim).map(|i| h_target[(i, i)]).collect();
     let perm = weight_mode_actorder(&h_diag);
 
-    // Cholesky-direct: U is upper-triangular K×K with U·U^T = (P^T(H+λI)P)^-1.
-    // OBS inner loop uses U[step, step] as divisor and U[step, next_step]
-    // as propagation weight — algebraically equivalent to the dense-inverse
-    // form but avoids the O(K³) serial solve(I) that dominated wall time
-    // at K=12288. See `compute_damped_inv_cholesky_upper` for the math.
+    // U is upper-tri K×K with U^T·U = (P^T(H+λI)P)^-1 — the
+    // Frantar-Algorithm-1 form (fixed 2026-05-14; prior implementation
+    // returned L_H^{-T} which satisfies U·U^T = H_inv instead, a
+    // different upper-tri factor that breaks the Schur-complement
+    // submatrix property OBS relies on). OBS inner loop below uses
+    // U[step, step] as the divisor and U[step, next_step] as the
+    // propagation weight; with this U, the ratio
+    // `U[j, k] / U[j, j] = H_inv[j, k] / H_inv[j, j]` for the residual
+    // Schur-complement Hessian — exactly the textbook GPTQ correction.
+    // See `compute_damped_inv_cholesky_upper` doc for the full math.
     let (u, effective_damp) = compute_damped_inv_cholesky_upper(
         h_target, Some(&perm), initial_damp, max_damp_multiplier,
     )?;
@@ -1227,8 +1297,9 @@ mod tests {
         assert!(damp2 > 0.0);
     }
 
-    /// `compute_damped_inv_cholesky_upper` satisfies `U · U^T = (H+λI)^-1`.
-    /// Cross-check on a tiny SPD matrix.
+    /// `compute_damped_inv_cholesky_upper` satisfies `U^T · U = (H+λI)^-1`,
+    /// the Frantar-Algorithm-1 form. (Was previously `U · U^T = H_inv`
+    /// before the 2026-05-14 fix — wrong invariant for GPTQ propagation.)
     #[test]
     fn compute_damped_inv_cholesky_upper_satisfies_identity() {
         let h = Mat::<f64>::from_fn(3, 3, |i, j| match (i, j) {
@@ -1246,32 +1317,117 @@ mod tests {
             }
         }
 
-        // Compute (U · U^T) and (H + damp·I)^-1 via brute force; compare.
-        let mut uut = [[0.0_f64; 3]; 3];
+        // Compute (U^T · U) and (H + damp·I)^-1; compare.
+        let mut utu = [[0.0_f64; 3]; 3];
         for i in 0..3 {
             for j in 0..3 {
                 let mut s = 0.0;
                 for k in 0..3 {
-                    s += u[(i, k)] * u[(j, k)];  // U·U^T  (note transpose on RHS)
+                    s += u[(k, i)] * u[(k, j)];  // U^T · U
                 }
-                uut[i][j] = s;
+                utu[i][j] = s;
             }
         }
 
-        // (H + damp·I) · uut should be I.
+        // (H + damp·I) · utu should be I.
         let mut a = h.clone();
         for i in 0..3 { a[(i, i)] += damp; }
         for i in 0..3 {
             for j in 0..3 {
                 let mut s = 0.0;
                 for k in 0..3 {
-                    s += a[(i, k)] * uut[k][j];
+                    s += a[(i, k)] * utu[k][j];
                 }
                 let expected = if i == j { 1.0 } else { 0.0 };
                 assert!(
                     (s - expected).abs() < 1e-10,
-                    "(H+damp·I)·(U·U^T) [{i},{j}] = {s}, expected {expected}"
+                    "(H+damp·I)·(U^T·U) [{i},{j}] = {s}, expected {expected}"
                 );
+            }
+        }
+    }
+
+    /// Regression test for the 2026-05-14 OBS-propagation bug. Two
+    /// checks:
+    ///   1. **Step 0**: `U[0, k] / U[0, 0]` must equal
+    ///      `H_inv[0, k] / H_inv[0, 0]` (the direct first-row ratio).
+    ///   2. **All steps via Schur complements**: at step j, the OBS
+    ///      ratio `U[j, k] / U[j, j]` must equal the Schur-complement
+    ///      ratio `S_j[0, k-j] / S_j[0, 0]` where S_j is the Schur
+    ///      complement of H_inv after eliminating rows/cols 0..j-1.
+    ///      This is the *full* Frantar-Algorithm-1 property — what
+    ///      makes GPTQ-via-Cholesky correct.
+    ///
+    /// Prior to the fix, hipfire's `compute_damped_inv_cholesky_upper`
+    /// returned `L_H^{-T}` whose row ratios diverged from the
+    /// Schur-complement ratios by factors of 1.5–3.5× — silently breaking
+    /// GPTQ's OBS cascade and producing quality regressions at every
+    /// tested model size.
+    #[test]
+    fn obs_propagation_ratios_match_direct_h_inv() {
+        // 4×4 SPD H for a stricter cross-check.
+        let h = Mat::<f64>::from_fn(4, 4, |i, j| {
+            ((i + 1) as f64) * ((j + 1) as f64) * 0.1
+                + if i == j { 2.0 } else { 0.0 }
+                + 0.05 * ((i as f64) - (j as f64)).sin()
+        });
+        // Symmetrize to be exactly SPD-compatible.
+        let mut hs = h.clone();
+        for i in 0..4 {
+            for j in (i + 1)..4 {
+                let avg = 0.5 * (hs[(i, j)] + hs[(j, i)]);
+                hs[(i, j)] = avg; hs[(j, i)] = avg;
+            }
+        }
+        let damp = 1e-8;
+        let (u, _eff_damp) = compute_damped_inv_cholesky_upper(&hs, None, damp, 1.0).unwrap();
+
+        // Reference H_inv via (H + damp·I)^-1 from an independent path.
+        let mut a = hs.clone();
+        for i in 0..4 { a[(i, i)] += damp; }
+        let l = a.llt(Side::Lower).unwrap();
+        let identity = Mat::<f64>::identity(4, 4);
+        let h_inv = l.solve(&identity);
+
+        // Check 1 — step 0 row ratios (direct first-row of H_inv).
+        for next in 1..4 {
+            let u_ratio = u[(0, next)] / u[(0, 0)];
+            let direct_ratio = h_inv[(0, next)] / h_inv[(0, 0)];
+            assert!(
+                (u_ratio - direct_ratio).abs() < 1e-9,
+                "step 0 → col {next}: U={u_ratio:.9}, H_inv={direct_ratio:.9}",
+            );
+        }
+
+        // Check 2 — full Schur-complement property at all steps.
+        // S_j is the (4-j) × (4-j) Schur complement of H_inv after
+        // eliminating leading principal submatrix [0:j, 0:j].
+        // Build S_j by sequential Gaussian elimination on H_inv.
+        let mut s = vec![vec![0.0_f64; 4]; 4];
+        for i in 0..4 {
+            for j in 0..4 {
+                s[i][j] = h_inv[(i, j)];
+            }
+        }
+        for j_step in 0..4 {
+            // Verify ratios from current Schur block against U.
+            for k in (j_step + 1)..4 {
+                let u_ratio = u[(j_step, k)] / u[(j_step, j_step)];
+                let schur_ratio = s[j_step][k] / s[j_step][j_step];
+                assert!(
+                    (u_ratio - schur_ratio).abs() < 1e-9,
+                    "step {j_step} → col {k}: \
+                     U[{j_step},{k}]/U[{j_step},{j_step}] = {u_ratio:.9}, \
+                     Schur ratio = {schur_ratio:.9}",
+                );
+            }
+            // Eliminate row/col j_step → next Schur complement.
+            let pivot = s[j_step][j_step];
+            for r in (j_step + 1)..4 {
+                let factor = s[r][j_step] / pivot;
+                for c in (j_step + 1)..4 {
+                    s[r][c] -= factor * s[j_step][c];
+                }
             }
         }
     }
@@ -1297,21 +1453,21 @@ mod tests {
         }
         for i in 0..3 { h_perm[(i, i)] += damp; }
 
-        // (P^T H P + damp·I) · (U · U^T) should be I.
+        // (P^T H P + damp·I) · (U^T · U) should be I.
         for i in 0..3 {
             for j in 0..3 {
                 let mut s = 0.0;
                 for k in 0..3 {
-                    let mut uut_kj = 0.0;
+                    let mut utu_kj = 0.0;
                     for m in 0..3 {
-                        uut_kj += u[(k, m)] * u[(j, m)];
+                        utu_kj += u[(m, k)] * u[(m, j)];  // U^T · U
                     }
-                    s += h_perm[(i, k)] * uut_kj;
+                    s += h_perm[(i, k)] * utu_kj;
                 }
                 let expected = if i == j { 1.0 } else { 0.0 };
                 assert!(
                     (s - expected).abs() < 1e-10,
-                    "(H_perm) · (U·U^T) [{i},{j}] = {s}, expected {expected}"
+                    "(H_perm) · (U^T·U) [{i},{j}] = {s}, expected {expected}"
                 );
             }
         }
