@@ -62,6 +62,32 @@ pub fn quantize_mq4_element(w: f64, scale: f64, min_val: f64) -> f64 {
     q * scale + min_val
 }
 
+/// Variant of `quantize_mq4_element` that also reports the clamp state of
+/// the pre-clamp grid index. Returns `(q_value, clamp_state)` where
+/// `clamp_state` is:
+///   - `-1` if `floor((w - min_val) / scale + 0.5) < 0` (clamped to 0),
+///   - `+1` if it `> 15` (clamped to 15),
+///   - `0` if the value was in range.
+///
+/// Used by the GPTQ inner loop's clamp diagnostic — the frozen per-256-
+/// block grid is fit to the ORIGINAL weights, but OBS error compensation
+/// can push the residual outside that range. When clamping fires, the
+/// per-column quantization error contract (`|err| ≤ ½·scale`) is
+/// violated, and the cascading OBS propagation in
+/// `gptq_column_sequential` operates on an inflated error → quality
+/// regression. Counting clamps per-tensor surfaces this case.
+#[inline]
+pub fn quantize_mq4_element_with_clamp(w: f64, scale: f64, min_val: f64) -> (f64, i8) {
+    if scale == 0.0 {
+        return (min_val, 0);
+    }
+    let inv_scale = 1.0 / scale;
+    let q_raw = ((w - min_val) * inv_scale + 0.5).floor();
+    let clamp_state: i8 = if q_raw < 0.0 { -1 } else if q_raw > 15.0 { 1 } else { 0 };
+    let q = q_raw.clamp(0.0, 15.0);
+    (q * scale + min_val, clamp_state)
+}
+
 /// FP64 Cholesky of `H + damp * I` with adaptive damping fallback.
 ///
 /// Returns `(L, effective_damp)` where `L` is the lower-triangular
@@ -534,6 +560,7 @@ pub fn gptq_pipeline_mq4g256(
     signs2_f32: &[f32],
     initial_damp: f64,
     max_damp_multiplier: f64,
+    tensor_name: &str,
 ) -> Result<Vec<u8>, CholeskyError> {
     assert_eq!(weights_f32.len(), m * k);
     assert_eq!(h_unrot_f32.len(), k * k);
@@ -573,6 +600,7 @@ pub fn gptq_pipeline_mq4g256(
         &frozen_grids,
         initial_damp,
         max_damp_multiplier,
+        tensor_name,
     )?;
 
     Ok(pack_mq4g256_from_rotated_f64(&weights, &frozen_grids))
@@ -681,6 +709,7 @@ pub fn gptq_column_sequential(
     frozen_grids: &[BlockGrid],
     initial_damp: f64,
     max_damp_multiplier: f64,
+    tensor_name: &str,
 ) -> Result<f64, CholeskyError> {
     assert_eq!(weights_flat.len(), m * k_dim, "weight shape mismatch");
     assert_eq!(h_target.nrows(), k_dim);
@@ -709,6 +738,17 @@ pub fn gptq_column_sequential(
     // future columns absorb the error compensation.
     let mut weights_residual: Vec<f64> = weights_flat.to_vec();
 
+    // Clamp diagnostic — atomic counters incremented inside the rayon
+    // closures. See `quantize_mq4_element_with_clamp` for rationale: the
+    // frozen per-256-block grid is fit to ORIGINAL weights, but OBS error
+    // propagation can push residuals outside the grid range. When the
+    // pre-clamp grid index is < 0 or > 15, the clamp inflates per-column
+    // error beyond GPTQ's ±½·scale assumption and the cascade amplifies.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let total_count = AtomicUsize::new(0);
+    let clamps_above = AtomicUsize::new(0);
+    let clamps_below = AtomicUsize::new(0);
+
     // Output: snapped values per (row, original_col). The outer column-
     // sequential pass is intrinsically serial (column step+1 depends on
     // column step's residual update), but both inner row-loops are
@@ -734,7 +774,13 @@ pub fn gptq_column_sequential(
                 let block_idx = block_idx_for(row, j_orig, k_dim);
                 let grid = frozen_grids[block_idx];
                 let w = res_row[j_orig];
-                let q = quantize_mq4_element(w, grid.scale, grid.min_val);
+                let (q, clamp_state) = quantize_mq4_element_with_clamp(w, grid.scale, grid.min_val);
+                total_count.fetch_add(1, Ordering::Relaxed);
+                if clamp_state < 0 {
+                    clamps_below.fetch_add(1, Ordering::Relaxed);
+                } else if clamp_state > 0 {
+                    clamps_above.fetch_add(1, Ordering::Relaxed);
+                }
                 out_row[j_orig] = q;
                 (w - q) / u_ss
             })
@@ -764,6 +810,19 @@ pub fn gptq_column_sequential(
                 }
             });
     }
+
+    // Diagnostic: per-tensor clamp stats. Print to stderr so the pipeline
+    // log + bench script's tail-grep can correlate clamp rates with
+    // downstream quality regressions.
+    let total = total_count.load(Ordering::Relaxed);
+    let cab = clamps_above.load(Ordering::Relaxed);
+    let cbe = clamps_below.load(Ordering::Relaxed);
+    let pct = 100.0 * (cab + cbe) as f64 / total.max(1) as f64;
+    eprintln!(
+        "[gptq-clamp] {tensor_name} M={m} K={k_dim} elements={total} \
+         clamps={}/{} ({:.3}%)  above={cab}  below={cbe}",
+        cab + cbe, total, pct,
+    );
 
     Ok(effective_damp)
 }
@@ -950,7 +1009,7 @@ mod tests {
         let h = Mat::<f64>::identity(k, k);
 
         let mut weights = weights_orig.clone();
-        let damp = gptq_column_sequential(&mut weights, &h, m, k, &frozen, 0.0, 1.0).unwrap();
+        let damp = gptq_column_sequential(&mut weights, &h, m, k, &frozen, 0.0, 1.0, "test:identity_H").unwrap();
         // Identity H trivially Cholesky'd — effective damp lands on the
         // ε·diag_mean=ε floor from clamped_initial_damp, not literally 0.
         assert!(damp < 1e-14, "identity H damp should be at the ε floor, got {damp}");
@@ -1061,7 +1120,8 @@ mod tests {
         let signs2: Vec<f32> = (0..256).map(|i| if (i / 4) % 2 == 0 { 1.0 } else { -1.0 }).collect();
 
         let gptq_packed = gptq_pipeline_mq4g256(
-            &weights_f32, m, k, &h_unrot, &awq_scales, &signs1, &signs2, 1e-6, 1.0
+            &weights_f32, m, k, &h_unrot, &awq_scales, &signs1, &signs2, 1e-6, 1.0,
+            "test:pipeline_identity",
         )
         .expect("identity-H pipeline should not need damping");
 
@@ -1124,7 +1184,7 @@ mod tests {
 
         // GPTQ.
         let mut gptq = weights_orig.clone();
-        gptq_column_sequential(&mut gptq, &h, m, k, &frozen, 1e-6, 1.0).unwrap();
+        gptq_column_sequential(&mut gptq, &h, m, k, &frozen, 1e-6, 1.0, "test:improves_aw").unwrap();
 
         // Activation-weighted error: sum over (i,j,k) of (w[i,j]-w_q[i,j]) * H[j,k] * (w[i,k]-w_q[i,k]).
         // Approximate via per-channel diagonal (the dominant term):
