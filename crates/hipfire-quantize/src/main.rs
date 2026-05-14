@@ -2277,12 +2277,32 @@ struct TensorSpill {
 }
 
 impl TensorSpill {
+    /// Create a fresh spill file with a per-process unique name to prevent
+    /// concurrent `hipfire-quantize` runs that target the same output
+    /// directory from clobbering each other's scratch state. See
+    /// `docs/plans/gptq_bug.md` for the 14-hour GPTQ work lost on
+    /// 2026-05-14 when two runs sharing `<dir>/.hipfire_quant_spill.tmp`
+    /// produced an `Err(NotFound)` at the read-back step in `write_hfq`.
+    ///
+    /// PID alone is sufficient to disambiguate concurrent processes on
+    /// Linux; the nanosecond suffix protects against the rare PID-reuse
+    /// case (two `hipfire-quantize` runs with the same PID within the
+    /// same epoch tick targeting the same directory). `create_new` makes
+    /// the file open fail loudly instead of silently truncating someone
+    /// else's data if the names ever collide despite both guards.
     fn new(dir: &Path) -> std::io::Result<Self> {
-        let path = dir.join(".hipfire_quant_spill.tmp");
-        let file = std::io::BufWriter::with_capacity(
-            4 * 1024 * 1024,
-            File::create(&path)?,
-        );
+        use std::fs::OpenOptions;
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let path = dir.join(format!(".hipfire_quant_spill.{pid}.{nanos}.tmp"));
+        let raw = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        let file = std::io::BufWriter::with_capacity(4 * 1024 * 1024, raw);
         Ok(Self { file, path, offset: 0 })
     }
 
@@ -4704,7 +4724,15 @@ fn main() {
     if let Some(ref mut s) = spill {
         maybe_spill(&mut hfq_tensors, s, 0); // spill everything remaining
     }
-    write_hfq(output_path, arch_id, &metadata_json, &hfq_tensors, spill.as_mut()).unwrap();
+    // Fail cleanly (non-zero exit + clear stderr) rather than panicking with
+    // a Rust backtrace — write-step failures otherwise lose hours of GPTQ
+    // Hessian work to an opaque `thread 'main' panicked` message. See
+    // docs/plans/gptq_bug.md (2026-05-14 incident: 14 h of work lost).
+    if let Err(e) = write_hfq(output_path, arch_id, &metadata_json, &hfq_tensors, spill.as_mut()) {
+        eprintln!("error: write_hfq failed for {}: {e}", output_path.display());
+        if let Some(s) = spill { s.cleanup(); }
+        std::process::exit(1);
+    }
     if let Some(s) = spill { s.cleanup(); }
 
     let file_size = std::fs::metadata(output_path).unwrap().len();
@@ -4714,6 +4742,38 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression test for the 2026-05-14 GPTQ panic
+    /// (`docs/plans/gptq_bug.md`). Two `TensorSpill::new` calls into the
+    /// same directory must produce distinct paths so concurrent
+    /// `hipfire-quantize` runs don't clobber each other's scratch state.
+    /// The previous code path-shared `<dir>/.hipfire_quant_spill.tmp`,
+    /// which led to a 14-hour GPTQ run panicking at write_hfq read-back
+    /// when a second concurrent run had unlinked the path on its Drop.
+    #[test]
+    fn tensor_spill_paths_are_per_process_unique() {
+        let dir = tempfile::tempdir().unwrap();
+        let s1 = TensorSpill::new(dir.path()).expect("first TensorSpill");
+        let s2 = TensorSpill::new(dir.path()).expect("second TensorSpill");
+        assert_ne!(
+            s1.path, s2.path,
+            "spill paths must be unique across overlapping spills \
+             (see docs/plans/gptq_bug.md)"
+        );
+        assert!(s1.path.exists(), "spill 1 file must exist on disk");
+        assert!(s2.path.exists(), "spill 2 file must exist on disk");
+
+        // create_new(true) makes a second open of the same path fail
+        // loudly — guards against PID-reuse-plus-same-nanosecond edge case.
+        let collision = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&s1.path);
+        assert!(
+            collision.is_err(),
+            "second create_new on existing spill path must fail"
+        );
+    }
 
     #[test]
     fn parse_layer_idx_safetensors_dense() {
