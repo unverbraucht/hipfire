@@ -3930,6 +3930,7 @@ fn main() {
                                     &h_unrot_f32, &awq_scales_for_pipeline_f64,
                                     &signs1, &signs2,
                                     gptq_initial_damp, gptq_max_damp_multiplier,
+                                    h_key,
                                 ) {
                                     Ok(packed) => packed,
                                     Err(e) => {
