@@ -2486,6 +2486,14 @@ fn is_q8_tensor(name: &str) -> bool {
         || name.ends_with("mlp.shared_expert_gate.weight")
 }
 
+/// Qwen3.5 DeltaNet conv1d weight: `{prefix}.linear_attn.conv1d.weight`,
+/// shape [conv_channels, 1, 4]. Small (~32K elem) and runs every token —
+/// Q8 is the safe default; lossy 4-bit FWHT formats (mq4/mq3) measurably
+/// hurt the gated-delta path.
+fn is_conv1d_tensor(name: &str) -> bool {
+    name.ends_with("conv1d.weight")
+}
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 /// Resolve a model input to a local directory path.
@@ -3467,6 +3475,11 @@ fn main() {
     // as HFP4G32 with format_flags bit 0 + bits 2-3 = 01 stamping the rotation kind.
     let use_mfp4 = format == "mfp4" || format == "mfp4g32" || format == "mf4p";
     let q8_router_flag = args.iter().any(|a| a == "--q8-router");
+    // Conv1d (DeltaNet) defaults to Q8 regardless of --format — the tensor is
+    // small (~32K elem) but runs every token and lossy 4-bit FWHT formats
+    // measurably hurt the gated-delta path. Override with --no-q8-conv1d to
+    // keep conv1d at the same quant as the rest of the model.
+    let q8_conv1d_default = !args.iter().any(|a| a == "--no-q8-conv1d");
     let no_kmap = args.iter().any(|a| a == "--no-kmap" || a == "--uniform");
 
     // ── Phase A L4 levers (Step 1 + Step 2 of qwen35-mq4-quality-gap.md §5) ──
@@ -4133,7 +4146,11 @@ fn main() {
             // inference time.
             let mut awq_sidecar_scales: Option<Vec<f32>> = None;
 
-            let (quantized, qt, gs, label) = if kmap_level == QuantLevel::Q8 {
+            let (quantized, qt, gs, label) = if q8_conv1d_default && is_conv1d_tensor(name) {
+                // DeltaNet conv1d defaults to Q8 (see --no-q8-conv1d to disable).
+                let q = quantize_q8f16(&f32_data);
+                (q, QuantType::Q8F16, 32u32, "Q8_F16")
+            } else if kmap_level == QuantLevel::Q8 {
                 // K-map says Q8 (embed, lm_head, router)
                 let q = quantize_q8f16(&f32_data);
                 (q, QuantType::Q8F16, 32u32, "Q8_F16")

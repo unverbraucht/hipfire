@@ -658,6 +658,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-atlas"
+version = "0.1.20"
+dependencies = [
+ "regex",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hipfire-detect"
 version = "0.1.20"
 dependencies = [
@@ -689,6 +698,7 @@ dependencies = [
  "hipfire-arch-llama",
  "hipfire-arch-qwen35",
  "hipfire-arch-qwen35-vl",
+ "hipfire-atlas",
  "hipfire-detect",
  "libc",
  "memmap2",
