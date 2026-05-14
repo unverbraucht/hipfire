@@ -2848,6 +2848,50 @@ fn awq_scales_to_f16_bytes(scales: &[f32]) -> Vec<u8> {
         .collect()
 }
 
+/// Apply AWQ pre-scaling for a single MQ-family weight tensor and stash
+/// the per-channel scales for sidecar emission later in the quantize loop.
+///
+/// Returns `(working_weights, awq_scales_f64)`:
+///   - `working_weights`: a fresh `Vec<f32>` of length `m * k`, either
+///     AWQ-pre-scaled (when AWQ is enabled, imatrix data exists, and the
+///     tensor is on the AWQ whitelist) or a plain clone of `f32_data`.
+///   - `awq_scales_f64`: per-channel scales as `Vec<f64>` of length `k`,
+///     for callers that feed downstream pipelines (GPTQ). Identity
+///     (`1.0`) when AWQ did not fire.
+///
+/// Side effect: when AWQ fires, sets `*awq_sidecar_scales = Some(scales)`
+/// so the outer quantize loop emits the F16 sidecar tensor alongside the
+/// parent weight (see the matching `awq_sidecar_scales.take()` block).
+///
+/// Hoisted from the MQ4G256 inline block so the K-map Promote6 arm can
+/// reuse the exact same gating — without this, weights promoted to MQ6
+/// via `--kmap-dense --kmap-mode 2` silently skipped AWQ even when the
+/// dense-MQ4 siblings carried it.
+fn apply_awq_prescale(
+    name: &str,
+    f32_data: &[f32],
+    m_dim: usize,
+    k_dim: usize,
+    awq_sidecar_scales: &mut Option<Vec<f32>>,
+) -> (Vec<f32>, Vec<f64>) {
+    if let (Some(alpha), Some(im_weights))
+        = (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
+    {
+        if awq_eligible(name) {
+            debug_assert_eq!(im_weights.len(), k_dim,
+                "imatrix length ({}) != K dim ({}) for {}",
+                im_weights.len(), k_dim, name);
+            let scales = compute_awq_scales(im_weights, alpha);
+            *awq_sidecar_scales = Some(scales.clone());
+            let mut scaled = f32_data.to_vec();
+            awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
+            let scales_f64: Vec<f64> = scales.iter().map(|&v| v as f64).collect();
+            return (scaled, scales_f64);
+        }
+    }
+    (f32_data.to_vec(), vec![1.0_f64; k_dim])
+}
+
 /// AWQ pre-scaling is mathematically valid only for weights whose runtime
 /// path applies the inverse divide-by-scale. Those are the weights fed via
 /// `fused_rmsnorm_rotate_mq` / `fused_rmsnorm_rotate_mq_awq` (the AWQ-aware
@@ -4164,23 +4208,43 @@ fn main() {
             } else if kmap_level == QuantLevel::Promote6 {
                 // K-map says promote to 6-bit
                 let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
+                let m_dim = if meta.shape.len() == 2 { meta.shape[0] } else { 1 };
                 if (use_mq4g256 || use_mq4_mq6exp || use_mq3g256 || use_mq2g256
                     || use_mq2g256_lloyd || use_mq3g256_lloyd) && k_dim % 256 == 0
                 {
+                    // Mixed-format AWQ: when --awq is enabled and the tensor is
+                    // on the AWQ whitelist, pre-scale before MQ6 packing — same
+                    // gating as the MQ4 Base arm. The runtime's
+                    // `fused_rmsnorm_rotate_mq_awq` kernel handles the inverse
+                    // divide before FWHT regardless of whether the weight is
+                    // MQ4 or MQ6 (dispatch keys on awq_scale.is_some(), not
+                    // dtype). Without this, --format mq4 --kmap-dense
+                    // --kmap-mode 2 --awq produces an asymmetric quant where
+                    // the MQ4 siblings carry AWQ but K-map-promoted MQ6 ones
+                    // don't.
+                    let (working_weights, _awq_f64) =
+                        apply_awq_prescale(name, &f32_data, m_dim, k_dim, &mut awq_sidecar_scales);
                     let signs1 = gen_fwht_signs(42, 256);
                     let signs2 = gen_fwht_signs(1042, 256);
-                    let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
+                    let q = quantize_mq6g256(&working_weights, &signs1, &signs2);
                     (q, QuantType::MQ6G256, 256u32, "MQ6G256")
                 } else if (use_hfq4g256 || use_hfq3g256 || use_hfq3g128
                     || use_hfq2g256 || use_hfq2g128) && k_dim % 256 == 0
                 {
+                    // HFQ family doesn't go through the AWQ block in the Base
+                    // arm either (HFQ4G256 lacks an AWQ-aware fused kernel);
+                    // skip AWQ pre-scaling here for symmetry.
                     let q = quantize_hfq6g256(&f32_data);
                     (q, QuantType::HFQ6G256, 256u32, "HFQ6G256")
                 } else if use_mq6g256 && k_dim % 256 == 0 {
-                    // Already 6-bit MQ — no-op promotion
+                    // Already 6-bit MQ — no-op promotion. AWQ still applies
+                    // for `--format mq6 --awq` since MQ6's runtime path goes
+                    // through the same fused_rmsnorm_rotate_mq_awq dispatch.
+                    let (working_weights, _awq_f64) =
+                        apply_awq_prescale(name, &f32_data, m_dim, k_dim, &mut awq_sidecar_scales);
                     let signs1 = gen_fwht_signs(42, 256);
                     let signs2 = gen_fwht_signs(1042, 256);
-                    let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
+                    let q = quantize_mq6g256(&working_weights, &signs1, &signs2);
                     (q, QuantType::MQ6G256, 256u32, "MQ6G256")
                 } else if use_hfq6 && k_dim % 256 == 0 {
                     // Already 6-bit HFQ — no-op promotion
@@ -4307,26 +4371,7 @@ fn main() {
                     let m_dim = meta.shape[0];
                     // Step 1: AWQ pre-scaling (if eligible + enabled).
                     let (working_weights, awq_scales_for_pipeline_f64) =
-                        if let (Some(alpha), Some(im_weights))
-                            = (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
-                        {
-                            if awq_eligible(name) {
-                                debug_assert_eq!(im_weights.len(), k_dim,
-                                    "imatrix length ({}) != K dim ({}) for {}",
-                                    im_weights.len(), k_dim, name);
-                                let scales = compute_awq_scales(im_weights, alpha);
-                                awq_sidecar_scales = Some(scales.clone());
-                                let mut scaled = f32_data.clone();
-                                awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
-                                let scales_f64: Vec<f64> = scales.iter().map(|&v| v as f64).collect();
-                                (scaled, scales_f64)
-                            } else {
-                                // AWQ-ineligible: plain weights, identity scales.
-                                (f32_data.clone(), vec![1.0_f64; k_dim])
-                            }
-                        } else {
-                            (f32_data.clone(), vec![1.0_f64; k_dim])
-                        };
+                        apply_awq_prescale(name, &f32_data, m_dim, k_dim, &mut awq_sidecar_scales);
 
                     // Step 2: GPTQ (if --gptq enabled + Hessian present) or plain pack.
                     let q = if let Some(sc) = GPTQ_HESSIAN.get() {

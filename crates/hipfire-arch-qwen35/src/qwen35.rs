@@ -886,7 +886,12 @@ fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, name: &str, m: usize, k: usize) 
         // pread_buf borrow, but the weight bytes have already been
         // uploaded to GPU (owned by `wt.buf`) so the borrow no longer
         // matters.
-        if matches!(wt.gpu_dtype, DType::MQ4G256) {
+        // MQ6G256 included so K-map-promoted (--kmap-dense --kmap-mode 2)
+        // weights carry their AWQ sidecars too. The dispatch helper
+        // `fused_rmsnorm_rotate_mq_awq` is dtype-agnostic on the weight
+        // side — it divides activations and rotates, then `gemv_mq6g256_*`
+        // consumes the pre-rotated buffer like `gemv_mq4g256_*` does.
+        if matches!(wt.gpu_dtype, DType::MQ4G256 | DType::MQ6G256) {
             wt.awq_scale = load_awq_scale_for(hfq, gpu, &full_name, k)
                 .or_else(|| load_awq_scale_for(hfq, gpu, name, k));
         }
@@ -898,7 +903,12 @@ fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, name: &str, m: usize, k: usize) 
             .or_else(|| hfq.tensor_data(name))
             .unwrap_or_else(|| panic!("tensor not found: {name} or {full_name}"));
         let mut wt = load_weight_tensor_raw(gpu, info.quant_type, data, m, k)?;
-        if matches!(wt.gpu_dtype, DType::MQ4G256) {
+        // MQ6G256 included so K-map-promoted (--kmap-dense --kmap-mode 2)
+        // weights carry their AWQ sidecars too. The dispatch helper
+        // `fused_rmsnorm_rotate_mq_awq` is dtype-agnostic on the weight
+        // side — it divides activations and rotates, then `gemv_mq6g256_*`
+        // consumes the pre-rotated buffer like `gemv_mq4g256_*` does.
+        if matches!(wt.gpu_dtype, DType::MQ4G256 | DType::MQ6G256) {
             wt.awq_scale = load_awq_scale_for(hfq, gpu, &full_name, k)
                 .or_else(|| load_awq_scale_for(hfq, gpu, name, k));
         }
