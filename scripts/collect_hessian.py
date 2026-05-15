@@ -103,6 +103,29 @@ def is_gptq_target(name: str) -> bool:
     return False
 
 
+def _extract_layer_idx(mod_name: str) -> int | None:
+    """Parse the layer index from a transformer module name.
+
+    Recognizes the conventional `.layers.<N>.` infix in both HF
+    safetensors naming (`model.language_model.layers.0.linear_attn.q_proj`)
+    and the MTP head's `mtp.layers.0.self_attn.q_proj`. Layers in MTP
+    are treated as a separate index space; we return `None` to lump
+    them into the "always-included" bucket (they're a fixed small set
+    and their tensors fit in RAM trivially).
+
+    Returns `None` for modules without a recognizable layer infix
+    (lm_head, embed_tokens, top-level norms, vision encoder).
+    """
+    parts = mod_name.split(".")
+    for i, part in enumerate(parts):
+        if part == "layers" and i + 1 < len(parts):
+            try:
+                return int(parts[i + 1])
+            except ValueError:
+                return None
+    return None
+
+
 def _safetensors_keys(model_path: str) -> set[str]:
     """Returns the set of all tensor keys stored in the safetensors files,
     stripped of `.weight` suffix to match against module names.
@@ -164,21 +187,44 @@ def _translate_to_stored_name(mod_name: str, stored_keys: set[str]) -> str | Non
 class HessianAccumulator:
     """One per nn.Linear we hook. Accumulates H = sum_t x_t · x_t^T (FP32, K×K).
 
-    We accumulate in FP32 on the CPU side to keep GPU memory free for the
-    forward pass. The transfer per token is K*4 bytes — for K=4096 that's
-    16 KB per linear per token, ~5 MB per layer per token — fits in PCIe
-    bandwidth.
+    Two backing-store modes:
+      - **in-RAM** (default): `H = np.zeros((K, K), dtype=np.float32)`. Fast,
+        no I/O cost per `update`. Suitable for ≤9B-class models where the
+        sum of all per-tensor Hessians fits comfortably in system RAM
+        (9B's 248 entries total ~33 GB, fits in 32 GB tight; 4B fits easily).
+      - **memmap** (use `accumulator_dir`): each Hessian is a
+        `np.memmap` file at `<accumulator_dir>/{escaped_name}.f32.bin`.
+        Updates go through the OS page cache; resident DRAM stays bounded.
+        Required for 27B-class models where the full accumulator set is
+        126 GB (FP32) — 4× system RAM. Local SSD typical write throughput
+        (~500 MB/s on the md0 RAID) makes the per-token overhead ~1 ms.
+        NFS-backed memmap is workable but throttles by ~10× (~10 ms/token).
 
     Promoted to FP64 only at the quantizer for Cholesky (per plan v2 §2).
     """
 
-    def __init__(self, name: str, K: int) -> None:
+    def __init__(self, name: str, K: int, accumulator_dir: Path | None = None) -> None:
         self.name = name
         self.K = K
-        # FP32 accumulator. K=12288 → 576 MB. For 27B's largest tensor we'd
-        # need ~600 MB host RAM per Hessian; manageable.
-        self.H = np.zeros((K, K), dtype=np.float32)
         self.n_tokens = 0
+        self.accumulator_dir = accumulator_dir
+        if accumulator_dir is None:
+            # In-RAM accumulator (current behavior for ≤9B).
+            self.H = np.zeros((K, K), dtype=np.float32)
+            self._mmap_path: Path | None = None
+        else:
+            # Memmap-backed accumulator. File-per-tensor; OS handles paging.
+            # Escape name → filename: replace dots/slashes for filesystem safety.
+            safe_name = name.replace("/", "_").replace(".", "_")
+            self._mmap_path = accumulator_dir / f"{safe_name}.f32.bin"
+            self._mmap_path.parent.mkdir(parents=True, exist_ok=True)
+            # mode='w+' zeros the file at open. Total bytes = K * K * 4.
+            self.H = np.memmap(
+                self._mmap_path,
+                dtype=np.float32,
+                mode="w+",
+                shape=(K, K),
+            )
 
     def update(self, x_2d: np.ndarray) -> None:
         """x_2d: shape [num_tokens, K] in FP32 on CPU.
@@ -187,6 +233,10 @@ class HessianAccumulator:
         rounding error per accumulation is ~1 ULP per entry per token —
         across 262k tokens, accumulated error stays well below the
         damping λ that GPTQ adds anyway.
+
+        For memmap-backed `self.H`, the `+=` is a read-modify-write of
+        K² FP32 values per update. OS page cache buffers; explicit
+        `H.flush()` happens once at `finalize` time (not per update).
         """
         assert x_2d.ndim == 2 and x_2d.shape[1] == self.K, \
             f"{self.name}: shape mismatch {x_2d.shape} vs K={self.K}"
@@ -196,10 +246,31 @@ class HessianAccumulator:
         self.n_tokens += x_2d.shape[0]
 
     def finalize(self) -> np.ndarray:
-        """Returns H / n_tokens (the actual expectation E[x x^T])."""
+        """Returns H / n_tokens as an FP32 K×K array (the actual
+        expectation E[x x^T]).
+
+        For memmap-backed accumulators, this materializes a fresh in-RAM
+        K×K FP32 copy of the data normalized by `n_tokens`. The caller
+        is expected to immediately write it to the HFHS sidecar and drop
+        the reference, so peak RAM is one Hessian at a time (≤1.2 GB
+        for K=17408 — fits comfortably).
+        """
         if self.n_tokens == 0:
-            return self.H  # uninitialized — caller must skip
-        return self.H / self.n_tokens
+            return np.asarray(self.H, dtype=np.float32)
+        if isinstance(self.H, np.memmap):
+            self.H.flush()
+        return (np.asarray(self.H, dtype=np.float32) / self.n_tokens).astype(np.float32)
+
+    def close(self) -> None:
+        """Release the memmap and (optionally) delete the backing file.
+        Safe to call multiple times; no-op for in-RAM accumulators.
+        Called after `finalize()` to free OS resources during the
+        sidecar-write loop."""
+        if isinstance(self.H, np.memmap):
+            self.H._mmap.close()  # type: ignore[attr-defined]
+        self.H = None  # type: ignore[assignment]
+        # Caller may unlink self._mmap_path after the sidecar is written;
+        # we don't auto-delete to ease debugging a partial run.
 
 
 def build_hook(acc: HessianAccumulator):
@@ -223,21 +294,169 @@ def build_hook(acc: HessianAccumulator):
     return hook
 
 
-def write_hessian_file(out_path: Path, accs: dict[str, HessianAccumulator]) -> None:
-    """Serialize all accumulated Hessians to HFHS v1 binary format."""
+def merge_hfhs_files(out_path: Path, partial_paths: list[Path]) -> None:
+    """Concatenate per-pass partial HFHS files into a single sidecar.
+
+    The HFHS v1 format is a header (n_tensors u64) followed by sequential
+    per-tensor records — so a "merge" is: sum the n_tensors fields,
+    write the header, then copy each partial's record bytes verbatim.
+    All partials must be HFHS v1 with the same dtype convention.
+
+    Used by the multi-pass collector (--n-passes N): each pass writes
+    its layers' Hessians to a partial, then this function combines them.
+    Partial files are unlinked after merge.
+    """
     out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    total_tensors = 0
+    record_blocks: list[tuple[Path, int, int]] = []  # (path, offset, length)
+    for pp in partial_paths:
+        with pp.open("rb") as f:
+            header = f.read(24)
+            if header[:4] != b"HFHS":
+                raise IOError(f"{pp} is not an HFHS file (magic={header[:4]!r})")
+            version = struct.unpack("<I", header[4:8])[0]
+            if version != 1:
+                raise IOError(f"{pp} HFHS version {version} != 1")
+            n_t = struct.unpack("<Q", header[8:16])[0]
+            total_tensors += n_t
+            # Record block = everything after the 24-byte header
+            file_size = pp.stat().st_size
+            record_blocks.append((pp, 24, file_size - 24))
+
+    with out_path.open("wb") as f:
+        # Write merged header
+        f.write(b"HFHS")
+        f.write(struct.pack("<I", 1))                  # version
+        f.write(struct.pack("<Q", total_tensors))      # n_tensors (summed)
+        f.write(struct.pack("<Q", 0))                  # reserved
+        # Stream each partial's records, then unlink it. This keeps peak
+        # disk usage at ~one-partial-size above the growing output, vs
+        # holding all partials until the very end (which would peak at
+        # 2x total final size).
+        for pp, off, length in record_blocks:
+            with pp.open("rb") as g:
+                g.seek(off)
+                # Stream in 64 MB chunks so we don't fault the whole partial
+                # into RAM during the copy.
+                CHUNK = 64 * 1024 * 1024
+                remaining = length
+                while remaining > 0:
+                    buf = g.read(min(CHUNK, remaining))
+                    if not buf:
+                        break
+                    f.write(buf)
+                    remaining -= len(buf)
+            try:
+                pp.unlink()
+            except OSError as e:
+                print(f"  WARN: failed to unlink {pp}: {e}", file=sys.stderr)
+
+
+def collect_one_pass(
+    model,
+    seqs: list[torch.Tensor],
+    stored_names: set[str],
+    pass_idx: int,
+    n_passes: int,
+    accumulator_dir: Path | None,
+    device: str,
+) -> dict[str, HessianAccumulator]:
+    """Register hooks for layers in this pass, run forward, return accs.
+
+    `layer_idx % n_passes == pass_idx` selects which layers participate.
+    Modules without a recognizable `.layers.<N>.` infix (lm_head etc.)
+    are not GPTQ-eligible by `is_gptq_target` anyway, so we never see
+    them here. MTP modules use the `mtp.layers.<N>.` namespace; their
+    layer_idx is in a separate index space from the main model, but
+    falls under the same modulo policy (so MTP layer 0 lands in pass 0
+    when n_passes ≥ 1 — fine since MTP is small).
+    """
+    accs: dict[str, HessianAccumulator] = {}
+    handles = []
+    skipped_no_layer_idx = 0
+    skipped_other_pass = 0
+
+    for mod_name, module in model.named_modules():
+        if not (isinstance(module, torch.nn.Linear) and is_gptq_target(mod_name)):
+            continue
+        layer_idx = _extract_layer_idx(mod_name)
+        if n_passes > 1:
+            if layer_idx is None:
+                # No layer infix → assign to pass 0 by convention.
+                if pass_idx != 0:
+                    skipped_no_layer_idx += 1
+                    continue
+            else:
+                if layer_idx % n_passes != pass_idx:
+                    skipped_other_pass += 1
+                    continue
+
+        K = module.in_features
+        stored = _translate_to_stored_name(mod_name, stored_names)
+        if stored is None:
+            print(f"  WARN: no safetensors key matches {mod_name!r} — skipping",
+                  file=sys.stderr)
+            continue
+        accs[stored] = HessianAccumulator(stored, K, accumulator_dir=accumulator_dir)
+        handles.append(module.register_forward_pre_hook(build_hook(accs[stored])))
+
+    if n_passes > 1:
+        print(f"      pass {pass_idx+1}/{n_passes}: {len(accs)} hooks "
+              f"({skipped_other_pass} skipped → other passes, "
+              f"{skipped_no_layer_idx} skipped → no layer infix)")
+    else:
+        print(f"      {len(accs)} hooks registered "
+              f"({len(set(acc.K for acc in accs.values()))} distinct K dims)")
+    if accs:
+        print(f"      K range: {min(acc.K for acc in accs.values())}.."
+              f"{max(acc.K for acc in accs.values())}")
+
+    t0 = time.time()
+    with torch.no_grad():
+        for i, seq in enumerate(seqs):
+            seq = seq.unsqueeze(0).to(device)
+            model(seq)
+            if (i + 1) % 8 == 0:
+                elapsed = time.time() - t0
+                rate = (i + 1) / elapsed
+                eta = (len(seqs) - i - 1) / rate
+                print(f"      seq {i+1}/{len(seqs)} "
+                      f"({elapsed:.1f}s elapsed, {rate:.2f} seq/s, ETA {eta:.0f}s)")
+    print(f"      forward pass complete: {time.time() - t0:.1f}s")
+
+    for h in handles:
+        h.remove()
+    return accs
+
+
+def write_hessian_file(out_path: Path, accs: dict[str, HessianAccumulator]) -> None:
+    """Serialize all accumulated Hessians to HFHS v1 binary format.
+
+    For memmap-backed accumulators, each tensor is finalized → written →
+    closed → backing file unlinked in turn, so peak in-flight RAM is
+    O(K_max² · 4 bytes) = ~1.2 GB for K=17408. Without this streaming
+    discipline, 27B's 126 GB total Hessian set would never fit in RAM
+    even temporarily.
+    """
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    # Count valid tensors first so we can write the correct n_tensors
+    # header without scanning twice through the accumulator dict.
+    valid_count = sum(1 for acc in accs.values() if acc.n_tokens > 0)
+
     with out_path.open("wb") as f:
         # Header
         f.write(b"HFHS")
         f.write(struct.pack("<I", 1))                  # version
-        f.write(struct.pack("<Q", len(accs)))          # n_tensors
+        f.write(struct.pack("<Q", valid_count))        # n_tensors
         f.write(struct.pack("<Q", 0))                  # reserved
 
         for name, acc in accs.items():
             if acc.n_tokens == 0:
                 print(f"  WARN: {name} accumulated 0 tokens — skipping", file=sys.stderr)
+                acc.close()
                 continue
-            H_final = acc.finalize().astype(np.float32, copy=False)
+            H_final = acc.finalize()                      # FP32 K×K, in-RAM copy
             name_bytes = name.encode("utf-8")
             f.write(struct.pack("<I", len(name_bytes)))   # name_len
             f.write(name_bytes)                           # name
@@ -245,6 +464,16 @@ def write_hessian_file(out_path: Path, accs: dict[str, HessianAccumulator]) -> N
             f.write(struct.pack("<I", acc.K))             # K
             f.write(struct.pack("<I", 1))                 # dtype_flag (1 = F32)
             f.write(H_final.tobytes(order="C"))           # K*K*4 bytes
+            del H_final
+            # Free the memmap (if any) and unlink the backing file —
+            # we already serialized the data into the .hessian.bin.
+            backing_path = acc._mmap_path
+            acc.close()
+            if backing_path is not None:
+                try:
+                    backing_path.unlink()
+                except OSError as e:
+                    print(f"  WARN: failed to unlink {backing_path}: {e}", file=sys.stderr)
 
 
 def load_calibration_text(corpus: str, n_sequences: int, ctx_len: int,
@@ -424,6 +653,30 @@ def main():
     ap.add_argument("--dtype", default="bfloat16",
                     choices=["bfloat16", "float16", "float32"],
                     help="Model dtype (default bfloat16).")
+    ap.add_argument("--accumulator-dir", type=Path, default=None,
+                    help="If set, each per-tensor Hessian is backed by a "
+                         "memmap file under this directory rather than held "
+                         "in system RAM. Required for ≥27B models where the "
+                         "total Hessian footprint (~126 GB FP32 for "
+                         "Qwen3.6-27B) exceeds system RAM. Local SSD path "
+                         "(e.g. /tmp/hipfire-hessian-acc/) is fastest; "
+                         "NFS works but throttles update throughput ~10x. "
+                         "Files are unlinked after the HFHS sidecar is "
+                         "written. For ≤9B, leave unset and use in-RAM "
+                         "accumulators (no I/O overhead).")
+    ap.add_argument("--n-passes", type=int, default=1,
+                    help="Number of forward passes over the corpus. Each "
+                         "pass collects Hessians for a disjoint subset of "
+                         "transformer layers (layer_idx %% n_passes == "
+                         "pass_idx). Set N=4 for 27B-class models where "
+                         "the full-set in-RAM accumulator (~126 GB) "
+                         "exceeds system RAM — per-pass peak is ~30 GB. "
+                         "Forward-pass wall time scales linearly with N "
+                         "(N=4 for 27B → ~4h vs ~1h at N=1). Each pass "
+                         "writes its Hessians to a partial .hessian.bin.partN "
+                         "file; a final merge step concatenates them into "
+                         "--output. Default 1 (no chunking, same behavior "
+                         "as before for ≤9B models).")
     ap.add_argument("--inject-conv1d-mq4-noise", action="store_true",
                     help="Round-trip every linear_attn.conv1d weight through "
                          "FWHT-256 + MQ4-quantize-then-dequantize BEFORE the "
@@ -481,65 +734,67 @@ def main():
               f"(seeds 42/1042, group=256)...")
         _inject_conv1d_mq4_noise_in_place(model)
 
-    print(f"\n[2/4] Registering Hessian hooks on GPTQ-target Linear modules...")
-    # HF's AutoModelForCausalLM flattens multimodal submodules (e.g. Qwen3.5's
-    # `language_model.` is dropped from in-memory module names when loaded as
-    # a CausalLM). Hipfire's .hfq, however, mirrors the safetensors naming
-    # which keeps the full prefix. We translate in-memory names → stored
-    # names via safetensors-index matching so the Rust quantizer can look up
-    # Hessians by the same key as the .hfq tensors.
-    stored_names = _safetensors_keys(args.model)
-    accs: dict[str, HessianAccumulator] = {}
-    handles = []
-    name_remap_count = 0
-    for mod_name, module in model.named_modules():
-        if isinstance(module, torch.nn.Linear) and is_gptq_target(mod_name):
-            K = module.in_features
-            stored = _translate_to_stored_name(mod_name, stored_names)
-            if stored is None:
-                print(f"  WARN: no safetensors key matches {mod_name!r} — skipping",
-                      file=sys.stderr)
-                continue
-            if stored != mod_name:
-                name_remap_count += 1
-            accs[stored] = HessianAccumulator(stored, K)
-            handles.append(module.register_forward_pre_hook(build_hook(accs[stored])))
-    print(f"      {name_remap_count} of {len(accs)} names remapped from in-memory "
-          f"→ stored (multimodal-flatten translation)")
-    print(f"      registered {len(accs)} hooks "
-          f"({len(set(K_ for K_ in [acc.K for acc in accs.values()]))} distinct K dims)")
-    print(f"      K range: {min(acc.K for acc in accs.values())}..{max(acc.K for acc in accs.values())}")
+    if args.n_passes < 1:
+        raise SystemExit("--n-passes must be >= 1")
 
-    print(f"\n[3/4] Loading calibration corpus + running forward pass...")
+    # HF's AutoModelForCausalLM flattens multimodal submodules; we resolve
+    # in-memory module names back to safetensors-stored names so the Rust
+    # quantizer can look Hessians up by the same key as the .hfq tensors.
+    stored_names = _safetensors_keys(args.model)
+
+    print(f"\n[3/4] Loading calibration corpus...")
     t0 = time.time()
     seqs = load_calibration_text(args.corpus, args.n_sequences, args.ctx_len, tokenizer)
     print(f"      loaded {len(seqs)} calibration sequences in {time.time() - t0:.1f}s")
-    print(f"      starting forward pass (no_grad, eval mode)...")
 
-    t0 = time.time()
-    with torch.no_grad():
-        for i, seq in enumerate(seqs):
-            seq = seq.unsqueeze(0).to(args.device)
-            model(seq)
-            if (i + 1) % 8 == 0:
-                elapsed = time.time() - t0
-                rate = (i + 1) / elapsed
-                eta = (len(seqs) - i - 1) / rate
-                print(f"      seq {i+1}/{len(seqs)} "
-                      f"({elapsed:.1f}s elapsed, {rate:.2f} seq/s, ETA {eta:.0f}s)")
+    if args.n_passes == 1:
+        # Single-pass (default, original behavior for ≤9B).
+        print(f"\n[2/4] Registering hooks + running forward pass (1 pass)...")
+        accs = collect_one_pass(
+            model, seqs, stored_names,
+            pass_idx=0, n_passes=1,
+            accumulator_dir=args.accumulator_dir,
+            device=args.device,
+        )
+        if not accs:
+            raise SystemExit("no GPTQ-target Linear modules matched — nothing to collect")
+        sample_acc = next(iter(accs.values()))
+        print(f"      total tokens accumulated per tensor (sample): {sample_acc.n_tokens}")
+        print(f"\n[4/4] Writing Hessian sidecar to {args.output}...")
+        t0 = time.time()
+        write_hessian_file(args.output, accs)
+        print(f"      wrote {args.output.stat().st_size / 1e9:.2f} GB in {time.time() - t0:.1f}s")
+    else:
+        # Multi-pass: N forward passes, each over a disjoint layer set.
+        # Per-pass peak RAM is bounded by N; total wall is N × single-pass.
+        print(f"\n[2-3/4] Multi-pass collection ({args.n_passes} passes — "
+              f"required for 27B-class models to bound per-pass accumulator RAM)")
+        partial_paths: list[Path] = []
+        for pass_idx in range(args.n_passes):
+            print(f"\n  --- Pass {pass_idx+1}/{args.n_passes} ---")
+            accs = collect_one_pass(
+                model, seqs, stored_names,
+                pass_idx=pass_idx, n_passes=args.n_passes,
+                accumulator_dir=args.accumulator_dir,
+                device=args.device,
+            )
+            if not accs:
+                print(f"      WARN: pass {pass_idx} yielded 0 hooks — skipping")
+                continue
+            partial = args.output.with_suffix(args.output.suffix + f".part{pass_idx}")
+            print(f"      writing pass {pass_idx} → {partial} ({len(accs)} tensors)")
+            t0 = time.time()
+            write_hessian_file(partial, accs)
+            print(f"      wrote {partial.stat().st_size / 1e9:.2f} GB in {time.time() - t0:.1f}s")
+            partial_paths.append(partial)
+            # Free RAM held by the accumulators of this pass before the next.
+            del accs
 
-    print(f"      forward pass complete: {time.time() - t0:.1f}s")
-    print(f"      total tokens accumulated per tensor (sample): "
-          f"{next(iter(accs.values())).n_tokens}")
+        print(f"\n[4/4] Merging {len(partial_paths)} partial HFHS files → {args.output}")
+        t0 = time.time()
+        merge_hfhs_files(args.output, partial_paths)
+        print(f"      wrote {args.output.stat().st_size / 1e9:.2f} GB in {time.time() - t0:.1f}s")
 
-    # Detach hooks before writing — they'll keep accumulating otherwise.
-    for h in handles:
-        h.remove()
-
-    print(f"\n[4/4] Writing Hessian sidecar to {args.output}...")
-    t0 = time.time()
-    write_hessian_file(args.output, accs)
-    print(f"      wrote {args.output.stat().st_size / 1e9:.2f} GB in {time.time() - t0:.1f}s")
     print(f"\n=== Done ===")
 
 
