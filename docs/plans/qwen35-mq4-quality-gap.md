@@ -1142,6 +1142,159 @@ genuinely different outlier distribution from Llama and F3 below
 across `[0.3, 0.7]`, the alpha lever is exhausted and the gap is
 elsewhere (F2/F4/F5/Stage E).
 
+**F1 RESULTS — 2026-05-14, gfx906 (dp4a / wave64, kv-mode asym3).**
+
+Two-phase sweep on Qwen3.5-9B BF16 safetensors (post-merge engine
+including RoPE halfsplit + dflash fixes, conv1d Q8 default). Imatrix:
+committed `qwen3.5-9b-bf16.imatrix.gguf`. Phase 1 n=50 screened seven
+α values; phase 2 n=512 deep-eval'd the three central candidates.
+
+Phase 2 n=512 KLDs (paired t-test, since same chunks scored per
+variant):
+
+| α | KLD n=512 | 95% CI | PPL | NLL |
+|---|---:|---:|---:|---:|
+| 0.40 | 0.2292 | ±0.0095 | 9.98 | 2.30 |
+| 0.50 | 0.2283 | ±0.0095 | 10.06 | 2.31 |
+| **0.60** | **0.2231** | ±0.0094 | **9.66** | **2.27** |
+
+Paired Δ (a vs b):
+
+| Comparison | paired ΔKLD | t | significant? |
+|---|---:|---:|:-:|
+| α=0.6 vs α=0.5 | **−0.0052** | **−5.21** | yes (p<1e-6) |
+| α=0.6 vs α=0.4 | **−0.0061** | **−5.96** | yes (p<1e-8) |
+| α=0.5 vs α=0.4 | −0.0009 | −1.04 | no (noise) |
+
+Naive marginal-CI overlap was misleading; the per-sequence pairing
+(each KLD scored on the same wikitext-2 chunk) drops the noise floor
+by ~5× and reveals the α=0.6 win cleanly. **On gfx906/asym3, α=0.6
+beats both 0.5 and 0.4 decisively; 0.5 and 0.4 are indistinguishable.**
+
+The lever lift vs α=0.5: **−2.3% KLD, −3.9% PPL.** Above the n=512
+half-width (0.0095) but well below the **+5–15% lever value the F1
+prediction targeted**. The plan's "flat curve → exhausted lever" branch
+fires: the curve is shallowly tilted (not flat, but the optimum-vs-
+default delta is small), and the dominant residual gap to llama.cpp's
+Δ-above-own-Q8 must live elsewhere (F2/F4/F5/Stage E).
+
+**Cross-arch divergence — gfx1100 contradicts the optimum.** Parallel
+experiment on gfx1100 (WMMA / wave32, kv-mode q8) ran α=0.5 and α=0.6
+on the same .hfq lineage:
+
+| Setup | α=0.5 KLD | α=0.6 KLD | Δ |
+|---|---:|---:|---:|
+| gfx906 / dp4a / wave64 / asym3 KV | 0.2283 | 0.2231 | **α=0.6 wins −2.3%** |
+| gfx1100 / WMMA / wave32 / q8 KV | 0.1375 | 0.1502 | **α=0.5 wins +9.2%** |
+
+The optima are **opposite-signed across archs**. Two confounded
+variables (kernel-numerics AND KV mode) so the strict
+arch-vs-KV-mode attribution is open. Absolute KLD floor offset
+(0.22 vs 0.14) is *engine drift*, not model quality — different
+forward-pass kernels produce different numerical paths with the same
+.hfq input.
+
+**Implications for F3 (per-class alpha) and beyond.**
+
+The cross-arch divergence is now a hard finding: **there is no
+universal α=0.5 default for hipfire MQ4+AWQ — the optimum is a
+function of (arch numerics, KV mode)**. F3's per-class alpha plan
+extends naturally to **per-deployment-config alpha**: ship a small
+table (arch × KV-mode) of optimal α, or auto-select at quantize time
+from the deployer's intended runtime config.
+
+In practice the lift is modest (~2-3% from off-optimal α at a given
+config), so unless F2/F4/F5 close more of the absolute gap, F3 is a
+low-priority polish. Recommended sequencing: run F2 first (kernel work,
+projected +3-7% on top), then re-measure α-optimum at the new baseline
+before deciding F3 budget.
+
+**Decision rule update.** The F1 5–15% lever prediction wasn't met
+(measured 2.3%). Per the plan's existing rule "If F1 lift <5%:
+structural gap dominates; skip F2-F5, proceed to Stage C measurement
+and Stage E decision." Strict reading: skip F2-F5, jump to Stage E
+(MQ4K wire format). Soft reading: F1 *did* find a real optimum and
+*does* reveal cross-arch divergence — these are insights worth keeping
+even if the dollar value is small. Recommend running F2 anyway because
+the kernel work is needed for AWQ to cover the full whitelist (the
+plan's F2 description explicitly notes post-projection paths are
+currently un-AWQ'd; that's correctness-leaning work, not just
+optimization).
+
+**Retroactive metric note (added during F2, 2026-05-15).** The 2.3%
+lever measurement above is on KLD only. The F2 work (below) revealed
+that AWQ improvements move PPL much more strongly than KLD — at
+α=0.5 F1 vs F2 paired (n=256, KV q8), KLD Δ ≈ 0 (t=−0.01) but PPL
+Δ = −6.6% (NLL paired-t = −13.32, p<10⁻³⁰). The F1 α=0.6 KLD-win on
+gfx906/asym3 (paired-t = −5.21) is real, but the PPL implications
+weren't measured at the time. **The "F1 lift = 2.3%" headline
+understates the true lever value because PPL was never collected
+alongside KLD.** A retroactive F1 α=0.5 vs α=0.6 PPL paired-t at
+n=256 would tighten the F1 conclusions; not done in this session.
+
+**Eyeball coherence check (4 variants × 3 prompts).** After the n=512
+KLD sweep, ran the `run` REPL on each variant (9B α=0.5, 9B α=0.6,
+0.8B α=0.0 / no-AWQ, 0.8B α=0.5) with three prompts (short factual QA,
+code generation, multi-step word problem). Outputs at
+`benchmarks/quality-baselines/results/2026-05-14-awq-coherence-check/`.
+
+Findings:
+
+- **Short factual QA ("capital of France"):** all 4 variants produce
+  "The capital of France is Paris." correctly.
+- **Code generation ("sum of squares function"):** clean separation —
+  9B α=0.5 emitted syntactically broken code
+  (`return x ** 2 for x in nums)` — missing `sum(...)`, unbalanced
+  paren); 9B α=0.6 produced working code
+  (`return sum(x ** 2 for x in nums) if isinstance(nums, list) else None`).
+  Both 0.8B variants produced clean code. This is the first observed
+  case of the KLD lift translating to a concrete capability difference.
+- **0.8B coherence is size-floor, not AWQ.** 0.8B α=0.0 (no AWQ at all)
+  and 0.8B α=0.5 both produce fluent-looking but factually wrong
+  answers on the multi-step word problem (hallucinated distance,
+  off-by-many-hours final answer). AWQ doesn't degrade 0.8B; the model
+  is simply too small for chained arithmetic. **Original concern that
+  AWQ was causing 0.8B incoherence is falsified.**
+
+**Engine-side reasoning regression (separate finding, NOT AWQ).** All
+9B hipfire-quantized variants — including a pre-merge May 6 mq4, May 6
+mq6, and May 6 mq8 (untouched by today's quantizer changes) — exhibit
+a **catastrophic meta-loop** on the multi-step word-problem prompt: the
+model opens cleanly, derives a few correct steps, then derails into
+"let me re-read the prompt, I think the user typed `?` instead of a
+number" hallucinations that loop until token budget runs out.
+
+This affects:
+- All bit-widths (mq4 / mq6 / mq8) and the AWQ-enabled variants alike
+- All sampling temperatures (0.0 / 0.3 / 0.8)
+- The pre-merge May 6 quants AND today's post-merge quants
+
+**Llama.cpp on the same GPU (gfx906) with the same model
+(Qwen3.5-9B-BF16.gguf from unsloth) produces a clean, correct answer:**
+"$t = \frac{360}{140} = \frac{18}{7} \approx 2.57$ hours … 11:34am"
+(correct: 280 = 60t + 80(t-1), solve t = 18/7 h after 9am).
+Tested via `mixa3607/llama.cpp-gfx906:b9010-rocm-6.3.3` Docker with
+`HIP_VISIBLE_DEVICES=0` pinning to MI50.
+
+**Conclusion: there is a hipfire forward-pass coherence regression on
+multi-step word-problem reasoning that is independent of all of
+{quantization format, AWQ alpha, sampling temperature, today's
+quantizer changes}.** It pre-dates this branch (May 6 quants exhibit
+it). Likely culprits worth investigating in a separate work item:
+DeltaNet recurrence drift on long reasoning chains (per Phase 1 Step c
+probes), specific token-attractor in the post-FWHT residual stream,
+or KV-quant interaction with the reasoning-trace token distribution.
+Out of scope for F1; logged as a follow-up.
+
+The F1 cross-arch AWQ finding stands cleanly — the meta-loop affects
+every alpha equally, so it doesn't shift which alpha wins on KLD.
+
+Raw data: `benchmarks/quality-baselines/results/2026-05-14-awq-phase2-n512-9b-gfx906/`
+(plus the n=50 screening at `.../2026-05-14-awq-alpha-sweep-9b-gfx906/`
+and the coherence-check probes at `.../2026-05-14-awq-coherence-check/`).
+Cross-arch gfx1100 numbers per separate experiment (not in this repo
+tree at time of writing).
+
 ##### F2 — AWQ on post-projection paths (was "Option B" from awq_bug_hunt_glm5.md)
 
 Stage A's AWQ pre-scaling is whitelisted to weights whose runtime
@@ -1160,6 +1313,106 @@ than originally assumed.
 `fused_silu_mul_rotate_mq_awq` (silu_mul → input divide → FWHT). ~4
 new HIP kernels + dispatcher wiring, ~3–4 days. Estimated +3–7%
 Δ-above-own-Q8 reduction on top of F1.
+
+**F2 RESULTS — 2026-05-14/15, gfx906 (dp4a / wave64), KV q8.**
+
+Implementation shipped in a single PR-shaped change:
+- Two new HIP kernels (`rotate_x_mq_awq.hip`,
+  `fused_silu_mul_mq_rotate_awq.hip`) — clones of the originals plus
+  one extra `/awq_scale[i]` before the FWHT.
+- Four dispatch wrappers in `crates/rdna-compute/src/dispatch.rs`.
+- Four `_for` routing helpers in `crates/hipfire-runtime/src/llama.rs`
+  that auto-route based on the downstream weight's `awq_scale`.
+- ~10 call-site conversions in `crates/hipfire-arch-qwen35/src/qwen35.rs`
+  (forward_prefill_batch, forward_scratch, MoE indexed paths).
+- `weight_gemv` itself made AWQ-aware for all MQ-family branches
+  (closing a critical gap from the initial implementation — see
+  `awq-f2-rev-claude.md` for the post-implementation self-review
+  that found this gap before any user-visible corruption).
+- `awq_eligible()` expanded with `o_proj` / `wo` / `out_proj` /
+  `down_proj` / `w_down` patterns. Sidecar count on 9B Qwen3.5
+  hybrid: **184 → 248** (+64: 8 FA o_proj + 24 LA out_proj + 32
+  down_proj).
+- Backward-compat: AWQ-disabled .hfq files route through the
+  non-AWQ kernels via `_for` helper fall-through — byte-identical
+  to pre-F2 behavior.
+
+**Headline measurement — F1 vs F2 at α=0.5 (paired n=256, KV q8):**
+
+| Metric | F1 (184 sidecars) | F2 (248 sidecars) | Paired Δ | t-stat |
+|---|---:|---:|---:|---:|
+| KLD (mean) | 0.1725 ± 0.0119 | 0.1724 ± 0.0121 | −0.00003 ± 0.0040 | −0.01 |
+| **NLL (mean)** | **2.255148** | **2.187349** | **−0.067799 ± 0.00997** | **−13.32 ★** |
+| **PPL** | **9.5367** | **8.9116** | **−0.625 (−6.56%)** | **same as NLL** |
+
+Per-chunk improvement direction: F2 improved NLL on **209/256
+chunks (81.6%)** vs F1, near-monotonic. KLD per-chunk split 52/48
+(noise drowns the signal).
+
+**Interpretation — KLD is the wrong metric for AWQ improvements.**
+
+KLD measures full-distribution divergence vs BF16 over the top-K
+predicted tokens. NLL measures surprise at the *true* next token.
+F2 redistributes probability mass favorably toward the true tokens
+without changing the overall divergence shape vs BF16 — so KLD
+is flat, but PPL drops 6.6%. The same pattern reappears in the
+F2 alpha sweep (next paragraph): the α that minimizes KLD is one
+of the worst on PPL, and vice versa.
+
+This was a methodological miss in F1's headline writeup. F1's α=0.6
+KLD-win on gfx906/asym3 (paired-t = −5.21) was real, but the much
+larger PPL story was never measured. Going forward, **paired-t on
+NLL is the primary AWQ-quality signal**; KLD is secondary.
+
+**F2 alpha sweep — gfx906 / KV q8 / n=100, [0.35, 0.65] step 0.05:**
+
+| α | KLD | KLD CI | PPL | NLL paired-t vs α=0.50 |
+|---|---:|---:|---:|---:|
+| 0.35 | **0.1723** (best) | ±0.018 | 10.09 | +0.104 (worse) t=+13.2 ★ |
+| 0.40 | 0.1731 | ±0.016 | 10.18 | +0.112 t=+15.8 ★ |
+| 0.45 | 0.1740 | ±0.018 | 10.13 | +0.107 t=+18.5 ★ |
+| 0.50 | 0.1751 | ±0.018 | 9.10  | (anchor) |
+| **0.55** | 0.1830 (worst) | ±0.018 | **8.79** (best) | **−0.034 t=−8.65 ★** |
+| 0.60 | 0.1796 | ±0.019 | 9.19 | +0.010 t=+1.75 |
+| 0.65 | 0.1795 | ±0.018 | 9.50 | +0.043 t=+6.06 ★ |
+
+**The KLD-PPL inversion is severe at gfx906/KV q8.** α=0.55 is the
+*worst* alpha on KLD but the *best* on PPL — and the PPL win is
+highly significant (paired-t = −8.65 vs the α=0.50 anchor, with
+all 7 alphas at |t| > 6 except α=0.60).
+
+**Practical conclusion: ship F2, default α=0.55 on gfx906/KV q8.**
+PPL win vs F1 α=0.5 baseline:
+
+| Variant | Sidecars | PPL | Lift vs F1 α=0.5 |
+|---|---:|---:|---:|
+| F1 α=0.5 (baseline) | 184 | 9.54 | — |
+| F2 α=0.5 | 248 | 8.91 | **−6.6%** |
+| F2 α=0.55 | 248 | 8.79 (n=100) | **−7.9%** (subject to n=256 confirmation) |
+
+**Plan vs measured:** §F2 predicted "+3-7% Δ-above-own-Q8 reduction
+on top of F1." Measured: **+6.6% to +7.9% PPL reduction** (not
+above the Q8 floor — direct PPL — but the same lever). Right in
+the predicted range, just on the right metric.
+
+**Open follow-ups identified during F2 development:**
+- α=0.55 confirmation at n=256 (1h wall, ~8min/variant)
+- F2 sweep on gfx1100 / KV q8 — does PPL optimum hold cross-arch?
+  Previous gfx1100 F1 measurement showed α=0.5 winning on KLD;
+  re-measure with PPL paired-t.
+- MoE routed-expert AWQ — per-expert split path in `main.rs:3911`
+  bypasses the AWQ pipeline entirely. Identical math to dense; a
+  separate patch would replicate AWQ inside the per-expert loop.
+- Reciprocal precomputation — runtime divide by `awq_scale` could
+  be replaced by precomputed `1/awq_scale` at sidecar-load time.
+  Marginal perf win; tracked separately.
+
+Raw data:
+- F1 vs F2 paired (n=256, KV q8):
+  `benchmarks/quality-baselines/results/2026-05-14-f1-vs-f2-n256-kvq8-9b-gfx906/`
+- F2 alpha sweep (n=100, KV q8):
+  `benchmarks/quality-baselines/results/2026-05-14-f2-alpha-sweep-n100-kvq8-9b-gfx906/`
+- Implementation self-review: `docs/plans/awq-f2-rev-claude.md`
 
 ##### F3 — Per-layer-class AWQ alpha (extension of F1)
 

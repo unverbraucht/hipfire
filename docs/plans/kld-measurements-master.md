@@ -1,7 +1,7 @@
 # KLD Measurements — Master Table
 
 **Status:** Living document. Append new measurements; do not delete.
-**Last updated:** 2026-05-13 PM (post pattern-hunt audit)
+**Last updated:** 2026-05-15 (F2 AWQ whitelist expansion + KLD/NLL methodology rule 9)
 **Owner:** hipfire eval
 **Authoritative methodology:** [`issue-113-quant-quality-eval.md`](issue-113-quant-quality-eval.md)
 **Cross-engine framework:** Δ-above-own-Q8 (TL;DR + §2.4.1 + [engine-drift memory](../../memory/project_engine_drift_floor_decomposition.md)). Absolute `KLD(engine || HF-bf16)` is NOT a cross-engine output-quality metric — see §6 rule 8.
@@ -172,6 +172,65 @@ Source: this session's `/tmp/awq_q8conv_redo.sh`, after the cargo incremental bu
 
 Working artifacts: `qwen35-9b-mq4-awq-q8conv__gfx1100__kv-q8__c20.kldseq` (smoke), `qwen35-9b-mq4-awq-q8conv__gfx1100__kv-q8__c512.kldseq` (n=512); reverify quant `qwen35-9b-mq4-q8conv1d-reverify__gfx1100__kv-q8__c512.kldseq` md5-identical to the §5 anchor `qwen35-9b-mq4-q8conv1d__gfx1100__kv-q8__c512.kldseq` (both `8c90dbad8d7b9ee22147f0b02fbc2b43`). All in `benchmarks/quality-baselines/results/2026-05-13-q8-lmhead-conv-smoke/per-variant/`.
 
+### 1.1h F2 — AWQ whitelist expansion to output-side projections (gfx906, KV=q8, prefill, 2026-05-14/15)
+
+Source: this session's `scripts/awq_f1_vs_f2.sh` (paired comparison) + `scripts/awq_alpha_sweep.sh` (alpha sweep). F2 is plan §F2: extend AWQ pre-scaling from input-side projections (q/k/v/gate/up/router/in_proj_*, 184 sidecars) to also include output-side projections (o_proj/wo/out_proj/down_proj/w_down, +64 sidecars → **248 total**) via two new HIP kernels (`rotate_x_mq_awq.hip`, `fused_silu_mul_mq_rotate_awq.hip`) + dispatch wrappers + `_for` routing helpers + `weight_gemv` AWQ-aware fix.
+
+**F1 vs F2 at α=0.5, paired (n=256, KV=q8, gfx906):**
+
+| Variant | n | bpw | KLD (CI) | PPL | NLL | Notes |
+|---|---:|---:|---|---:|---:|---|
+| F1 α=0.5 (184 sidecars) | 256 | 4.25 | 0.1725 ± 0.0119 | 9.5367 | 2.2551 | baseline (`HIPFIRE_AWQ_F1_ONLY=1`) |
+| **F2 α=0.5 (248 sidecars)** | 256 | 4.25 | **0.1724 ± 0.0121** | **8.9116** | **2.1873** | F2 default whitelist |
+
+**Paired t-test on per-chunk metrics (F2 − F1, n=256):**
+
+| Metric | Paired Δ | 95% CI | t-stat | Significant? |
+|---|---:|---:|---:|---|
+| KLD | −0.00003 | ±0.00399 | −0.01 | ✗ noise (KLD flat) |
+| **NLL** | **−0.06780** | **±0.00997** | **−13.32** | ✓ p<10⁻³⁰ (F2 strictly better) |
+
+F2 improved NLL on **209/256 chunks (81.6%)** — near-monotonic per-chunk improvement. KLD per-chunk split 52/48 (noise drowns the signal). **PPL: 9.54 → 8.91, −6.56%.**
+
+**The KLD-PPL inversion is the headline.** AWQ improvements move probability mass favorably toward the true next token without changing the full-distribution divergence shape vs BF16. KLD averages over the full top-K so the mass-redistribution cancels; NLL (per-token surprise at the true label) captures it cleanly. **Going forward, paired-t on NLL is the primary AWQ-quality signal; KLD is secondary.** F1's earlier "lift = 2.3% on KLD" headline understated the true lever value because NLL wasn't measured alongside.
+
+**F2 alpha sweep (gfx906 / KV q8 / n=100, [0.35, 0.65] step 0.05):**
+
+| α | KLD | KLD CI | PPL | NLL paired-t vs α=0.50 |
+|---|---:|---:|---:|---:|
+| 0.35 | **0.1723** (best KLD) | ±0.018 | 10.09 | +0.104 t=+13.2 ★ (worse) |
+| 0.40 | 0.1731 | ±0.016 | 10.18 | +0.112 t=+15.8 ★ |
+| 0.45 | 0.1740 | ±0.018 | 10.13 | +0.107 t=+18.5 ★ |
+| 0.50 | 0.1751 | ±0.018 | 9.10 | (anchor) |
+| **0.55** | 0.1830 (worst KLD) | ±0.018 | **8.79** (best PPL) | **−0.034 t=−8.65 ★** |
+| 0.60 | 0.1796 | ±0.019 | 9.19 | +0.010 t=+1.75 |
+| 0.65 | 0.1795 | ±0.018 | 9.50 | +0.043 t=+6.06 ★ |
+
+**KLD-PPL inversion is severe.** α=0.55 is the *worst* alpha on KLD but the *best* on PPL, with NLL paired-t = −8.65 vs the α=0.50 anchor (highly significant). The α-that-minimizes-KLD (0.35) is the 5th-best on PPL. Six of seven non-anchor alphas show |t| > 6 on NLL paired-t — the lever is strong on PPL, weak on KLD.
+
+**Recommended ship config (subject to n=256 confirmation):**
+
+| Variant | Sidecars | KLD | PPL | Lift vs F1 α=0.5 baseline |
+|---|---:|---:|---:|---:|
+| F1 α=0.5 (baseline) | 184 | 0.1725 | 9.54 | — |
+| F2 α=0.5 | 248 | 0.1724 | 8.91 | **−6.6% PPL** |
+| **F2 α=0.55** (gfx906/q8 PPL optimum) | 248 | 0.1830 | **8.79** (n=100) | **−7.9% PPL** (subject to n=256) |
+
+**Plan §F2's "+3-7% reduction on top of F1" prediction was right in magnitude (measured +6.6 to +7.9% PPL), wrong in metric (predicted vs measured KLD ≈ 0).** Right lever, right impact range, wrong yardstick.
+
+**Methodological implication.** Section §6 rule list should add: "AWQ improvements are best measured by paired-t on per-chunk NLL, not KLD. The KLD-PPL inversion at AWQ-relevant alpha shifts is severe — KLD-only ranking will pick the wrong default."
+
+**Cross-arch open question.** gfx1100 F1 sweep (separate experiment) had α=0.5 winning at KLD on KV q8. With the new PPL-primary methodology, that finding needs re-measuring with NLL paired-t alongside. Expected: same KLD-PPL inversion shape; gfx1100 PPL optimum likely also above α=0.5. Followup sweep on gfx1100 next session.
+
+**Implementation review trail:**
+- Implementation: this branch (`feat/mq-v2-quant-format`), §F2 commit pending.
+- Critical self-review: `docs/plans/awq-f2-rev-claude.md` (identified `weight_gemv` un-AWQ'd dispatch path; fix landed in same commit before any user-visible corruption).
+- Quant-side env toggle: `HIPFIRE_AWQ_F1_ONLY=1` reproduces the F1 (184-sidecar) whitelist for A/B comparison without rebuilding.
+
+Working artifacts:
+- F1 vs F2 paired: `benchmarks/quality-baselines/results/2026-05-14-f1-vs-f2-n256-kvq8-9b-gfx906/{f1,f2}-a0_5.kldseq`
+- F2 alpha sweep: `benchmarks/quality-baselines/results/2026-05-14-f2-alpha-sweep-n100-kvq8-9b-gfx906/per-variant/a*/awq-a*.kldseq`
+
 ### 1.1c MQ4-Lloyd anchor (gfx1151, KV=q8, prefill, n=512)
 
 Source: gfx1151 agent 2026-05-13 PM. Default conv1d (MQ4G256, not Q8), default lm_head (MQ4G256). FWHT rotation on projections + Lloyd-Max codebook fit per 256-block instead of uniform grid.
@@ -233,10 +292,15 @@ Source: `benchmarks/quality-baselines/results/2026-05-10/per-seq/qwen3.5-9b.gguf
 | Hipfire q8f16 (Tier-3) | 8.50 | q8 | 0.0173 | (floor) | n=256 gfx1151 |
 | **Hipfire mq4-base** | 4.25 | q8 | _pending q8-KV measurement_ | ~0.25 est. | n=20 smoke: 0.318 → Δ 0.30 |
 | **Hipfire mq4-awq** | 4.25 | q8 | _pending q8-KV measurement_ | ~0.21 est. | extrapolation |
+| **Hipfire F1 α=0.5** (gfx906) | 4.25 | q8 | 0.1725 | **0.155** | n=256, gfx906 not gfx1100 — see arch caveat |
+| **Hipfire F2 α=0.5** (gfx906) | 4.25 | q8 | 0.1724 | **0.155** | KLD-flat vs F1; PPL −6.6% |
+| **Hipfire F2 α=0.55** (gfx906) | 4.25 | q8 | 0.1830 | 0.166 | n=100 sweep, PPL=8.79 (PPL optimum) |
 
 **Cross-engine gap (corrected, Δ-vs-Δ):** hipfire mq4-awq Δ ~0.21 vs llama.cpp UD-Q3_K_XL Δ 0.125 → **hipfire ~68% worse at matched bpw**, not the original master-doc claim of "~7% behind". The path-mismatched Δ in §1.1's original "Above-floor" column understated the gap by ~9× (because Tier-2 Q8 floor was 0.130 nats higher than the path-matched Tier-3 floor — that "extra" 0.130 was implicitly being credited to MQ4's quantizer cost when it was actually FP32-cast noise).
 
 **AWQ closure on the corrected Δ basis:** ~17% (vs the master-doc-original 30% which was inflated by the same path-mismatched floor subtraction). AWQ still helps, just less dramatically than the original framing suggested.
+
+**F2 on Δ-above-own-Q8 basis.** Hipfire F2 α=0.5 Δ = 0.155 (using gfx906 measurements, slightly different arch than the Tier-3 gfx1151 floor — caveat). PPL improvement is decoupled from this metric; F2's lift is more visible on PPL-paired-t (−6.6%, p<10⁻³⁰) than on Δ-above-own-Q8 (essentially zero movement). The Δ framework masks AWQ improvements that show up as mass-redistribution within an unchanged divergence envelope. **Δ-above-own-Q8 is the right metric for cross-engine quant-quality comparison; paired-t on NLL is the right metric for within-engine AWQ-config comparison.** Two different jobs.
 
 ---
 
@@ -514,6 +578,7 @@ SHA in the row's "Notes" field (e.g. "engine=PR#197@<sha>").
 - **2026-05-14 — Calibration-mismatch hypothesis FALSIFIED.** Hypothesis: GPTQ regresses on 0.8B-no-Q8conv1d because the Hessian was collected on a BF16 model (clean conv1d) while inference has MQ4-conv1d quant noise. Tested via `scripts/collect_hessian.py --inject-conv1d-mq4-noise` (commit `c4107fa2`): round-trip every linear_attn.conv1d weight through FWHT-256 + MQ4-quant-dequant before collecting Hessians, then re-quantize 0.8B mq4-awq-gptq. Result: KLD 0.356 vs BF16-H's 0.337 — slightly worse (+5.6%), not better. The activation-distribution mismatch is not the mechanism. Real explanation: GPTQ's column-sequential OBS update has high variance at small K (0.8B K_max=3584); empirical regularization (AWQ + Q8 conv1d) outperforms OBS at this scale. Re-validates Frantar's "scale matters" finding.
 - **2026-05-14 — 0.8B shipping recipe (RETRACTED): no recipe ships at 0.8B because 0.8B on hipfire is intrinsically incoherent regardless of quant precision.** Coherence-eyeball test across three variants on gfx906 (`mq4-kmd2-awq`, shipped `mq4-awq+Q8 conv1d` Stage A baseline, and the **Q8 floor** `q8f16-pr248`) all produce equivalent-quality babble at free generation. Confirmed independently on gfx1100 with `mq4-awq+Q8conv1d` (KLD 0.1366, PPL 19.61) and `mq4-awq+gptq+Q8conv1d-postfix` (KLD 0.0478, PPL 18.24) — both incoherent despite the dramatic prefill-metric gap. Since Q8 effectively-lossless weights also babble, the failure is below the quant layer: the ~0.5-nat DeltaNet pedestal at 0.8B (master doc §1.1) is depth × recurrence amplification of HF's bf16-cast pattern, not weight-quantization noise. **KLD/PPL on 0.8B remain valid for RANKING quant recipes against each other** (lower KLD = closer prefill-distribution match to HF reference); they just don't translate to generation coherence on a model whose baseline is broken. The "Stage A 0.8B winner" framing was misleading — there's no winner because the playing field is unusable. **9B is the only valid coherence-validation target for Stage A/B/C.** 9B's Tier-3 Q8 floor 0.0173 is 4.6× lower than 0.8B's; the 9B BF16 reference generates coherently in upstream engines, so the 9B GPTQ overnight (`/tmp/gptq_9b_overnight.sh`, post-OBS-fix) is the actual ship-decision experiment.
 - **2026-05-14 — KLD-vs-coherence inversion at 0.8B made the post-fix 0.0478 anchor diagnostic, not decisional.** The OBS-Cholesky bug fix (commit `687aa2d0`) dropped mq4-awq+gptq+Q8conv1d KLD from 0.1983 (broken) to 0.0478 (correct math) — a real 4× improvement in prefill-distribution match. But the absolute KLD value doesn't predict generation coherence at 0.8B because the BF16 reference itself is broken at that scale. Useful interpretation: 0.0478 confirms the fixed Cholesky math reaches its theoretical lower bound (the residual KLD is now dominated by 4-bit quant noise vs the original ~0.1 nat noise floor from the buggy OBS factor). Empirical-quality validation moves to 9B.
+- **2026-05-14/15 — F2 AWQ whitelist expansion: KLD-flat but PPL −6.6% with paired-t = −13.32 (p<10⁻³⁰).** F2 extended AWQ pre-scaling to output-side projections (o_proj/wo/out_proj/down_proj/w_down, sidecar count 184→248 on 9B). Paired n=256 q8-KV α=0.5 on gfx906: KLD Δ=−0.00003 (t=−0.01, noise), but NLL Δ=−0.0678 (t=−13.32, F2 strictly better on 209/256 chunks = 81.6%), PPL 9.54→8.91 (−6.6%). The lever is real and significant — KLD just doesn't see it because AWQ redistributes probability mass favorably toward the true next token without changing the full top-K divergence shape vs BF16. KLD averages over top-K; NLL captures per-token surprise at the true label. F2 alpha sweep n=100 q8-KV gfx906 [0.35–0.65 step 0.05] shows severe KLD-PPL inversion: α=0.55 is the WORST on KLD (0.183) but BEST on PPL (8.79), NLL paired-t = −8.65 vs α=0.50. The α that minimizes KLD (0.35) is 5th-best on PPL. **Methodological retroactive finding: F1's headline "lift = 2.3% on KLD" understated true F1 lever value because NLL was never measured. Going forward, paired-t on per-chunk NLL is the primary AWQ-quality signal; KLD is secondary.** F2 implementation includes critical self-review at `awq-f2-rev-claude.md` (caught `weight_gemv` un-AWQ'd dispatch path in post-implementation review; fix landed in same PR before any user-visible corruption). Recommend ship config: **F2 default whitelist, α=0.55 on gfx906/q8-KV** (subject to n=256 PPL-optimum confirmation + cross-arch gfx1100 sweep — both pending). Plan §F2 predicted "+3-7% reduction"; measured 6.6-7.9% PPL, right range, wrong metric. See §1.1h for the full table.
 
 ---
 
@@ -527,3 +592,4 @@ SHA in the row's "Notes" field (e.g. "engine=PR#197@<sha>").
 6. **Flag PRE-FIX (pre-2026-05-12 RoPE) rows explicitly** if they need to be cited; otherwise omit them.
 7. **Flag the Q8 kernel path** (Tier-2 batched / Tier-3 fused WMMA / future) in any q8f16 row. The Q8 floor is kernel-path-specific (structurally close but not bit-identical across paths); the Δ-framework requires consistent kernel path between numerator and denominator.
 8. **Absolute `KLD(engine || HF-bf16)` is reported for completeness but is NOT a cross-engine output-quality metric.** It measures similarity to HF's bf16-cast noise pattern, which favors engines with bf16-cast-like internal accumulators over arithmetically more precise engines. Use Δ-above-own-Q8 for any "engine A vs engine B" claim. See TL;DR + §2.4.1 + engine-drift memory.
+9. **For AWQ-config A/B comparisons (e.g. F1 vs F2, α-sweep, whitelist variations), report paired-t on per-chunk NLL alongside the KLD table.** AWQ improvements typically redistribute probability mass favorably toward true tokens without changing the full top-K divergence shape vs BF16, so they're under-measured by KLD. The F1 vs F2 A/B at α=0.5 (§1.1h) had KLD Δ ≈ 0 (t=−0.01) but NLL Δ = −0.068 (t=−13.32, p<10⁻³⁰) — a 6.6% PPL win invisible to KLD. The F2 alpha sweep showed severe KLD-PPL inversion: α=0.55 had the worst KLD AND the best PPL simultaneously. **KLD-only ranking will pick the wrong AWQ default.** Pair every AWQ-config row with NLL paired-t when the comparison is within-engine; reserve absolute KLD ranking for cross-format (MQ4 vs MQ6 vs Q8) comparisons where the per-channel distribution shape changes more than the mass-redistribution effect.
