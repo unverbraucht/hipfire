@@ -1,7 +1,7 @@
 # KLD Measurements — Master Table
 
 **Status:** Living document. Append new measurements; do not delete.
-**Last updated:** 2026-05-15 (F2 AWQ whitelist expansion + KLD/NLL methodology rule 9)
+**Last updated:** 2026-05-15 (F2 AWQ whitelist expansion + KLD/NLL methodology rule 9; mq4-kmd2-awq landed §1.1h: AWQ extension to K-map MQ6 tensors → −20.1% KLD vs kmd2 baseline at matched conditions)
 **Owner:** hipfire eval
 **Authoritative methodology:** [`issue-113-quant-quality-eval.md`](issue-113-quant-quality-eval.md)
 **Cross-engine framework:** Δ-above-own-Q8 (TL;DR + §2.4.1 + [engine-drift memory](../../memory/project_engine_drift_floor_decomposition.md)). Absolute `KLD(engine || HF-bf16)` is NOT a cross-engine output-quality metric — see §6 rule 8.
@@ -150,6 +150,38 @@ PPL 9.172 is **within 0.02% of the Tier-3 Q8 floor** (9.189) — indistinguishab
 **Cross-engine Δ-above-Tier3-Q8: 0.1613 − 0.0173 = 0.144** — vs llama.cpp Q4_K_M's Δ ≈ 0.109. Hipfire stack now within 1.32× of Q4_K_M, the smallest absolute-KLD gap to llama.cpp K-quants on any hipfire 4-5 bpw recipe to date.
 
 **Note on dispatch:** the same `--kmap-dense --kmap-mode 2` recipe was filed as [issue #249](https://github.com/Kaden-Schutt/hipfire/issues/249) on gfx1100, where the runtime forward pass produces NaN logits (silent corruption). This gfx1151 measurement implies the dispatch NaN is **gfx1100-specific** — the bug class (kernels not enumerating the mixed-format combo) may only trigger on the WMMA path active on gfx1100 but not on gfx1151's RDNA3.5 dispatch. Issue #249 should be re-scoped from "kmd2 produces NaN" to "kmd2 produces NaN on gfx1100 (works on gfx1151)" pending follow-up.
+
+### 1.1h AWQ + K-map mixed MQ4/MQ6 + Q8 conv1d (gfx1151, KV=asym3, prefill, n=256, 2026-05-15)
+
+Source: commit `0043e26c` ("feat(quantize): AWQ pre-scale K-map MQ6 promotions") — extends Stage A AWQ-on-MQ4 to the K-map-promoted MQ6 tensors. Recipe: `--format mq4 --kmap-dense --kmap-mode 2 --imatrix … --awq`, q8_conv1d_default ON (PR #251). Quantized models in `~/.hipfire/models/qwen3.5-9b.mq4-kmd2{,-awq}-2026-05-14`. **Both runs ran on the same fresh build** (cargo clean + `.hipfire_kernels/` nuke + daemon binary refresh — earlier KLD=0 / NaN cohort was a stale-binary artifact). Cohort artifacts: `benchmarks/quality-baselines/results/2026-05-14-awq-mq6-cohort-fresh/per-seq/`.
+
+| Variant | n | bpw (body / total) | KLD | mean NLL | PPL | Wall |
+|---|---:|---:|---:|---:|---:|---:|
+| mq4-kmd2 + Q8 conv1d (no AWQ) | 256 | 4.81 / 5.75 | **0.185940** | 2.2681 | 9.6611 | 3315 s @ 79 tok/s |
+| **mq4-kmd2-awq + Q8 conv1d** | 256 | 4.81 / 5.75 | **0.148480** | 2.2868 | 9.8435 | 3317 s @ 79 tok/s |
+| **Δ (AWQ − no-AWQ)** | | +0.001 (AWQ sidecars) | **−0.037460 (−20.1%)** | +0.019 | +0.183 (+1.9%) | identical |
+
+**Headline: AWQ extension to K-map-promoted MQ6 tensors drops KLD by 20.1%** at matched conditions (same code, same model files, only `--awq` differs). Per the K-map mode-2 typed rule, the AWQ sidecar count grew by 8 (v_proj on the 8 FA layers, previously skipped because the Promote6 arm in the quantizer didn't go through the AWQ pre-scale block — see §"the gap" in commit `0043e26c`). Edge-layer MQ6 tensors also receive AWQ; the post-projection paths (`o_proj`, `down_proj`) correctly skip AWQ per the `awq_eligible` whitelist.
+
+**KLD/PPL inversion (again, same as 1.1e.i and 1.1f).** AWQ on the kmd2 mix lifts KLD substantially (−20.1%) but regresses PPL +1.9%. AWQ tightens the full distribution match against HF but shifts the argmax token's probability slightly down. For long-context reasoning workloads where the tail mass matters, prefer AWQ + kmd2 + Q8 conv1d.
+
+**Cross-engine Δ-above-Tier3-Q8** (CAVEAT: Tier-3 Q8 floor in §1.1b is q8-KV; this row is asym3-KV, so the Δ here mixes weight-quant cost with KV-mode contribution. Per §4.1 asym3-KV adds ~0.04 nats vs q8-KV; the asym3-corrected Δ is approximate):
+
+| Recipe | KV | KLD | est. Δ-above-Tier3-Q8 |
+|---|:---:|---:|---:|
+| mq4 + Q8 conv1d (1.1, uniform 4-bit) | q8 | 0.2501 | 0.233 |
+| mq4-awq + Q8 conv1d (1.1f, AWQ on uniform MQ4) | q8 | 0.1842 | 0.167 |
+| mq4-kmd2 + Q8 conv1d (1.1g, kmd2 only) | q8 | 0.1613 | 0.144 |
+| **mq4-kmd2 (this row, no AWQ)** | asym3 | 0.186 | est. ~0.13 at q8-KV |
+| **mq4-kmd2-awq (this row)** | asym3 | **0.148** | **est. ~0.09 at q8-KV** |
+| mq6 + Q8 conv1d (uniform 6-bit) | q8 | 0.0510 | 0.034 |
+
+If the asym3→q8 KV-mode contribution holds at ~0.04 nats, mq4-kmd2-awq sits at est. ~0.108 q8-KV-equivalent — **a new best 9B sub-6-bpw recipe** beating both 1.1g (kmd2 alone, 0.1613) and 1.1f (AWQ on uniform MQ4, 0.1842). The two AWQ levers (per-channel pre-scaling) and bit allocation (kmd2 mode-2 typed) stack additively: each gives ~−20% KLD on its own, combined yields a measurable further drop. Confirmed via dispatch flow — `fused_rmsnorm_rotate_mq_awq` kernel handles the inverse divide regardless of whether the consuming gemm is MQ4 or MQ6 (key on `awq_scale.is_some()`, not dtype). Validation: ran on both gfx906 (user, AWQ-on-MQ4 coherent at commit `155c2a0b`) and gfx1100 (user, AWQ-on-MQ4-with-kmd2 coherent at commit `0043e26c`) and gfx1151 (this row, fresh build).
+
+**Follow-up gaps:**
+1. **Matched-KV re-measurement.** This row's asym3-KV vs §1.1g's q8-KV is a methodology mismatch. A clean q8-KV n=512 run on both mq4-kmd2 and mq4-kmd2-awq would put this row on the Pareto frontier next to 1.1g without the KV-mode caveat. ~3.5 h gfx1151 wall.
+2. **AWQ alpha sweep on kmd2 mix.** Per the F1 follow-up in `qwen35-mq4-quality-gap.md` §"open follow-ups", the default alpha=0.5 is Llama-tuned. The kmd2 mix has a different per-class scale distribution (some classes uniform MQ4, some MQ6); per-class alpha may give further KLD reduction. The +1.9% PPL regression at alpha=0.5 hints this is worth probing.
+3. **gfx1100 reproduction** at matched n=512 q8-KV would close the cross-arch validation loop and let this row drop directly into the Pareto frontier table in §1.1g.
 
 ### 1.1f AWQ + Q8 conv1d stack (gfx1100, KV=q8, prefill, 2026-05-14)
 
