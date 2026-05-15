@@ -52,6 +52,7 @@ kv_research/
 __pycache__/
 *.pyc
 .venv/
+.venv-*/
 
 # Logs / temp
 *.log
