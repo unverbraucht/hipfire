@@ -100,6 +100,14 @@ echo "    manifest: $MANIFEST_OUT"
 echo "    output:   $HFQ_OUT"
 echo
 
+# cargo lives in ~/.cargo/bin per rustup default; source the env so this
+# script works under bare bash (non-interactive shell, no .bashrc loaded).
+# Without this, the cargo invocation below fails with "command not found"
+# AFTER the multi-hour Stage 1 has already succeeded.
+if [[ -f "$HOME/.cargo/env" ]]; then
+    . "$HOME/.cargo/env"
+fi
+
 cargo build --release -p hipfire-quantize
 
 ./target/release/hipfire-quantize \
