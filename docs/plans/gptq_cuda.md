@@ -1,6 +1,6 @@
 # GPTQ on CUDA — handoff plan for the RTX 5070 Ti box
 
-**Status**: not started. Branch `feat/mq-v2-quant-format` at HEAD `b709375c`.
+**Status**: not started. Branch `feat/mq-v2-quant-format` at HEAD `1df2a24d`.
 Remote agent works on `feat/mq-v2-quant-format-cuda` branched from this HEAD;
 PR back when done.
 
@@ -13,6 +13,22 @@ Math must stay byte-faithful to the post-OBS-fix algorithm at commit
 `687aa2d0` (`fix(gptq): OBS propagation uses correct upper-Cholesky-of-H_inv`).
 That commit was a 2-week investigation that fixed a real correctness bug;
 do **not** regress it.
+
+**Anchor to beat** (commits `9ca8d900` + `1df2a24d`, F2 AWQ whitelist
+expansion + cross-arch alpha-sweep reproduction):
+
+| Config | sidecars | KLD | NLL | PPL |
+|---|---:|---:|---:|---:|
+| F1 α=0.5 (old anchor, superseded) | 184 | 0.1725 | 2.2551 | 9.54 |
+| **F2 α=0.55** (current ship default, gfx906 + gfx1151 confirmed) | 248 | 0.1830 | **2.1730** | **8.79** |
+
+**Acceptance metric: paired-t on per-chunk NLL, not KLD.** AWQ-class
+improvements redistribute probability mass toward the true next token
+without changing the top-K divergence shape vs BF16, so they're flat
+on KLD and strongly visible on NLL. F1→F2 at α=0.5: KLD Δ ≈ 0
+(t=−0.01) but NLL Δ = −0.0678 (t=**−13.32**, p<10⁻³⁰). KLD-only
+ranking would have shipped α=0.5 and missed the gain. See
+master-doc §6 rule 9.
 
 ## Hardware here
 
@@ -94,6 +110,9 @@ For each MQ4G256 weight `W: [M, K]` and its Hessian `H_unrot: [K, K]`:
 
 # 1. AWQ pre-scale (per imatrix; identity for non-AWQ-eligible tensors)
 #    s[j] = RMS_act[j] ** alpha   (NOT alpha/2 — see §4.1)
+#    Default alpha = 0.55 (gfx906 + gfx1151 PPL optimum, F2 whitelist).
+#    See `crates/hipfire-quantize/src/main.rs:awq_eligible` for the expanded
+#    F2 whitelist (248 sidecars on 9B: input + output projections).
 #    geo-mean normalize: s = s / exp(mean(log(s)))
 s = compute_awq_scales(in_sum2, alpha)        # length K, geo-mean = 1
 W_awq = W * s[None, :]                         # broadcast multiply
@@ -237,13 +256,16 @@ and per-tensor quality auditing.
      from `awq_scales.safetensors`, write as F16 sidecar (matches what
      the current Rust path does).
 
-9. **End-to-end run + KLD** (~2h)
-   - `python scripts/gptq_cuda.py --input <hf snapshot> --hessian
-     refs/qwen3.5-9b-bf16.hessian.bin --imatrix refs/qwen3.5-9b-bf16.imatrix.gguf
-     --output ~/.hipfire/gptq-precomputed/qwen3.5-9b-mq4-awq-gptq-q8conv/`
-   - `hipfire-quantize --precomputed-gptq-path ~/.hipfire/gptq-precomputed/qwen3.5-9b-mq4-awq-gptq-q8conv/
-     --output ~/.hipfire/models/qwen3.5-9b.mq4-awq-gptq-q8conv-cuda --format mq4`
-   - `eval_hipfire` at n=512 q8-KV. Compare against anchor 0.1842.
+9. **End-to-end run + NLL paired-t** (~2h)
+   - `python scripts/gptq_cuda.py --input <hf snapshot>
+     --hessian refs/qwen3.5-9b-bf16.hessian.bin
+     --imatrix refs/qwen3.5-9b-bf16.imatrix.gguf
+     --alpha 0.55
+     --output ~/.hipfire/gptq-precomputed/qwen3.5-9b-mq4-awq-gptq-q8conv-f2/`
+   - `hipfire-quantize --precomputed-gptq-path ~/.hipfire/gptq-precomputed/qwen3.5-9b-mq4-awq-gptq-q8conv-f2/
+     --output ~/.hipfire/models/qwen3.5-9b.mq4-awq-gptq-q8conv-f2-cuda --format mq4`
+   - `eval_hipfire` at n=512 q8-KV. Compare via NLL paired-t against
+     F2 α=0.55 anchor (KLD 0.1830 / NLL 2.1730 / PPL 8.79). See §5.2.
 
 ### Day 3-4 — buffer for parity debugging
 
@@ -342,24 +364,41 @@ document the choice.
 `non_blocking=True` + explicit `torch.cuda.Stream` per device.
 Synchronize only at end-of-tensor (when saving result back to CPU).
 
-### 4.9 AWQ whitelist (full list)
+### 4.9 AWQ whitelist (F2 expansion, full list)
 
-Apply AWQ pre-scaling ONLY to weights whose name ends with one of, or
+Apply AWQ pre-scaling to weights whose name ends with one of, or
 contains:
 
+**Input-side (F1, 184 sidecars):**
 ```
 q_proj.weight, k_proj.weight, v_proj.weight,
 qkv_proj.weight, wqkv.weight,
 gate_proj.weight, up_proj.weight, w_gate.weight, w_up.weight,
 gate_up_proj.weight,
 .in_proj_   (substring; covers in_proj_qkv, in_proj_a, in_proj_b, in_proj_z)
-mlp.gate.weight (the MoE router — separate from gate_proj)
-router.weight
+mlp.gate.weight, router.weight    (MoE router — two distinct patterns)
 ```
 
-Reference: `main.rs:2912-2960`. Non-eligible (e.g., `out_proj`,
-`down_proj`, `o_proj`, `wo`) get identity scales `s = [1.0; K]` —
-they STILL go through GPTQ, just without AWQ pre-scale.
+**Output-side (F2 addition, +64 → 248 sidecars on 9B):**
+```
+o_proj.weight, wo.weight,             (full-attention output projection)
+out_proj.weight,                       (linear-attention output projection)
+down_proj.weight, w_down.weight        (MLP down projection)
+```
+
+Reference: `main.rs:2912-2960` (F2 expansion in commit `9ca8d900`).
+Only embeddings, layer norms, lm_head, and conv1d weights stay out of
+AWQ — those go through GPTQ with identity scales `s = [1.0; K]`.
+
+**Runtime kernels for output-side AWQ are different from input-side.**
+Input-side: AWQ divide happens BEFORE the FWHT in
+`fused_rmsnorm_mq_rotate_awq`. Output-side: divide happens at different
+points in the activation flow, hence the F2-new kernels
+`rotate_x_mq_awq.hip` and `fused_silu_mul_mq_rotate_awq.hip`. This
+matters only for Rust runtime dispatch; **the quantize-time math is
+identical across whitelist entries** — multiply weight columns by
+`s = RMS_act^alpha`, geo-mean-normalized. Python doesn't need to know
+which kernel the runtime will use.
 
 ## 5. Validation
 
@@ -374,21 +413,38 @@ Steps:
 3. Compare on resulting `.hfq`:
    - Per-tensor weight bytes: `max|w_rust - w_python| / max|w_rust| < 1e-6` (FP64)
    - Per-tensor MSE(quant, original): match within 5%
-4. Run `eval_hipfire` n=512 q8-KV on both. **KLD bootstrap CIs must overlap**.
+4. Run `eval_hipfire` n=512 q8-KV on both. **Paired-t on per-chunk NLL
+   must be |t| < 2.0** (the two paths produce statistically
+   indistinguishable per-chunk NLL). KLD bootstrap CIs should also
+   overlap, but NLL paired-t is the load-bearing check — see master-doc
+   §6 rule 9 for why.
 
 The weight-diff threshold is the sanity gate (fail-loud on order-of-magnitude
-divergence). The KLD CI overlap is the actual acceptance.
+divergence). The NLL paired-t is the actual acceptance. KLD parity is
+informational.
 
 ### 5.2 9B end-to-end
 
-Run `eval_hipfire` n=512 q8-KV on the CUDA-path `.hfq`. Compare KLD
-against the AWQ-only anchor **0.1842** (master doc §1.1f).
+Run `eval_hipfire` n=512 q8-KV on the CUDA-path `.hfq`. Compare against
+the **F2 α=0.55 anchor** (master doc §1.1h/i):
 
-**Acceptance is a clean measurement**, not a win:
-- KLD < 0.1842 → Stage B is a win at 9B
-- KLD ≥ 0.1842 (within CI overlap) → Stage B is a wash at 9B; this is
-  the same outcome observed at 0.8B and is a legitimate publishable result
-- KLD ≫ 0.1842 OR gibberish output → math/handoff regression, debug
+| Anchor (no-GPTQ baseline) | KLD | NLL | PPL |
+|---|---:|---:|---:|
+| **F2 α=0.55 (current ship default)** | 0.1830 | 2.1730 | 8.79 |
+
+**Acceptance is a clean measurement**, not necessarily a win:
+- NLL paired-t < 0 with |t| > 3 (GPTQ-on-F2 strictly better per-chunk)
+  → Stage B is a win at 9B
+- |NLL paired-t| ≤ 3 (within noise) → Stage B is a wash at 9B
+  (consistent with 0.8B finding); legitimate publishable result
+- NLL paired-t > 0 with |t| > 3 (GPTQ-on-F2 strictly worse) → math/
+  handoff regression, debug
+- Any gibberish at chat decode → handoff regression, debug
+
+**Report both KLD and NLL paired-t**; do NOT lead with KLD because the
+KLD-PPL inversion at α=0.55 means KLD-only ranking can pick the wrong
+direction. Per master-doc §6 rule 9, paired-t on per-chunk NLL is
+primary; KLD is secondary informational.
 
 ### 5.3 Per-tensor MSE outlier check
 
@@ -417,6 +473,15 @@ indexing bug on that tensor's distribution.
 11. **Hessian sidecar format** — use `gptq-hessian-format.md` §3 as
     canonical, not any inline summary. Doc claims "~6 GB"; actual file
     is 33 GB on disk — file size wins.
+12. **NLL paired-t is the acceptance signal, not KLD** (master-doc §6
+    rule 9). At α≈0.55 the KLD-PPL inversion can flip the apparent
+    ranking. Always report both, lead with NLL paired-t.
+13. **eval_hipfire segfault-on-exit with F2 kernels** (`9ca8d900` known
+    issue on gfx1151): all three sweep evals on gfx1151 exited with
+    SIGSEGV AFTER writing the kldseq + slice-mean line. **Data is valid**
+    (verified per-chunk + paired-t). Suspected `Drop` ordering issue
+    with the new F2 AWQ-aware kernels in the dispatch table. Doesn't
+    block measurement; do not panic when you see it. Separate cleanup PR.
 
 ## 7. Ecosystem implications
 
@@ -445,8 +510,10 @@ When the CUDA path runs end-to-end + matches Rust on 0.8B parity test:
      the path bypasses GPTQ math entirely)
    - **Create** `scripts/gptq_9b_overnight.sh` (currently only at
      `/tmp/`; promote it and switch to the CUDA path)
-2. Update `docs/plans/kld-measurements-master.md` §1.1f with the 9B GPTQ
-   anchor (whether it beats 0.1842 or not, plus the per-tensor MSE table)
+2. Update `docs/plans/kld-measurements-master.md` with a new section
+   (§1.1j or similar) for the 9B GPTQ-on-F2 anchor — include KLD,
+   NLL paired-t vs F2 α=0.55, PPL, per-tensor MSE outlier list, and
+   the per-arch numbers if both gfx906 and gfx1151 are run
 3. Open PR from `feat/mq-v2-quant-format-cuda` into
    `feat/mq-v2-quant-format`
 4. Tag for review here
@@ -470,7 +537,10 @@ branches mid-flight.
 | **`687aa2d0`** | **The OBS-Cholesky FIX — `U^T·U = H_inv` math. CRITICAL.** |
 | `0ab8575a` | Per-tensor clamp counter for diagnostic |
 | `6e358a11` | TensorSpill path-uniqueness + write_hfq non-panicking error |
-| `b709375c` | (HEAD) CLAUDE.md note re: clean-rebuild reset for token-attractor garbage |
+| `589de2e5` | CLAUDE.md note re: clean-rebuild reset for token-attractor garbage |
+| **`9ca8d900`** | **F2 — AWQ on output-side projections. New runtime kernels (`rotate_x_mq_awq`, `fused_silu_mul_mq_rotate_awq`). Sidecar count 184→248. NLL paired-t vs KLD methodology change.** |
+| `0c7aaeed` | AWQ on K-map MQ4/MQ6 mix — −20.1% KLD vs kmd2 baseline on gfx1151 |
+| `1df2a24d` | (HEAD) F2 α-sweep reproduces on gfx1151 — α=0.55 sweet spot arch-portable |
 
 ## 10. What NOT to do
 
