@@ -1,7 +1,7 @@
 # KLD Measurements — Master Table
 
 **Status:** Living document. Append new measurements; do not delete.
-**Last updated:** 2026-05-15 (F2 AWQ whitelist expansion + KLD/NLL methodology rule 9; mq4-kmd2-awq landed §1.1h: AWQ extension to K-map MQ6 tensors → −20.1% KLD vs kmd2 baseline at matched conditions)
+**Last updated:** 2026-05-15 PM (F2 AWQ whitelist expansion + KLD/NLL methodology rule 9; mq4-kmd2-awq landed §1.1h: AWQ extension to K-map MQ6 tensors → −20.1% KLD vs kmd2 baseline at matched conditions; §1.1i F2 alpha-sweep reproduced on gfx1151: α=0.55 sweet spot is arch-portable, NLL paired-t = −8.48 vs gfx906's −8.65)
 **Owner:** hipfire eval
 **Authoritative methodology:** [`issue-113-quant-quality-eval.md`](issue-113-quant-quality-eval.md)
 **Cross-engine framework:** Δ-above-own-Q8 (TL;DR + §2.4.1 + [engine-drift memory](../../memory/project_engine_drift_floor_decomposition.md)). Absolute `KLD(engine || HF-bf16)` is NOT a cross-engine output-quality metric — see §6 rule 8.
@@ -262,6 +262,50 @@ F2 improved NLL on **209/256 chunks (81.6%)** — near-monotonic per-chunk impro
 Working artifacts:
 - F1 vs F2 paired: `benchmarks/quality-baselines/results/2026-05-14-f1-vs-f2-n256-kvq8-9b-gfx906/{f1,f2}-a0_5.kldseq`
 - F2 alpha sweep: `benchmarks/quality-baselines/results/2026-05-14-f2-alpha-sweep-n100-kvq8-9b-gfx906/per-variant/a*/awq-a*.kldseq`
+
+### 1.1i F2 cross-arch reproduction on gfx1151 (KV=q8, prefill, n=100, 2026-05-15)
+
+Source: tight 3-alpha sweep around the gfx906 sweet spot (§1.1h). Recipe: uniform MQ4+AWQ on 9B (no kmd2), q8 KV, prefill scoring, n=100 chunks — methodology byte-matched to §1.1h. Branch tip `0c7aaeed` (F2 code in `9ca8d900`). Quant slot reused per-alpha; eval per-variant. **All 248 sidecars confirmed in every quant**: F2 whitelist (input + output projections) is identical on gfx1151 because the quantizer path is arch-agnostic.
+
+| α | KLD (CI) | NLL (CI) | PPL | eval wall |
+|---|---:|---:|---:|---:|
+| 0.50 (anchor) | 0.1757 ± 0.018 | 2.2066 ± 0.049 | 9.085 | 1058 s @ 97 tok/s |
+| **0.55** | 0.1855 ± 0.019 (worst) | **2.1730 ± 0.048** (best) | **8.785** (best) | 1069 s |
+| 0.60 | 0.1807 ± 0.019 | 2.2161 ± 0.049 | 9.172 | 1077 s |
+
+**Paired-t (variant − α=0.50 anchor) on per-chunk metrics, n=100:**
+
+| Comparison | NLL Δ | NLL t-stat | KLD Δ | KLD t-stat |
+|---|---:|---:|---:|---:|
+| **α=0.55 vs α=0.50** | **−0.03361** | **−8.48 ★** | +0.00980 | +3.72 ★ (worse) |
+| α=0.60 vs α=0.50 | +0.00953 | +1.63 (n.s.) | +0.00506 | +1.91 (n.s.) |
+
+**The gfx906 finding reproduces on gfx1151 with near-zero drift.** Side-by-side:
+
+| α | gfx906 KLD | gfx1151 KLD | gfx906 PPL | gfx1151 PPL | gfx906 NLL t-stat | gfx1151 NLL t-stat |
+|---|---:|---:|---:|---:|---:|---:|
+| 0.50 | 0.1751 | 0.1757 (+0.4%) | 9.10 | 9.085 (−0.2%) | (anchor) | (anchor) |
+| **0.55** | 0.1830 (worst) | 0.1855 (worst) | **8.79** (best) | **8.785** (best) | **−8.65 ★** | **−8.48 ★** |
+| 0.60 | 0.1796 | 0.1807 (+0.6%) | 9.19 | 9.172 (−0.2%) | +1.75 n.s. | +1.63 n.s. |
+
+The shape is *identical*:
+1. **KLD-PPL inversion preserved.** α=0.55 has worst KLD AND best PPL/NLL on both archs.
+2. **NLL paired-t magnitude reproduces.** −8.65 (gfx906) vs −8.48 (gfx1151) — essentially the same effect size; t-statistics agree to 2% on a single dispatch-path change.
+3. **PPL gain reproduces.** α=0.50→0.55 drops PPL −3.41% on gfx906, −3.30% on gfx1151.
+4. **α=0.60 plateau reproduces.** Past the sweet spot, KLD recovers slightly but PPL/NLL flattens — neither arch shows further gain.
+
+**Methodology vindication.** §1.1h's "paired-t on NLL is the right metric" rule (§6 rule 9) holds cross-arch. KLD-only ranking would have picked α=0.50 on both archs and missed the −3.3% PPL gain. The lever is real and arch-portable; it just doesn't show in the metric we used to default to.
+
+**Strategic implication.** **α=0.55 is the recommended ship default on gfx11.x as well as gfx906.** No per-arch tuning needed for this lever. The AWQ pre-scale mechanism is doing the same thing on both INT8 dp4a (gfx906) and FP16 WMMA (gfx1151) dispatch paths — the underlying mass-redistribution toward the true next token is a property of the AWQ pre-scaled weights, not of the kernel that consumes them.
+
+**Cross-arch open question, now closed.** §1.1h's "gfx1100 followup sweep next session" is now answered for gfx1151 (RDNA3.5). gfx1100 (RDNA3) reproduction is the next step, but RDNA3 and RDNA3.5 share enough dispatch lineage that I'd expect the same shape there too.
+
+**Side note on eval_hipfire teardown:** all three sweep evals on gfx1151 exited with signal 11 (segfault) *after* writing the kldseq and the `slice-mean KLD` line. Data is valid (verified per-chunk reads + paired-t). Suspected: `Drop` ordering issue when the F2-new AWQ-aware kernels (`rotate_x_mq_awq`, `fused_silu_mul_mq_rotate_awq`) are in the dispatch table — gfx1151 path takes them, gfx906 path may not. Doesn't affect data correctness; should be a separate cleanup PR.
+
+Working artifacts:
+- Sweep results: `benchmarks/quality-baselines/results/2026-05-15-f2-alpha-sweep-gfx1151/per-variant/a*/awq-a*.kldseq`
+- Sweep script: `/tmp/sweep-gfx1151{,-resume}.sh` (resume variant tolerates teardown segfault)
+- Per-alpha eval logs in `…/per-variant/a*/eval.log` (all show clean `slice-mean KLD` line + buffered tokens, then segfault on exit)
 
 ### 1.1c MQ4-Lloyd anchor (gfx1151, KV=q8, prefill, n=512)
 
