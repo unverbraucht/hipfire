@@ -9,6 +9,7 @@
 mod gguf_input;
 mod gptq;
 mod hessian_io;
+mod precomputed_gptq;
 
 use memmap2::Mmap;
 use std::collections::HashMap;
@@ -92,6 +93,17 @@ static LM_HEAD_FORMAT: OnceLock<GgufFormat> = OnceLock::new();
 // would be MQ4-quantized but NOT AWQ-scaled — runtime would read them as
 // AWQ-scaled and corrupt logits (0.67 → 13.5 KLD blowup, master-doc §6 rule 5).
 static LM_HEAD_AWQ_ENABLED: OnceLock<bool> = OnceLock::new();
+
+// Phase A Stage B (CUDA precomputed) — when --precomputed-gptq-path is set,
+// the GPTQ math (AWQ-pre-scale + FWHT-rotate + Hessian/Cholesky + OBS) has
+// already happened on a CUDA box per `scripts/gptq_cuda.py`. Rust just
+// packs the MQ4G256 codewords using the manifest's frozen grids and emits
+// AWQ sidecars from the manifest's pre-computed scale vectors. Mutually
+// exclusive with --awq / --gptq / --imatrix (their work is folded in).
+//
+// `--precomputed-gptq-path <dir>` is what the CLI accepts; the parsed
+// manifest is stored here for the MQ4G256 branch to query.
+static PRECOMPUTED_GPTQ: OnceLock<precomputed_gptq::PrecomputedGptq> = OnceLock::new();
 
 // ─── Safetensors Parser ─────────────────────────────────────────────────────
 
@@ -3656,6 +3668,54 @@ fn main() {
     // Cache GPTQ tuning params for the MQ4G256 branch below.
     let gptq_initial_damp = gptq_damp;
     let gptq_max_damp_multiplier = gptq_max_damp;
+
+    // ── --precomputed-gptq-path <dir> ────────────────────────────────────
+    // Mutually exclusive with --awq / --gptq / --imatrix: the manifest at
+    // <dir> already carries AWQ-pre-scaled + FWHT-rotated + GPTQ-updated
+    // weights plus frozen grids plus the AWQ scale sidecars. The Rust
+    // quantize loop's MQ4G256 branch checks `PRECOMPUTED_GPTQ` first and
+    // takes a fast path: pack with the manifest's frozen grids, emit
+    // the AWQ scale sidecar from the manifest. See `docs/plans/gptq_cuda.md`.
+    let precomputed_gptq_path = args.iter().position(|a| a == "--precomputed-gptq-path")
+        .and_then(|i| args.get(i + 1))
+        .map(std::path::PathBuf::from);
+    if let Some(dir) = &precomputed_gptq_path {
+        // Mutual exclusion — fail loud, don't silently override.
+        let mut conflicts: Vec<&str> = Vec::new();
+        if awq_enabled { conflicts.push("--awq"); }
+        if IMATRIX.get().is_some() { conflicts.push("--imatrix"); }
+        if gptq_path.is_some() { conflicts.push("--gptq"); }
+        if !conflicts.is_empty() {
+            eprintln!(
+                "error: --precomputed-gptq-path is mutually exclusive with: {}\n\
+                 The manifest at {} already carries AWQ-pre-scaled + FWHT-rotated + GPTQ-updated\n\
+                 weights, AWQ scale sidecars, and frozen MQ4G256 grids. Re-running AWQ/GPTQ\n\
+                 logic on top would double-apply.",
+                conflicts.join(", "), dir.display(),
+            );
+            std::process::exit(1);
+        }
+        if !dir.is_dir() {
+            eprintln!("error: --precomputed-gptq-path {} is not a directory", dir.display());
+            std::process::exit(1);
+        }
+        let manifest = match precomputed_gptq::PrecomputedGptq::open(dir) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("error: failed to open precomputed-gptq manifest at {}: {e}", dir.display());
+                std::process::exit(1);
+            }
+        };
+        eprintln!(
+            "precomputed-gptq: ENABLED via {} (alpha={}, source={}, hessian={}, schema_v{})",
+            dir.display(),
+            manifest.meta.alpha,
+            manifest.meta.source_model_dir,
+            manifest.meta.hessian_path,
+            manifest.meta.schema_version,
+        );
+        PRECOMPUTED_GPTQ.set(manifest).map_err(|_| "PRECOMPUTED_GPTQ set twice").unwrap();
+    }
     // K-map gate: applies to MoE models by default. Dense models opt in
     // via --kmap-dense (the K-map dense PPL effect is mixed: regression at
     // short context, win at long context — see benchmarks/results/
@@ -4342,7 +4402,21 @@ fn main() {
         }
 
         if should_quantize(name) && n_elements >= 32 {
-            let f32_data = to_f32(raw_data, &meta.dtype);
+            // When --precomputed-gptq-path is active and the manifest carries
+            // this tensor, use the manifest's pre-baked bytes (post-AWQ-scale
+            // + post-FWHT-rotate + post-GPTQ-update for MQ4G256-eligible
+            // tensors; verbatim passthrough for everything else). The
+            // manifest is mutually exclusive with --awq / --gptq / --imatrix,
+            // so swapping the bytes here cleanly redirects the entire quant
+            // path without needing to touch the per-format branches.
+            let f32_data = if let Some(m) = PRECOMPUTED_GPTQ.get() {
+                match (m.weight_bf16(name), m.weight_meta(name)) {
+                    (Some(bytes), Some((dtype, _))) => to_f32(bytes, dtype),
+                    _ => to_f32(raw_data, &meta.dtype),
+                }
+            } else {
+                to_f32(raw_data, &meta.dtype)
+            };
             quantized_params += n_elements as u64;
 
             let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
@@ -4722,6 +4796,56 @@ fn main() {
                 if k_dim % 256 == 0 {
                     let signs1 = gen_fwht_signs(42, 256);
                     let signs2 = gen_fwht_signs(1042, 256);
+                    // Precomputed-GPTQ fast path: when --precomputed-gptq-path
+                    // is set and the manifest carries frozen grids for this
+                    // tensor, skip Rust-side AWQ pre-scale + FWHT rotate +
+                    // GPTQ math entirely — `f32_data` is already post-AWQ-
+                    // pre-scale + post-FWHT-rotate (loaded from the manifest
+                    // at the top of this loop), and we just pack 4-bit
+                    // codewords against the manifest's frozen per-256-block
+                    // grids. AWQ sidecar bytes come straight from the
+                    // manifest. See `docs/plans/gptq_cuda.md` §1.2.
+                    if let Some(m) = PRECOMPUTED_GPTQ.get() {
+                        if let Some(grids) = m.frozen_grids(name) {
+                            // Promote weights to FP64 for `pack_mq4g256_from_rotated_f64`
+                            // (the Rust packer expects FP64; the manifest is
+                            // BF16, which we upcast lossily via to_f32 above —
+                            // BF16 ulp at typical post-rotated magnitudes is
+                            // ~3e-4, well below scale/2 ~ 8e-3, so re-quant
+                            // doesn't shift the int4 code).
+                            let weights_f64: Vec<f64> = f32_data.iter().map(|&v| v as f64).collect();
+                            let q = gptq::pack_mq4g256_from_rotated_f64(&weights_f64, &grids);
+                            // AWQ sidecar — F16 bytes go straight through.
+                            // The runtime emit-sidecar block looks for
+                            // `awq_sidecar_scales` as Vec<f32>; convert from
+                            // F16 → F32 once here so the existing
+                            // `awq_scales_to_f16_bytes` doesn't need a second
+                            // F16→F32→F16 round-trip. The runtime kernel sees
+                            // F16 bytes anyway, so no precision loss.
+                            if m.has_awq_scale(name) {
+                                if let Some(scale_bytes) = m.awq_scale_f16_bytes(name) {
+                                    let scales_f32: Vec<f32> = scale_bytes
+                                        .chunks_exact(2)
+                                        .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                                        .collect();
+                                    awq_sidecar_scales = Some(scales_f32);
+                                }
+                            }
+                            (q, QuantType::MQ4G256, 256u32, "MQ4G256")
+                        } else {
+                            // Manifest doesn't have grids for this tensor —
+                            // would be a manifest gap. Fail loud so the
+                            // operator notices.
+                            eprintln!(
+                                "warning: --precomputed-gptq-path: tensor {name} missing frozen_grids \
+                                in manifest. Falling back to plain MQ4 pack on the manifest's f32_data \
+                                (which is unrotated for passthrough tensors → result will diverge from a \
+                                regular --awq --gptq run for THIS tensor)."
+                            );
+                            (quantize_mq4g256(&f32_data, &signs1, &signs2),
+                             QuantType::MQ4G256, 256u32, "MQ4G256")
+                        }
+                    } else
                     // Phase A Stage A — AWQ pre-scaling, when --awq is enabled
                     // AND we have imatrix data for this tensor AND the tensor
                     // is on the AWQ whitelist (see `awq_eligible`). Mutates a
@@ -4746,6 +4870,7 @@ fn main() {
                     // tensors (o_proj/out_proj/down_proj per the whitelist),
                     // pass identity scales — Stage B widens GPTQ coverage to
                     // all MQ4G256 tensors per GLM5 M5.
+                    {
                     let m_dim = meta.shape[0];
                     // Step 1: AWQ pre-scaling (if eligible + enabled).
                     let (working_weights, awq_scales_for_pipeline_f64) =
@@ -4816,6 +4941,7 @@ fn main() {
                         quantize_mq4g256(&working_weights, &signs1, &signs2)
                     };
                     (q, QuantType::MQ4G256, 256u32, "MQ4G256")
+                    }  // closes the `else` arm added for the precomputed-gptq guard above
                 } else {
                     // Fallback to standard HFQ4-G128 for non-256-aligned
                     let q = quantize_hfq4g128(&f32_data);
