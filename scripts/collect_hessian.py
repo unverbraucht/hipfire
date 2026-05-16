@@ -416,7 +416,25 @@ def collect_one_pass(
     with torch.no_grad():
         for i, seq in enumerate(seqs):
             seq = seq.unsqueeze(0).to(device)
-            model(seq)
+            # `logits_to_keep=1` (renamed from `num_logits_to_keep` in
+            # transformers ≥4.50) makes lm_head only project the LAST
+            # token, not all `ctx_len` positions. For 27B with
+            # vocab=248320 + ctx=2048, full logits = ~1 GB BF16 — and
+            # that allocation lands on whichever device lm_head sits
+            # on (typically cuda:0 under device_map="auto"), which
+            # may already be near its --max-gpu-mem cap. The Hessian
+            # collector doesn't use logits at all; only the hooks on
+            # the GPTQ-target Linear layers (which fire before lm_head)
+            # contribute to the accumulators.
+            try:
+                model(seq, logits_to_keep=1)
+            except TypeError:
+                # Older transformers: use num_logits_to_keep
+                try:
+                    model(seq, num_logits_to_keep=1)
+                except TypeError:
+                    # Even older: just run full forward (works for <27B)
+                    model(seq)
             if (i + 1) % 8 == 0:
                 elapsed = time.time() - t0
                 rate = (i + 1) / elapsed
