@@ -52,7 +52,7 @@
 # Example invocation:
 #   scripts/quant_cohort.sh \
 #     phase-a-step-0-baselines \
-#     /home/kread/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots/SNAP \
+#     ~/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots/SNAP \
 #     /tmp/cohort_baselines.tsv \
 #     --kldref benchmarks/quality-baselines/refs/qwen3.5-9b-bf16.kldref.bin \
 #     --max-chunks 256
@@ -61,13 +61,21 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-if [ $# -lt 3 ]; then
+usage() {
     echo "usage: $0 <cohort-label> <bf16-ref-dir-or-file> <variant-spec.tsv> [flags...]"
     echo
     echo "variant-spec.tsv format (TAB-separated):"
     echo "  <variant-name>\t<hfq-path>\t<arch>"
     echo
     echo "Optional flags: --kldref PATH, --max-chunks N, --kv-mode MODE, --scoring-mode MODE"
+}
+
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+    usage
+    exit 0
+fi
+if [ $# -lt 3 ]; then
+    usage
     exit 2
 fi
 

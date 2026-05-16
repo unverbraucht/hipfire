@@ -4,10 +4,23 @@
 The previous version had a buggy vectorized FWHT (reshape misinterpreted pair indices
 at stride > 1). This uses the slow but correct reference loop.
 """
+import argparse
 import json
+import math
 import struct
+from pathlib import Path
 
 import numpy as np
+
+
+DEFAULT_TARGETS = [
+    "model.language_model.embed_tokens.weight",
+    "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+    "model.language_model.layers.0.linear_attn.out_proj.weight",
+    "model.language_model.layers.0.mlp.gate.weight",
+    "model.language_model.layers.0.mlp.shared_expert.gate_proj.weight",
+    "model.visual.merger.linear_fc1.weight",
+]
 
 
 def gen_fwht_signs(seed, n=256):
@@ -97,97 +110,144 @@ def bf16_array(raw, n):
     return (u16 << 16).astype(np.uint32).view(np.float32)
 
 
-def main():
-    import os
-    snap = "/home/kread/.cache/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B/snapshots/995ad96eacd98c81ed38be0c5b274b04031597b0"
-    path = os.path.join(snap, "model-00001-of-00026.safetensors")
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Compare approximate MQ4 and Q4_K reconstruction MSE for selected BF16/F16 safetensors."
+    )
+    parser.add_argument(
+        "source",
+        help="Safetensors shard or directory containing *.safetensors shards.",
+    )
+    parser.add_argument(
+        "targets",
+        nargs="*",
+        help="Tensor names to analyze. Defaults to a small Qwen3.6-A3B probe set.",
+    )
+    return parser.parse_args()
 
-    with open(path, "rb") as f:
+
+def safetensor_files(source):
+    path = Path(source).expanduser()
+    if path.is_file():
+        return [path]
+    if path.is_dir():
+        files = sorted(path.glob("*.safetensors"))
+        if files:
+            return files
+        raise SystemExit(f"error: no *.safetensors files found in {path}")
+    raise SystemExit(f"error: safetensors source not found: {path}")
+
+
+def read_header(path):
+    with path.open("rb") as f:
         header_size = struct.unpack("<Q", f.read(8))[0]
         header = json.loads(f.read(header_size).decode("utf-8"))
-        body_offset = 8 + header_size
+    return header, 8 + header_size
 
-        signs1 = gen_fwht_signs(42)
-        signs2 = gen_fwht_signs(1042)
 
-        # First sanity-check: fast FWHT matches reference and is orthonormal
-        rng = np.random.default_rng(0)
-        x_test = rng.normal(0, 0.02, size=(4, 256)).astype(np.float32)
-        y_ref = fwht_256_correct(x_test, signs1, signs2)
-        y_fast = fwht_256_fast(x_test, signs1, signs2)
-        norm_ref = np.linalg.norm(y_ref - x_test)
-        diff = np.linalg.norm(y_ref - y_fast)
-        norm_preserve = abs((y_ref**2).sum() - (x_test**2).sum())
-        print(f"FWHT sanity:")
-        print(f"  ||fast - ref|| = {diff:.6e}")
-        print(f"  ||y_ref||² - ||x||² = {norm_preserve:.6e}  (should be ~0)")
-        if diff > 1e-5:
-            print("FAST FWHT IS WRONG, using slow reference")
-            fwht = fwht_256_correct
-        else:
-            print("Fast FWHT validated, using it")
-            fwht = fwht_256_fast
-        print()
+def find_tensor(shards, name):
+    for path in shards:
+        header, body_offset = read_header(path)
+        if name in header:
+            return path, header[name], body_offset
+    return None
 
-        targets = [
-            "model.language_model.embed_tokens.weight",
-            "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
-            "model.language_model.layers.0.linear_attn.out_proj.weight",
-            "model.language_model.layers.0.mlp.gate.weight",  # router (small)
-            "model.language_model.layers.0.mlp.shared_expert.gate_proj.weight",
-            "model.visual.merger.linear_fc1.weight",
-        ]
 
-        print(f"{'tensor':<60} {'shape':<14} "
-              f"{'mq4 mse':>11} {'q40 mse':>11} {'q4k mse':>11} "
-              f"{'mq4/q40':>9} {'mq4/q4k':>9}")
-        print("-" * 145)
+def read_tensor(path, info, body_offset):
+    shape = info["shape"]
+    dtype = info["dtype"]
+    doff = info["data_offsets"]
+    n_elem = math.prod(shape)
+    byte_count = doff[1] - doff[0]
+    with path.open("rb") as f:
+        f.seek(body_offset + doff[0])
+        raw = f.read(byte_count)
+    if dtype == "F16":
+        return f16_array(raw, n_elem)
+    if dtype == "BF16":
+        return bf16_array(raw, n_elem)
+    raise ValueError(f"unsupported dtype {dtype!r}")
 
-        for name in targets:
-            if name not in header:
-                print(f"  (missing: {name})")
-                continue
-            info = header[name]
-            shape = info["shape"]
-            dtype = info["dtype"]
-            doff = info["data_offsets"]
-            n_elem = shape[0] * shape[1]
-            f.seek(body_offset + doff[0])
-            raw = f.read(2 * n_elem)
-            arr = f16_array(raw, n_elem) if dtype == "F16" else bf16_array(raw, n_elem)
 
-            if shape[1] % 256 != 0:
-                print(f"  (skipping non-256-aligned: {name} shape {shape})")
-                continue
+def validate_fwht():
+    signs1 = gen_fwht_signs(42)
+    signs2 = gen_fwht_signs(1042)
 
-            n_blocks = n_elem // 256
-            arr = arr[: n_blocks * 256].reshape(n_blocks, 256)
+    rng = np.random.default_rng(0)
+    x_test = rng.normal(0, 0.02, size=(4, 256)).astype(np.float32)
+    y_ref = fwht_256_correct(x_test, signs1, signs2)
+    y_fast = fwht_256_fast(x_test, signs1, signs2)
+    diff = np.linalg.norm(y_ref - y_fast)
+    norm_preserve = abs((y_ref**2).sum() - (x_test**2).sum())
+    print("FWHT sanity:")
+    print(f"  ||fast - ref|| = {diff:.6e}")
+    print(f"  ||y_ref||² - ||x||² = {norm_preserve:.6e}  (should be ~0)")
+    if diff > 1e-5:
+        print("FAST FWHT IS WRONG, using slow reference")
+        fwht = fwht_256_correct
+    else:
+        print("Fast FWHT validated, using it")
+        fwht = fwht_256_fast
+    print()
+    return fwht, signs1, signs2
 
-            # Subsample for speed
-            if n_blocks > 4096:
-                idx = np.linspace(0, n_blocks - 1, 4096, dtype=int)
-                arr = arr[idx]
-                n_blocks = arr.shape[0]
 
-            # MQ4: rotate, quantize, inverse-rotate. The inverse FWHT is the same
-            # operation with signs1 and signs2 swapped (per kernels/turbo_common.h:57).
-            rot = fwht(arr, signs1, signs2)
-            rot_q = quant_uniform_4bit(rot)
-            rec = fwht(rot_q, signs2, signs1)
-            mq4_mse = float(((arr - rec) ** 2).mean())
+def main():
+    args = parse_args()
+    shards = safetensor_files(args.source)
+    targets = args.targets or DEFAULT_TARGETS
+    fwht, signs1, signs2 = validate_fwht()
 
-            # Q4_0 (per-32 sub-block, single scale, no rotation)
-            q40 = quant_per_32(arr)
-            q40_mse = float(((arr - q40) ** 2).mean())
+    print(f"{'tensor':<60} {'shape':<14} "
+          f"{'mq4 mse':>11} {'q40 mse':>11} {'q4k mse':>11} "
+          f"{'mq4/q40':>9} {'mq4/q4k':>9}")
+    print("-" * 145)
 
-            # Q4_K-like (also per-32 here as upper bound; real Q4_K is similar but with
-            # quantized 6-bit scales-of-scales that cost ~0.05 dB)
-            q4k_mse = q40_mse  # same in this approximation
+    for name in targets:
+        found = find_tensor(shards, name)
+        if found is None:
+            print(f"  (missing: {name})")
+            continue
 
-            shape_str = f"{shape[0]}x{shape[1]}"
-            print(f"{name[:60]:<60} {shape_str:<14} "
-                  f"{mq4_mse:>11.4e} {q40_mse:>11.4e} {q4k_mse:>11.4e} "
-                  f"{mq4_mse/q40_mse:>8.2f}x {mq4_mse/q4k_mse:>8.2f}x")
+        path, info, body_offset = found
+        shape = info["shape"]
+        if len(shape) < 2 or shape[-1] % 256 != 0:
+            print(f"  (skipping non-256-aligned: {name} shape {shape})")
+            continue
+
+        try:
+            arr = read_tensor(path, info, body_offset)
+        except ValueError as exc:
+            print(f"  (skipping: {name}: {exc})")
+            continue
+
+        n_blocks = arr.size // 256
+        arr = arr[: n_blocks * 256].reshape(n_blocks, 256)
+
+        # Subsample for speed.
+        if n_blocks > 4096:
+            idx = np.linspace(0, n_blocks - 1, 4096, dtype=int)
+            arr = arr[idx]
+
+        # MQ4: rotate, quantize, inverse-rotate. The inverse FWHT is the same
+        # operation with signs1 and signs2 swapped (per kernels/turbo_common.h:57).
+        rot = fwht(arr, signs1, signs2)
+        rot_q = quant_uniform_4bit(rot)
+        rec = fwht(rot_q, signs2, signs1)
+        mq4_mse = float(((arr - rec) ** 2).mean())
+
+        # Q4_0 (per-32 sub-block, single scale, no rotation)
+        q40 = quant_per_32(arr)
+        q40_mse = float(((arr - q40) ** 2).mean())
+
+        # Q4_K-like (also per-32 here as upper bound; real Q4_K is similar but with
+        # quantized 6-bit scales-of-scales that cost ~0.05 dB)
+        q4k_mse = q40_mse
+
+        shape_str = "x".join(str(dim) for dim in shape)
+        print(f"{name[:60]:<60} {shape_str:<14} "
+              f"{mq4_mse:>11.4e} {q40_mse:>11.4e} {q4k_mse:>11.4e} "
+              f"{mq4_mse/q40_mse:>8.2f}x {mq4_mse/q4k_mse:>8.2f}x")
 
 
 if __name__ == "__main__":

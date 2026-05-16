@@ -8,7 +8,7 @@
 # for the planned wiring.
 #
 # Usage:
-#   scripts/bench_quant_quality.sh <safetensors_dir> <model.hfq> [out.md]
+#   scripts/bench_quant_quality.sh <safetensors_dir_or_file> <model.hfq> [out.md]
 #
 # Example:
 #   scripts/bench_quant_quality.sh \
@@ -30,8 +30,16 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+usage() {
+    echo "usage: $0 <safetensors_dir_or_file> <model.hfq> [out.md]"
+}
+
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+    usage
+    exit 0
+fi
 if [ $# -lt 2 ]; then
-    echo "usage: $0 <safetensors_dir> <model.hfq> [out.md]"
+    usage
     exit 2
 fi
 
@@ -47,6 +55,60 @@ if [ ! -e "$HFQ_PATH" ]; then
     echo "error: hfq file not found: $HFQ_PATH"
     exit 1
 fi
+
+wait_for_model_ready() {
+    local hfq_path="$1"; local timeout="${2:-120}"
+    local want; want=$(basename "$hfq_path")
+    local start; start=$(date +%s)
+    local tmp; tmp=$(mktemp)
+    while [ $(( $(date +%s) - start )) -lt "$timeout" ]; do
+        if curl -sS --max-time 3 -o "$tmp" http://127.0.0.1:8080/v1/models 2>/dev/null; then
+            if python3 - "$tmp" "$want" <<'PY' 2>/dev/null; then
+import json
+import sys
+
+path, want = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as f:
+        payload = json.load(f)
+except Exception:
+    sys.exit(1)
+sys.exit(0 if any(m.get("id", "").endswith(want) for m in payload.get("data", [])) else 1)
+PY
+                rm -f "$tmp"; return 0
+            fi
+        fi
+        sleep 2
+    done
+    rm -f "$tmp"; return 1
+}
+
+model_id_for_path() {
+    local hfq_path="$1"
+    local want; want=$(basename "$hfq_path")
+    local tmp; tmp=$(mktemp)
+    if ! curl -sS --max-time 3 -o "$tmp" http://127.0.0.1:8080/v1/models 2>/dev/null; then
+        rm -f "$tmp"
+        return 0
+    fi
+    python3 - "$tmp" "$want" <<'PY' | head -1
+import json
+import sys
+
+path, want = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as f:
+        models = json.load(f).get("data", [])
+except Exception:
+    models = []
+for model in models:
+    model_id = model.get("id", "")
+    if model_id.endswith(want):
+        print(model_id)
+        break
+PY
+    rm -f "$tmp"
+}
 
 mkdir -p "$(dirname "$OUT")"
 
@@ -100,20 +162,15 @@ else
     # Phase 1: default mode (rmsnorm fix active)
     hipfire stop 2>&1 | head -1 || true
     sleep 2
-    hipfire serve 8080 -d 2>&1 | tail -2
-
-    until tail -1 ~/.hipfire/serve.log 2>/dev/null | grep -q "warm-up complete"; do
-        sleep 5
-        if ! pgrep -af "examples/daemon" >/dev/null; then
-            echo "  daemon failed to start"
-            break
-        fi
-    done
+    HIPFIRE_MODEL="$HFQ_PATH" hipfire serve 8080 -d 2>&1 | tail -2
+    if ! wait_for_model_ready "$HFQ_PATH" 300; then
+        echo "  daemon failed to list requested model: $(basename "$HFQ_PATH")" | tee -a "$OUT"
+        hipfire stop 2>&1 | head -1 || true
+        exit 1
+    fi
 
     # Find the model id (it should be the basename of the hfq)
-    MODEL_ID=$(curl -sS http://127.0.0.1:8080/v1/models 2>/dev/null \
-        | python3 -c "import sys,json; ms=json.load(sys.stdin)['data']; n='$(basename "$HFQ_PATH")'; [print(m['id']) for m in ms if m['id'].endswith(n)]" \
-        | head -1)
+    MODEL_ID=$(model_id_for_path "$HFQ_PATH")
     if [ -z "$MODEL_ID" ]; then
         # Fallback: assume basename
         MODEL_ID="$(basename "$HFQ_PATH")"
@@ -166,15 +223,16 @@ except Exception as e:
     # Phase 2: workaround mode
     hipfire stop 2>&1 | head -1 || true
     sleep 2
-    HIPFIRE_QWEN_MOE_FINAL_NORM_RAW=1 hipfire serve 8080 -d 2>&1 | tail -2
-
-    until tail -1 ~/.hipfire/serve.log 2>/dev/null | grep -q "warm-up complete"; do
-        sleep 5
-        if ! pgrep -af "examples/daemon" >/dev/null; then
-            echo "  daemon failed to start (phase 2)"
-            break
-        fi
-    done
+    HIPFIRE_MODEL="$HFQ_PATH" HIPFIRE_QWEN_MOE_FINAL_NORM_RAW=1 hipfire serve 8080 -d 2>&1 | tail -2
+    if ! wait_for_model_ready "$HFQ_PATH" 300; then
+        echo "  daemon failed to list requested model in workaround mode: $(basename "$HFQ_PATH")" | tee -a "$OUT"
+        hipfire stop 2>&1 | head -1 || true
+        exit 1
+    fi
+    MODEL_ID=$(model_id_for_path "$HFQ_PATH")
+    if [ -z "$MODEL_ID" ]; then
+        MODEL_ID="$(basename "$HFQ_PATH")"
+    fi
 
     {
         echo
