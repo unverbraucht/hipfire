@@ -653,6 +653,18 @@ def main():
     ap.add_argument("--dtype", default="bfloat16",
                     choices=["bfloat16", "float16", "float32"],
                     help="Model dtype (default bfloat16).")
+    ap.add_argument("--max-gpu-mem", type=str, default=None,
+                    help="Per-GPU memory cap for HF's device_map='auto' (e.g. "
+                         "'14GiB'). Required for 27B-class models on the "
+                         "dual-16-GB-GPU box: without it, 'auto' tries to pack "
+                         "the full 54 GB model into 32 GB total VRAM and OOMs "
+                         "during _init_weights' FP32 cast. Leave unset for "
+                         "≤9B models that fit comfortably on the GPUs.")
+    ap.add_argument("--max-cpu-mem", type=str, default=None,
+                    help="CPU memory cap for HF's device_map='auto' (e.g. "
+                         "'60GiB'). Defaults to 60GiB when --max-gpu-mem is "
+                         "set. Includes CPU RAM + disk-backed offload "
+                         "(safetensors mmap), so can exceed system RAM.")
     ap.add_argument("--accumulator-dir", type=Path, default=None,
                     help="If set, each per-tensor Hessian is backed by a "
                          "memmap file under this directory rather than held "
@@ -710,17 +722,47 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=False)
     # device_map="auto" → HF/accelerate uses meta tensors, skipping the
     # random-init step that would otherwise allocate the full model in
-    # GPU memory before safetensors weights replace them. Critical for
-    # 9B on 20 GB VRAM where the init buffer alone exceeds capacity.
-    # Offloads layers that don't fit to CPU automatically.
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model,
-        dtype=dtype,
-        device_map="auto" if args.device == "cuda" else None,
-        low_cpu_mem_usage=True,
-        trust_remote_code=False,
-    )
-    if args.device != "cuda":
+    # GPU memory before safetensors weights replace them.
+    #
+    # For 27B-class models on this dual-16-GB-GPU box, "auto" without
+    # an explicit max_memory cap tries to pack the full model onto
+    # GPUs (54 GB BF16 → spills past 32 GB total VRAM) and OOMs during
+    # _init_weights' FP32 cast (`init.normal_(module.weight.float())`).
+    # The --max-gpu-mem flag caps per-GPU usage so the remainder lands
+    # on CPU/disk. Setting to e.g. "14GiB" leaves ~2 GB headroom per
+    # card for activations + KV cache during the forward pass.
+    if args.device == "cuda":
+        if args.max_gpu_mem is not None:
+            # Build a per-device max_memory dict. accelerate accepts
+            # GPU indices as either int or str; we use int for clarity.
+            n_gpus = torch.cuda.device_count()
+            max_memory = {i: args.max_gpu_mem for i in range(n_gpus)}
+            max_memory["cpu"] = args.max_cpu_mem or "60GiB"
+            print(f"      max_memory: {max_memory}")
+            model = AutoModelForCausalLM.from_pretrained(
+                args.model,
+                dtype=dtype,
+                device_map="auto",
+                max_memory=max_memory,
+                low_cpu_mem_usage=True,
+                trust_remote_code=False,
+            )
+        else:
+            model = AutoModelForCausalLM.from_pretrained(
+                args.model,
+                dtype=dtype,
+                device_map="auto",
+                low_cpu_mem_usage=True,
+                trust_remote_code=False,
+            )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model,
+            dtype=dtype,
+            device_map=None,
+            low_cpu_mem_usage=True,
+            trust_remote_code=False,
+        )
         model = model.to(args.device)
     model.eval()
     print(f"      loaded in {time.time() - t0:.1f}s")
