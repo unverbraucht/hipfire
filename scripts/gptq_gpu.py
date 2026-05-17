@@ -43,6 +43,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sys
 import time
 from dataclasses import dataclass
@@ -195,6 +196,119 @@ def md5_first_1mb(path: Path) -> str:
 
 # ─── Orchestrator ─────────────────────────────────────────────────────────
 
+def _start_watchdog(timeout_sec: int, last_progress: dict) -> None:
+    """Daemon thread that SIGKILLs self if no `last_progress["ts"]` update
+    happens within `timeout_sec` seconds.
+
+    Why SIGKILL: when a CUDA kernel hangs (e.g. cuSOLVER pathological
+    case on sm_120 we hit 2026-05-17), Python's main thread is blocked
+    in `cudaStreamSynchronize` and ignores SIGTERM. SIGKILL is the only
+    reliable way out. Recovery is via `--resume <dir>` on the next
+    invocation, which picks up from the most recent checkpoint.
+    """
+    import threading, os, signal
+
+    def _loop():
+        while True:
+            time.sleep(30)
+            stalled_for = time.time() - last_progress["ts"]
+            if stalled_for > timeout_sec:
+                msg = (f"\n[watchdog] no per-tensor progress for "
+                       f"{stalled_for:.0f}s > timeout {timeout_sec}s — "
+                       f"SIGKILL'ing PID {os.getpid()}. "
+                       f"Resume with `--resume <output_dir>`.\n")
+                print(msg, file=sys.stderr)
+                sys.stderr.flush()
+                os.kill(os.getpid(), signal.SIGKILL)
+
+    t = threading.Thread(target=_loop, daemon=True, name="gptq-watchdog")
+    t.start()
+
+
+def _load_resume(
+    output_dir: Path, verbose: bool
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], dict[str, torch.Tensor], set[str]]:
+    """Load any existing partial manifest at `output_dir`.
+
+    Returns (weights, awq_scales, frozen_grids, set_of_done_names).
+    `set_of_done_names` is the set of weight tensor names present in
+    `weights.safetensors` — these are skipped on the resumed run.
+
+    All four files (weights, awq_scales, frozen_grids, manifest.json)
+    are read best-effort: if any is corrupt or missing, we fall back to
+    treating the corresponding piece as empty. A killed process during
+    a checkpoint write may leave a truncated safetensors that fails to
+    open — `_checkpoint_partial` writes to a `.tmp` sibling and renames
+    atomically to avoid this, but ancient checkpoints from before that
+    patch could still be corrupt.
+    """
+    weights: dict[str, torch.Tensor] = {}
+    awq_scales: dict[str, torch.Tensor] = {}
+    grids: dict[str, torch.Tensor] = {}
+    done: set[str] = set()
+    if not (output_dir / "weights.safetensors").exists():
+        if verbose:
+            print(f"[resume] no existing checkpoint at {output_dir} — starting fresh")
+        return weights, awq_scales, grids, done
+
+    def _safe_load(path: Path) -> dict[str, torch.Tensor]:
+        if not path.exists():
+            return {}
+        try:
+            with safe_open(str(path), framework="pt") as st:
+                return {k: st.get_tensor(k) for k in st.keys()}
+        except Exception as e:
+            print(f"[resume] failed to load {path}: {e}; treating as empty",
+                  file=sys.stderr)
+            return {}
+
+    weights = _safe_load(output_dir / "weights.safetensors")
+    awq_scales = _safe_load(output_dir / "awq_scales.safetensors")
+    grids = _safe_load(output_dir / "frozen_grids.safetensors")
+    done = set(weights.keys())
+    if verbose:
+        print(f"[resume] {len(done)} tensors already in checkpoint; will skip them")
+    return weights, awq_scales, grids, done
+
+
+def _checkpoint_partial(
+    output_dir: Path,
+    *,
+    weights_bf16: dict[str, torch.Tensor],
+    awq_scales: dict[str, torch.Tensor],
+    frozen_grids: dict[str, torch.Tensor],
+    metadata: dict,
+) -> None:
+    """Write current state to `output_dir` as a partial manifest.
+
+    Atomic write per file: save to `<name>.tmp`, then `os.rename`. POSIX
+    rename is atomic — a kill during the rename leaves either the old
+    file or the new one, never a half-written file.
+
+    `metadata["partial"] = True` flags the manifest as incomplete; once
+    the run finishes, the final `write_manifest` overwrites it with
+    `partial` absent (full file).
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    metadata = {**metadata, "partial": True}
+
+    plans = [
+        ("weights.safetensors", weights_bf16),
+        ("awq_scales.safetensors", awq_scales),
+        ("frozen_grids.safetensors", frozen_grids),
+    ]
+    for fname, payload in plans:
+        tmp = output_dir / (fname + ".tmp")
+        final = output_dir / fname
+        save_file(payload, str(tmp))
+        os.replace(tmp, final)
+    # manifest.json — atomic via .tmp + rename too
+    tmp_json = output_dir / "manifest.json.tmp"
+    with open(tmp_json, "w") as f:
+        json.dump(metadata, f, indent=2, sort_keys=True, default=str)
+    os.replace(tmp_json, output_dir / "manifest.json")
+
+
 def quantize_model(
     *,
     input_dir: Path,
@@ -208,6 +322,10 @@ def quantize_model(
     limit: int | None,
     skip_to: int,
     awq_f1_only: bool,
+    n_bits: int,
+    resume: bool,
+    checkpoint_interval: int,
+    watchdog_timeout_sec: int,
     verbose: bool,
 ) -> None:
     t_start = time.perf_counter()
@@ -229,11 +347,25 @@ def quantize_model(
     signs1_per_device = {d: gen_fwht_signs(42, 256, device=d) for d in devices}
     signs2_per_device = {d: gen_fwht_signs(1042, 256, device=d) for d in devices}
 
-    # Output accumulators (in CPU memory — passthrough + GPTQ-updated).
-    weights_out: dict[str, torch.Tensor] = {}
-    awq_scales_out: dict[str, torch.Tensor] = {}
-    frozen_grids_out: dict[str, torch.Tensor] = {}
+    # ── Resume from existing partial manifest, if requested + present ──
+    if resume:
+        weights_out, awq_scales_out, frozen_grids_out, done_names = _load_resume(
+            output_dir, verbose
+        )
+    else:
+        weights_out: dict[str, torch.Tensor] = {}
+        awq_scales_out: dict[str, torch.Tensor] = {}
+        frozen_grids_out: dict[str, torch.Tensor] = {}
+        done_names: set[str] = set()
     stats: list[TensorStats] = []
+
+    # ── Watchdog: SIGKILL self if no per-tensor progress in N seconds ──
+    last_progress = {"ts": time.time()}
+    if watchdog_timeout_sec > 0:
+        if verbose:
+            print(f"[watchdog] enabled — will SIGKILL self after "
+                  f"{watchdog_timeout_sec}s without per-tensor progress")
+        _start_watchdog(watchdog_timeout_sec, last_progress)
 
     # Determine eligibility per tensor; build the processing list.
     eligible_names: list[str] = []
@@ -252,6 +384,17 @@ def quantize_model(
         eligible_names = eligible_names[:limit]
         if verbose:
             print(f"[plan] --limit {limit} → processing {len(eligible_names)} tensors")
+
+    # ── Resume: filter out already-completed tensors. The `done_names`
+    # comes from the existing checkpoint's `weights.safetensors` keys —
+    # they're already in `weights_out`, just skip the re-processing.
+    if done_names:
+        before = len(eligible_names)
+        eligible_names = [n for n in eligible_names if n not in done_names]
+        if verbose:
+            print(f"[resume] {before - len(eligible_names)} of {before} "
+                  f"eligible tensors already done in checkpoint; "
+                  f"processing {len(eligible_names)} remaining")
 
     # ── Per-eligible-tensor: GPTQ on round-robin device ──
     for i, name in enumerate(eligible_names):
@@ -380,6 +523,10 @@ def quantize_model(
 
         st.wall_s = time.perf_counter() - t0
         stats.append(st)
+        # Update watchdog timestamp — successful or fallback completion
+        # both count as "progress", only a CUDA hang in cholesky_ex etc.
+        # would prevent reaching this point.
+        last_progress["ts"] = time.time()
         if verbose:
             kld_str = (f"mse={st.mse_vs_original:.4e}"
                        if st.mse_vs_original is not None else "mse=skip")
@@ -389,6 +536,43 @@ def quantize_model(
                   f"K={shape[1]:>5} M={shape[0]:>5} {kld_str} {damp_str} "
                   f"clamps={st.clamps_below+st.clamps_above:>6} "
                   f"t={st.wall_s:>6.2f}s  {name}")
+            sys.stdout.flush()
+
+        # ── Periodic checkpoint ──
+        # Snapshot the current partial state to `output_dir` every N
+        # eligible tensors. On a kill (watchdog or external), the next
+        # `--resume` invocation picks up from this snapshot.
+        if checkpoint_interval > 0 and (i + 1) % checkpoint_interval == 0:
+            t_ckpt = time.perf_counter()
+            ckpt_meta = {
+                "schema_version": 2,
+                "source_model_dir": str(input_dir),
+                "hessian_path": str(hessian_path) if hessian_path else None,
+                "imatrix_path": str(imatrix_path) if imatrix_path else None,
+                "alpha": alpha,
+                "awq_f1_only": awq_f1_only,
+                "n_bits": n_bits,
+                "gptq_initial_damp_ratio": initial_damp_ratio,
+                "gptq_max_damp_multiplier": max_damp_multiplier,
+                "devices": devices,
+                "n_tensors_processed_so_far": len(weights_out),
+                "wall_seconds_so_far": time.perf_counter() - t_start,
+            }
+            _checkpoint_partial(
+                output_dir,
+                weights_bf16=weights_out,
+                awq_scales=awq_scales_out,
+                frozen_grids=frozen_grids_out,
+                metadata=ckpt_meta,
+            )
+            if verbose:
+                print(f"  [checkpoint] wrote partial manifest "
+                      f"({len(weights_out)} tensors) in "
+                      f"{time.perf_counter() - t_ckpt:.1f}s",
+                      flush=True)
+            # Refresh watchdog timestamp — the checkpoint write itself
+            # can take 10-20s on /data NFS, shouldn't count as a stall.
+            last_progress["ts"] = time.time()
 
     # ── Passthrough non-eligible tensors (embed, lm_head, norms, …) ──
     if verbose:
@@ -456,6 +640,31 @@ def main(argv: list[str] | None = None) -> int:
                   help="skip first N eligible tensors (resume / partial)")
     p.add_argument("--awq-f1-only", action="store_true",
                   help="restrict AWQ to F1 set (no o_proj/down_proj/wo); A/B parity with HIPFIRE_AWQ_F1_ONLY=1")
+    p.add_argument("--bits", type=int, default=4, choices=[3, 4],
+                  help="Quantization bit width: 4 (MQ4G256, default, well-tested) or "
+                       "3 (MQ3G256, uniform 3-bit — master-doc §5 warns uniform MQ3 may "
+                       "collapse; pair with --alpha 0.55 AWQ for best chance). The manifest "
+                       "writeback records n_bits so Rust's --precomputed-gptq-path dispatches "
+                       "to the matching pack function automatically.")
+    p.add_argument("--resume", action="store_true",
+                  help="Load any existing partial manifest at --output and skip the "
+                       "tensors already present in weights.safetensors. Survives a "
+                       "mid-run kill (watchdog, OOM, manual) without re-processing "
+                       "completed tensors. Compatible with --checkpoint-interval.")
+    p.add_argument("--checkpoint-interval", type=int, default=25,
+                  help="Write a partial manifest (atomic via .tmp + rename) every N "
+                       "eligible tensors. 0 disables checkpointing. Default 25 — on a "
+                       "27B run with ~506 eligible tensors, that's 20 checkpoints, "
+                       "each costing ~10-20s on /data NFS. Lets a `--resume` pick up "
+                       "with at most N-1 tensors of re-work after a kill.")
+    p.add_argument("--watchdog-timeout-sec", type=int, default=900,
+                  help="Force-SIGKILL self if no per-tensor progress in this many "
+                       "seconds. Default 900 (15 min) — well above the legitimate "
+                       "worst-case ~7 min for a K=17408 K³ Cholesky with 3 damp "
+                       "retries. CUDA hangs (cuSOLVER pathological cases observed "
+                       "2026-05-17 on sm_120) cannot be cancelled from within Python; "
+                       "external kill via SIGKILL is the only recovery and pairs with "
+                       "--resume on the next launch. Set 0 to disable.")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(argv)
 
@@ -471,6 +680,10 @@ def main(argv: list[str] | None = None) -> int:
         limit=args.limit,
         skip_to=args.skip_to,
         awq_f1_only=args.awq_f1_only,
+        n_bits=args.bits,
+        resume=args.resume,
+        checkpoint_interval=args.checkpoint_interval,
+        watchdog_timeout_sec=args.watchdog_timeout_sec,
         verbose=args.verbose,
     )
     return 0
