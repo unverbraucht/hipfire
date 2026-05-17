@@ -8282,11 +8282,34 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "gemv_hfq4g256_residual_scaled",
-            kernels::GEMV_HFQ4G256_RESIDUAL_SCALED_SRC,
-            "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
-        )?;
+        // Issue #207 Gap 3: route wave64 on wave64-native arches (gfx906/908/94x).
+        // The wave32 sibling runs at half throughput because half the wave's
+        // lanes mask out per pyramid `__shfl_down`. ~40 launches/token on A3B
+        // MoE shared-expert down projection.
+        let (kernel_name, block, grid_x) = if has_wave64_native(&self.arch) {
+            (
+                "gemv_hfq4g256_residual_sigmoid_scaled_gpu_wave64",
+                [64u32, 1, 1],
+                ((m as u32) + 1) / 2,
+            )
+        } else {
+            (
+                "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
+                [32u32, 1, 1],
+                m as u32,
+            )
+        };
+        let kernel_src = if has_wave64_native(&self.arch) {
+            kernels::GEMV_HFQ4G256_RESIDUAL_SCALED_WAVE64_SRC
+        } else {
+            kernels::GEMV_HFQ4G256_RESIDUAL_SCALED_SRC
+        };
+        let kernel_module = if has_wave64_native(&self.arch) {
+            "gemv_hfq4g256_residual_scaled_wave64"
+        } else {
+            "gemv_hfq4g256_residual_scaled"
+        };
+        self.ensure_kernel(kernel_module, kernel_src, kernel_name)?;
         let a_ptr = a_raw.buf.as_ptr();
         let x_ptr = x.buf.as_ptr();
         let y_ptr = y.buf.as_ptr();
@@ -8306,7 +8329,7 @@ impl Gpu {
             &self.hip, "gemv", "gemv_hfq4g256_residual_sigmoid_scaled_gpu", bytes,
         );
         let result = self.launch_maybe_blob(
-            "gemv_hfq4g256_residual_sigmoid_scaled_gpu", [m as u32, 1, 1], [32, 1, 1], 0, &mut params,
+            kernel_name, [grid_x, 1, 1], block, 0, &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr); b.push_ptr(c_ptr);
@@ -8336,11 +8359,26 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "gemv_hfq4g256_residual_scaled",
-            kernels::GEMV_HFQ4G256_RESIDUAL_SCALED_SRC,
-            "gemv_hfq4g256_residual_sigmoid_scaled_gpu_batched",
-        )?;
+        // Issue #207 Gap 3 — wave64 sibling. See single-token sister above.
+        let (kernel_name, kernel_module, kernel_src, block, grid_x) =
+            if has_wave64_native(&self.arch) {
+                (
+                    "gemv_hfq4g256_residual_sigmoid_scaled_gpu_batched_wave64",
+                    "gemv_hfq4g256_residual_scaled_wave64",
+                    kernels::GEMV_HFQ4G256_RESIDUAL_SCALED_WAVE64_SRC,
+                    [64u32, 1, 1],
+                    ((m as u32) + 1) / 2,
+                )
+            } else {
+                (
+                    "gemv_hfq4g256_residual_sigmoid_scaled_gpu_batched",
+                    "gemv_hfq4g256_residual_scaled",
+                    kernels::GEMV_HFQ4G256_RESIDUAL_SCALED_SRC,
+                    [32u32, 1, 1],
+                    m as u32,
+                )
+            };
+        self.ensure_kernel(kernel_module, kernel_src, kernel_name)?;
         let a_ptr = a_raw.buf.as_ptr();
         let x_ptr = x_batch.buf.as_ptr();
         let y_ptr = y_batch.buf.as_ptr();
@@ -8360,8 +8398,8 @@ impl Gpu {
             &self.hip, "gemv", "gemv_hfq4g256_residual_sigmoid_scaled_gpu_batched", bytes,
         );
         let result = self.launch_maybe_blob(
-            "gemv_hfq4g256_residual_sigmoid_scaled_gpu_batched",
-            [m as u32, batch_size as u32, 1], [32, 1, 1], 0, &mut params,
+            kernel_name,
+            [grid_x, batch_size as u32, 1], block, 0, &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr); b.push_ptr(c_ptr);
@@ -8619,6 +8657,54 @@ impl Gpu {
         m: usize, k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // Issue #207 Gap 1: gfx906 dp4a fast path. Pre-quantizes the single
+        // K-elem x vector to Q8_1 (kblock-major, batch_size=1) and dispatches
+        // the dp4a kernel. Skipped in capture mode — `ensure_q8_1_mmq_x` can
+        // fire hipMalloc on first use (unsafe inside an active capture);
+        // captured workloads continue on the scalar wave64 path.
+        if gemv_dp4a_enabled(&self.arch) && !self.capture_mode {
+            let xq_ptr = self.ensure_q8_1_mmq_x(x, 1, k)?;
+            self.ensure_kernel(
+                "gemv_hfq4g256_moe_gate_up_indexed_wave64_dp4a",
+                kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_WAVE64_DP4A_SRC,
+                "gemv_hfq4g256_moe_gate_up_k8_indexed_wave64_dp4a",
+            )?;
+            let pp = expert_ptrs.buf.as_ptr();
+            let ip = topk_indices.buf.as_ptr();
+            let ygp = y_gate.buf.as_ptr();
+            let yup = y_up.buf.as_ptr();
+            let m_val = m as i32;
+            let k_val = k as i32;
+            let mut xq = xq_ptr;
+            let mut params: Vec<*mut c_void> = vec![
+                &pp as *const _ as *mut c_void,
+                &ip as *const _ as *mut c_void,
+                &mut xq as *mut _ as *mut c_void,
+                &ygp as *const _ as *mut c_void,
+                &yup as *const _ as *mut c_void,
+                &m_val as *const _ as *mut c_void,
+                &k_val as *const _ as *mut c_void,
+            ];
+            let bytes = 8 * (crate::profile::hfq4g256_weight_bytes(m, k) + k + m * 4);
+            let timer = crate::profile::begin_timer(
+                &self.hip, "gemv", "gemv_hfq4g256_moe_gate_up_k8_indexed_wave64_dp4a", bytes,
+            );
+            let grid_x = ((m as u32) + 1) / 2;
+            let result = self.launch_maybe_blob(
+                "gemv_hfq4g256_moe_gate_up_k8_indexed_wave64_dp4a",
+                [grid_x, 8, 1], [64, 1, 1], 0, &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(pp); b.push_ptr(ip); b.push_ptr(xq);
+                    b.push_ptr(ygp); b.push_ptr(yup);
+                    b.push_i32(m_val); b.push_i32(k_val);
+                    b
+                },
+            );
+            if let Some(t) = timer { t.finish(&self.hip); }
+            return result;
+        }
+
         let cdna_wave64 = has_wave64_native(&self.arch);
         let (func_name, block, grid_x) = if cdna_wave64 {
             self.ensure_kernel(
@@ -8684,6 +8770,56 @@ impl Gpu {
         m: usize, k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // Issue #207 Gap 1: gfx906 dp4a fast path. K_TOP is hardcoded to 8 in
+        // this k8 API. Pre-quantize all K_TOP rotated rows as batch_size=8
+        // (kblock-major Xq layout [K/128 × K_TOP]); the kernel reads
+        // Xq[kblock * K_TOP + krank] for each (row, krank) block.
+        const K_TOP: usize = 8;
+        if gemv_dp4a_enabled(&self.arch) && !self.capture_mode {
+            let xq_ptr = self.ensure_q8_1_mmq_x(rot_batch, K_TOP, k)?;
+            self.ensure_kernel(
+                "gemv_hfq4g256_moe_down_indexed_wave64_dp4a",
+                kernels::GEMV_HFQ4G256_MOE_DOWN_INDEXED_WAVE64_DP4A_SRC,
+                "gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_wave64_dp4a",
+            )?;
+            let pp  = expert_ptrs.buf.as_ptr();
+            let ip  = topk_indices.buf.as_ptr();
+            let wp  = topk_weights.buf.as_ptr();
+            let xrp = x_residual.buf.as_ptr();
+            let m_val = m as i32;
+            let k_val = k as i32;
+            let kt_val = K_TOP as i32;
+            let mut xq = xq_ptr;
+            let mut params: Vec<*mut c_void> = vec![
+                &pp  as *const _ as *mut c_void,
+                &ip  as *const _ as *mut c_void,
+                &wp  as *const _ as *mut c_void,
+                &mut xq as *mut _ as *mut c_void,
+                &xrp as *const _ as *mut c_void,
+                &m_val  as *const _ as *mut c_void,
+                &k_val  as *const _ as *mut c_void,
+                &kt_val as *const _ as *mut c_void,
+            ];
+            let bytes = 8 * (crate::profile::hfq4g256_weight_bytes(m, k) + k + m * 4);
+            let timer = crate::profile::begin_timer(
+                &self.hip, "gemv", "gemv_hfq4g256_moe_down_k8_indexed_wave64_dp4a", bytes,
+            );
+            let grid_x = ((m as u32) + 1) / 2;
+            let result = self.launch_maybe_blob(
+                "gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_wave64_dp4a",
+                [grid_x, 8, 1], [64, 1, 1], 0, &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(pp); b.push_ptr(ip); b.push_ptr(wp);
+                    b.push_ptr(xq); b.push_ptr(xrp);
+                    b.push_i32(m_val); b.push_i32(k_val); b.push_i32(kt_val);
+                    b
+                },
+            );
+            if let Some(t) = timer { t.finish(&self.hip); }
+            return result;
+        }
+
         let cdna_wave64 = has_wave64_native(&self.arch);
         let (func_name, block, grid_x) = if cdna_wave64 {
             self.ensure_kernel(

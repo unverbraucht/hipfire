@@ -369,6 +369,23 @@ pub const GEMV_HFQ4G256_RESIDUAL_WAVE64_PREFETCH_SRC: &str = include_str!("../..
 /// variant scales by an on-device sigmoid gate (no D2H sync).
 pub const GEMV_HFQ4G256_RESIDUAL_SCALED_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual_scaled.hip");
 
+/// Wave64-native counterpart to `_sigmoid_scaled_gpu` + `_batched` (issue
+/// #207 Gap 3). For gfx906/gfx908/gfx94x. Packs two rows per block via
+/// `block=[64,1,1]` with per-warp row routing; the wave32 sibling at
+/// `gemv_hfq4g256_residual_scaled.hip` runs at half throughput on these
+/// arches because half the wave's lanes mask out per pyramid `__shfl_down`.
+/// Used by the MoE shared-expert down projection on gfx906 (~40
+/// launches/token at A3B decode).
+pub const GEMV_HFQ4G256_RESIDUAL_SCALED_WAVE64_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual_scaled_wave64.hip");
+
+/// Wave64+dp4a indexed MoE GEMV variants for gfx906 (issue #207 Gap 1).
+/// Same row-routing topology as the wave64 reference but with sdot4
+/// inner loop on pre-quantized Q8_1 activations. Used by A3B MoE decode.
+pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_WAVE64_DP4A_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed_wave64_dp4a.hip");
+pub const GEMV_HFQ4G256_MOE_DOWN_INDEXED_WAVE64_DP4A_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_indexed_wave64_dp4a.hip");
+
 /// MoE fused gate_up GEMV: runs 8 top-K experts' HFQ4-G256 GEMV in one
 /// launch. Grid.y is the expert rank (0..7); each block selects its
 /// expert's weight base from the W0..W7 kernarg array and runs the

@@ -11,6 +11,43 @@ use crate::speculative::HiddenStateRingBuffer;
 use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
+/// Issue #207 Gap 7: one-time warning when MoE FFN decode falls through to
+/// the slow `weight_gemv` fallback because `gate_side_mq4 == false` (i.e.
+/// one of router/shared-expert-gate/shared.gate/shared.up/experts is not
+/// MQ4G256). Dead code path for current shipping models — but if a future
+/// quant mixes formats, this warning surfaces the perf cliff (~4× slower
+/// per-output GEMV vs the fused MQ4 path) instead of leaving users to
+/// wonder why decode is mysteriously slow.
+fn warn_moe_mixed_dtype_slow_path_once(ffn: &MoeFfnWeights) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if WARNED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let dtypes = [
+        ("router", ffn.router.gpu_dtype),
+        ("shared_expert_gate", ffn.shared_expert_gate.gpu_dtype),
+        ("shared.gate", ffn.shared_expert.gate.gpu_dtype),
+        ("shared.up", ffn.shared_expert.up.gpu_dtype),
+    ];
+    let mut summary = dtypes
+        .iter()
+        .filter(|(_, dt)| *dt != DType::MQ4G256)
+        .map(|(name, dt)| format!("{name}={dt:?}"))
+        .collect::<Vec<_>>();
+    let exp0_dt = ffn.experts.first().map(|e| e.gate_up.gpu_dtype);
+    if exp0_dt != Some(DType::MQ4G256) {
+        summary.push(format!("experts.gate_up={exp0_dt:?}"));
+    }
+    eprintln!(
+        "  [warn] MoE FFN decode falling through to slow per-output \
+         weight_gemv path: gate_side_mq4=false. Non-MQ4 weights detected: \
+         [{}]. Expect ~4× slower MoE attention. See issue #207 Gap 7. \
+         This warning fires once per process.",
+        summary.join(", ")
+    );
+}
+
 // ─── Config ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -2038,12 +2075,35 @@ fn moe_ffn_decode_impl(
     // Phase 2a-iii: rotate x_norm once per layer and share the rotated
     // buffer across every gate-side GEMV. Only MQ4 GEMVs benefit; mixed
     // configs fall back to weight_gemv which rotates internally.
+    // `gate_side_mq4` gates the 4-way fused preamble (`fused_qkvza_hfq4g256`)
+    // which reads all 4 weights (router + shared_expert_gate + shared.gate +
+    // shared.up) with HFQ4G256 row layout. Post issue #171 the router and
+    // shared_expert_gate are forced to Q8_F16 to preserve routing precision,
+    // so this is false on all shipping MoE quants.
     let gate_side_mq4 = ffn.router.gpu_dtype == DType::MQ4G256
         && ffn.shared_expert_gate.gpu_dtype == DType::MQ4G256
         && ffn.shared_expert.gate.gpu_dtype == DType::MQ4G256
         && ffn.shared_expert.up.gpu_dtype == DType::MQ4G256
         && ffn.experts.iter().all(|e| e.gate_up.gpu_dtype == DType::MQ4G256);
-    let x_rot_local = if gate_side_mq4 {
+
+    let routed_mq4 = ffn.experts.first()
+        .map(|e| e.down.gpu_dtype == DType::MQ4G256)
+        .unwrap_or(false);
+    let routed_gate_up_mq4 = ffn.experts.first()
+        .map(|e| e.gate_up.gpu_dtype == DType::MQ4G256)
+        .unwrap_or(false);
+    // Issue #207: routed experts can consume the rotated FWHT(x) even when
+    // the gate-side fused predicate is false (router / shared_expert_gate
+    // being Q8 doesn't preclude routed-expert MQ4 GEMVs). Rotate x_norm
+    // whenever the routed gate_up path will use it; the kernarg-fused and
+    // GPU-topk indexed paths both gate on `x_rot_local.is_some()`. Also
+    // covers the shared expert MQ4 case (gate/up readers) — those tensors
+    // read the same x_rot_local.
+    let routed_side_mq4 = routed_gate_up_mq4
+        || ffn.shared_expert.gate.gpu_dtype == DType::MQ4G256
+        || ffn.shared_expert.up.gpu_dtype == DType::MQ4G256;
+    let need_x_rot_local = gate_side_mq4 || routed_side_mq4;
+    let x_rot_local = if need_x_rot_local {
         gpu.ensure_mq_signs()?;
         if !x_rot_prerotated {
             gpu.rotate_x_mq(x_norm, s.x_rot_local, config.dim)?;
@@ -2051,18 +2111,17 @@ fn moe_ffn_decode_impl(
         // else caller guarantees s.x_rot_local already holds FWHT(rmsnorm(x)).
         Some(s.x_rot_local)
     } else {
+        // Issue #207 Gap 7: surfaces the slow-path mix when nothing on the
+        // gate side OR routed side is MQ4 (currently dead code for shipping
+        // models; will save someone hours of debugging if a future quant
+        // mixes formats).
+        warn_moe_mixed_dtype_slow_path_once(ffn);
         None
     };
 
-    // Detect Phase 2b+2c GPU-only fast path. When true, top-K runs on
-    // device and the indexed MoE kernels consume topk_indices /
-    // topk_weights directly — no D2H sync, hipGraph-capture-safe.
-    let routed_mq4 = ffn.experts.first()
-        .map(|e| e.down.gpu_dtype == DType::MQ4G256)
-        .unwrap_or(false);
-    let routed_gate_up_mq4 = ffn.experts.first()
-        .map(|e| e.gate_up.gpu_dtype == DType::MQ4G256)
-        .unwrap_or(false);
+    // GPU-topk fast path requires the 4-way fused preamble (gate_side_mq4)
+    // for atomically-safe softmax-over-routed-logits. Routed-only-MQ4 paths
+    // still fall through to the CPU-top-K kernarg-fused branch.
     let use_gpu_topk = k == 8 && gate_side_mq4 && routed_mq4 && routed_gate_up_mq4;
 
     // ── 1+2b+3a. Fused 4-way GEMV (router + shared_expert_gate + shared.gate + shared.up) ──
@@ -2073,12 +2132,16 @@ fn moe_ffn_decode_impl(
     // = 120 launches/fwd, ~8-12% cycle-time savings on 7900 XTX.
     let shared_gate = slice_f32_view(gate_buf, 0, smi);
     let shared_up   = slice_f32_view(up_buf,   0, smi);
-    if let Some(xr) = x_rot_local {
-        // All MQ4: use the 4-way fused prerotated GEMV. Router weight, shared
-        // sigmoid-gate weight, shared gate weight, shared up weight — all
-        // M×K matrices in HFQ4G256 storage (MQ4 weights are HFQ4 bytes pre-
-        // rotated at quant time, so `gemv_hfq4g256` inner loop with the
+    if gate_side_mq4 {
+        let xr = x_rot_local.expect("gate_side_mq4 implies x_rot_local");
+        // All four MQ4: use the 4-way fused prerotated GEMV. Router weight,
+        // shared sigmoid-gate weight, shared gate weight, shared up weight —
+        // all M×K matrices in HFQ4G256 storage (MQ4 weights are HFQ4 bytes
+        // pre-rotated at quant time, so `gemv_hfq4g256` inner loop with the
         // FWHT-rotated input is mathematically equivalent to `gemv_mq4g256`).
+        // Post issue #171 this predicate is false on shipping MoE quants
+        // (router + shared_expert_gate forced to Q8); the routed-side path
+        // below still uses `x_rot_local` for its MQ4 readers.
         gpu.fused_qkvza_hfq4g256(
             &ffn.router.buf, &ffn.shared_expert_gate.buf,
             &ffn.shared_expert.gate.buf, &ffn.shared_expert.up.buf,
@@ -2089,8 +2152,10 @@ fn moe_ffn_decode_impl(
             ffn.router.k,
         )?;
     } else {
-        // Mixed-dtype fallback: four separate `weight_gemv` calls. Each
-        // weight_gemv handles its own rotation for MQ4 weights internally.
+        // Mixed-dtype preamble: four separate `weight_gemv` calls. Each
+        // weight_gemv handles its own rotation for MQ4 weights internally,
+        // so the shared-expert MQ4 path still gets MQ4 GEMV here even
+        // though the fused-4-way wasn't safe (Q8 router prevents fusing).
         weight_gemv(gpu, &ffn.router, x_norm, router_logits)?;
         weight_gemv(gpu, &ffn.shared_expert_gate, x_norm, scalar_buf)?;
         weight_gemv(gpu, &ffn.shared_expert.gate, x_norm, &shared_gate)?;
@@ -2171,7 +2236,9 @@ fn moe_ffn_decode_impl(
         // Phase 2b+2c GPU-only fast path: indexed MoE kernels read expert
         // IDs and weights from device buffers. 3 launches for routed
         // compute, zero D2H sync — hipGraph-capturable.
-        let xr = x_rot_local.expect("gate_side_mq4 implies x_rot_local");
+        // use_gpu_topk includes gate_side_mq4 which now implies
+        // x_rot_local.is_some() via need_x_rot_local above.
+        let xr = x_rot_local.expect("use_gpu_topk → gate_side_mq4 → x_rot_local");
         let down_m = ffn.experts[0].down.m;
         let down_k = ffn.experts[0].down.k;
         let gate_up_k = ffn.experts[0].gate_up.k;
