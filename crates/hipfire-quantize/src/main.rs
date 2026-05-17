@@ -94,11 +94,11 @@ static LM_HEAD_FORMAT: OnceLock<GgufFormat> = OnceLock::new();
 // AWQ-scaled and corrupt logits (0.67 → 13.5 KLD blowup, master-doc §6 rule 5).
 static LM_HEAD_AWQ_ENABLED: OnceLock<bool> = OnceLock::new();
 
-// Phase A Stage B (CUDA precomputed) — when --precomputed-gptq-path is set,
+// Phase A Stage B (GPU precomputed) — when --precomputed-gptq-path is set,
 // the GPTQ math (AWQ-pre-scale + FWHT-rotate + Hessian/Cholesky + OBS) has
-// already happened on a CUDA box per `scripts/gptq_cuda.py`. Rust just
-// packs the MQ4G256 codewords using the manifest's frozen grids and emits
-// AWQ sidecars from the manifest's pre-computed scale vectors. Mutually
+// already happened on a GPU box (CUDA or HIP/ROCm) per `scripts/gptq_gpu.py`.
+// Rust just packs the MQ4G256 codewords using the manifest's frozen grids
+// and emits AWQ sidecars from the manifest's pre-computed scale vectors. Mutually
 // exclusive with --awq / --gptq / --imatrix (their work is folded in).
 //
 // `--precomputed-gptq-path <dir>` is what the CLI accepts; the parsed

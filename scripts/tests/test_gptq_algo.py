@@ -1,4 +1,4 @@
-"""Tests for `scripts/gptq_cuda_pkg/algo.py`.
+"""Tests for `scripts/gptq_gpu_pkg/algo.py`.
 
 Self-contained: every test verifies an INVARIANT of the math (not a
 byte-exact match against Rust), so failures point at the actual broken
@@ -21,7 +21,7 @@ import torch
 # Allow `python -m unittest scripts/tests/test_gptq_algo.py` from repo root.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from gptq_cuda_pkg.algo import (  # noqa: E402
+from gptq_gpu_pkg.algo import (  # noqa: E402
     CholeskyFailedError,
     apply_awq_rescaling_h,
     apply_fwht_per_256_to_weights,

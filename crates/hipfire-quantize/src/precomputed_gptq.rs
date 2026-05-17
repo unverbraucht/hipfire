@@ -1,7 +1,8 @@
-//! Reader for the Python+CUDA GPTQ manifest (see `scripts/gptq_cuda.py`).
+//! Reader for the Python+GPU GPTQ manifest (see `scripts/gptq_gpu.py`).
 //!
 //! When `hipfire-quantize` is invoked with `--precomputed-gptq-path <dir>`,
-//! the GPTQ math has already happened on a CUDA box; this module reads
+//! the GPTQ math has already happened on a GPU box (CUDA or HIP/ROCm);
+//! this module reads
 //! the resulting manifest and serves as the byte/grid source for the
 //! MQ4G256 packing step. The Rust quantize path skips AWQ pre-scale,
 //! FWHT rotation, Hessian/Cholesky, and column-sequential OBS for any
@@ -289,7 +290,7 @@ impl PrecomputedGptq {
     ///
     /// Storage layout in safetensors: shape `[n_blocks, 2]` F16, with
     /// column 0 = scale, column 1 = min_val (matching
-    /// `scripts/gptq_cuda_pkg/algo.py::compute_frozen_block_grids`).
+    /// `scripts/gptq_gpu_pkg/algo.py::compute_frozen_block_grids`).
     pub fn frozen_grids(&self, weight_name: &str) -> Option<Vec<BlockGrid>> {
         let key = format!("{weight_name}.grids");
         let (meta, bytes) = self.frozen_grids.raw_bytes(&key)?;
