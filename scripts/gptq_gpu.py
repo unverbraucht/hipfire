@@ -509,10 +509,26 @@ def quantize_model(
             torch.cuda.synchronize(device)
             torch.cuda.empty_cache()
 
-        except CholeskyFailedError as e:
-            st.error = f"cholesky failed: {e}"
-            # Fall back to RTN — same path as no-Hessian above.
-            print(f"[fallback] {name}: {e}; emitting RTN pack")
+        except (CholeskyFailedError, torch.cuda.OutOfMemoryError) as e:
+            # OOM and Cholesky-failed both go to the same RTN fallback:
+            # the per-tensor GPU work failed, but the tensor is still
+            # GPTQ-eligible; emit a plain MQ4/MQ3 pack on the AWQ-scaled
+            # FWHT-rotated weights, no Hessian-aware error propagation.
+            # OOM at K=17408 happens when allocator fragmentation pushes
+            # `cholesky_inverse`'s 2.4 GB workspace allocation past the
+            # 16 GB card limit (~15.5 GB cap with reserved fragments).
+            # `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` mitigates
+            # but doesn't always eliminate.
+            st.error = f"{type(e).__name__}: {e}"
+            print(f"[fallback] {name}: {type(e).__name__}; emitting RTN pack",
+                  flush=True)
+            # Free anything we can before the CPU fallback path
+            try:
+                del w_gpu, s_gpu
+            except NameError:
+                pass
+            torch.cuda.synchronize(device)
+            torch.cuda.empty_cache()
             from gptq_gpu_pkg.algo import (
                 apply_fwht_per_256_to_weights, compute_frozen_block_grids,
             )
