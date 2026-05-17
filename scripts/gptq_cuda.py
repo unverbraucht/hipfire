@@ -196,7 +196,7 @@ def md5_first_1mb(path: Path) -> str:
 def quantize_model(
     *,
     input_dir: Path,
-    hessian_path: Path,
+    hessian_path: Path | None,
     imatrix_path: Path | None,
     output_dir: Path,
     alpha: float,
@@ -214,9 +214,15 @@ def quantize_model(
     if verbose:
         print(f"[input] {len(file_map)} tensors from {input_dir}")
 
-    sidecar = HessianSidecar(hessian_path)
-    if verbose:
-        print(f"[hessian] {len(sidecar.index)} entries from {hessian_path}")
+    sidecar = None
+    if hessian_path is not None:
+        sidecar = HessianSidecar(hessian_path)
+        if verbose:
+            print(f"[hessian] {len(sidecar.index)} entries from {hessian_path}")
+    elif verbose:
+        print("[hessian] not provided — every tensor will fall to the RTN-fallback path "
+              "(per-256-block min/max with FWHT rotation, no Hessian-aware error propagation). "
+              "Combined with `--imatrix`, this gives an AWQ-only quant.")
 
     imatrix = None
     if imatrix_path is not None:
@@ -272,7 +278,7 @@ def quantize_model(
             # Cholesky succeeds, U^T U = (I+λI)^-1 ≈ I, propagation
             # weights ≈ 0). Cleaner: special-case it via direct pack.
             hfhs_key = to_hfhs_key(name)
-            has_h = sidecar.has(hfhs_key)
+            has_h = sidecar is not None and sidecar.has(hfhs_key)
             st.has_hessian = has_h
 
             # AWQ
@@ -437,8 +443,11 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--input", type=Path, required=True,
                   help="HF snapshot directory with model.safetensors.index.json")
-    p.add_argument("--hessian", type=Path, required=True,
-                  help="HFHS sidecar (qwen3.5-*.hessian.bin)")
+    p.add_argument("--hessian", type=Path, default=None,
+                  help="HFHS sidecar (qwen3.5-*.hessian.bin). Optional: when "
+                       "omitted, every tensor falls through to RTN-pack (no "
+                       "GPTQ). Combined with `--imatrix`, this gives an "
+                       "AWQ-only quant. Combined with neither, pure RTN.")
     p.add_argument("--imatrix", type=Path, default=None,
                   help="Imatrix GGUF for AWQ (omit to disable AWQ)")
     p.add_argument("--alpha", type=float, default=0.55,
