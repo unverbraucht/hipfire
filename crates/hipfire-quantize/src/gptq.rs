@@ -596,6 +596,61 @@ pub fn pack_mq4g256_from_rotated_f64(weights: &[f64], grids: &[BlockGrid]) -> Ve
     output
 }
 
+/// Pack rotated FP64 weights into MQ3G256 INT3 codewords using the FROZEN
+/// per-256-block grids. Output byte layout matches `quantize_mq3g256`
+/// (main.rs:1390-1439) exactly: per 256-block, 4-byte FP32 scale +
+/// 4-byte FP32 min_val + 96 bytes of packed 3-bit codewords (8
+/// codewords per 3 bytes, cross-byte bit-packed). Block total = 104 B.
+///
+/// Used as the final packing step of the MQ3 GPTQ pipeline. Same role
+/// as `pack_mq4g256_from_rotated_f64` for MQ4 — the only differences
+/// are the clamp upper bound (0..7 instead of 0..15) and the bit
+/// packing (3-bit cross-byte layout matching the HFQ3-G256 GEMV
+/// unpacker).
+pub fn pack_mq3g256_from_rotated_f64(weights: &[f64], grids: &[BlockGrid]) -> Vec<u8> {
+    let n = weights.len();
+    assert_eq!(n % 256, 0);
+    let n_blocks = n / 256;
+    assert_eq!(grids.len(), n_blocks);
+
+    let block_bytes = 104usize;
+    let mut output = vec![0u8; n_blocks * block_bytes];
+
+    for b in 0..n_blocks {
+        let grid = grids[b];
+        let scale_f32 = grid.scale as f32;
+        let min_f32 = grid.min_val as f32;
+        let inv_scale = if grid.scale > 0.0 { 1.0 / grid.scale } else { 0.0 };
+
+        let out_off = b * block_bytes;
+        output[out_off..out_off + 4].copy_from_slice(&scale_f32.to_le_bytes());
+        output[out_off + 4..out_off + 8].copy_from_slice(&min_f32.to_le_bytes());
+
+        let group = &weights[b * 256..(b + 1) * 256];
+        // 32 chunks × 8 weights × 3 bits = 96 bytes packed. Layout
+        // mirrors main.rs:1419-1435 (the HFQ3-G256 GEMV kernel's
+        // expected cross-byte unpack pattern).
+        for chunk in 0..32 {
+            let ci = chunk * 8;
+            let mut q = [0u8; 8];
+            for j in 0..8 {
+                let qi = (((group[ci + j] - grid.min_val) * inv_scale) + 0.5).floor() as i32;
+                q[j] = qi.clamp(0, 7) as u8;
+            }
+            let b0 = (q[0] & 7) | ((q[1] & 7) << 3) | ((q[2] & 3) << 6);
+            let b1 = ((q[2] >> 2) & 1) | ((q[3] & 7) << 1) | ((q[4] & 7) << 4) | ((q[5] & 1) << 7);
+            let b2 = ((q[5] >> 1) & 3) | ((q[6] & 7) << 2) | ((q[7] & 7) << 5);
+
+            let bo = out_off + 8 + chunk * 3;
+            output[bo] = b0;
+            output[bo + 1] = b1;
+            output[bo + 2] = b2;
+        }
+    }
+
+    output
+}
+
 /// High-level GPTQ pipeline for one MQ4G256 tensor.
 ///
 /// Input is the post-AWQ-prescaled FP32 weight matrix (row-major M × K),

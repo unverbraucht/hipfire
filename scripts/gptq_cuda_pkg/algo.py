@@ -243,16 +243,26 @@ def compute_damped_inv_cholesky_upper(
     damp = max(initial_damp, torch.finfo(torch.float64).eps * max(diag_mean, 1.0))
     damp_cap = max_damp_multiplier * diag_mean
 
-    eye_k = torch.eye(k, dtype=h_eff.dtype, device=h_eff.device)
-    l = None
+    # Memory budget at K=17408 FP64: each K×K is 2.43 GB. To fit on a
+    # 16 GB consumer card we aggressively `del` intermediates and skip
+    # the explicit `l_inv` materialization in favor of `cholesky_inverse`
+    # (potri), which produces H_inv directly from L without materializing
+    # the lower-triangular inverse. Saves ~2.4 GB peak per call.
+
+    # `damped` is `h_eff + damp*I` — done in-place via diagonal.add_ on a
+    # clone, avoiding the 2.4 GB `damp * eye_k` intermediate.
     effective_damp = damp
+    l = None
     while True:
-        a = h_eff + damp * eye_k
-        l_try, info = torch.linalg.cholesky_ex(a, upper=False)
+        damped = h_eff.clone()
+        damped.diagonal().add_(damp)
+        l_try, info = torch.linalg.cholesky_ex(damped, upper=False)
+        del damped
         if int(info.item()) == 0:
             l = l_try
             effective_damp = damp
             break
+        del l_try
         if damp >= damp_cap:
             raise CholeskyFailedError(
                 f"Cholesky of K={k} Hessian failed even at damp={damp:.6e} "
@@ -260,8 +270,15 @@ def compute_damped_inv_cholesky_upper(
             )
         damp = min(damp * 10.0, damp_cap)
 
-    l_inv = torch.linalg.solve_triangular(l, eye_k, upper=False, unitriangular=False)
-    h_inv = l_inv.T @ l_inv
+    # We own h_eff (it's either a permuted copy of the caller's `h` or a
+    # contiguous-no-permute clone). Free it now that Cholesky is done —
+    # the caller's `h` is held independently outside our scope.
+    del h_eff
+
+    # H_inv = (L L^T)^-1 in one call (cuSOLVER's potri). Avoids the
+    # explicit l_inv intermediate (K×K = 2.4 GB at K=17408).
+    h_inv = torch.cholesky_inverse(l, upper=False)
+    del l
 
     l_hi, info = torch.linalg.cholesky_ex(h_inv, upper=False)
     if int(info.item()) != 0:
@@ -269,20 +286,31 @@ def compute_damped_inv_cholesky_upper(
             f"Second Cholesky on H_inv (K={k}) failed at effective_damp={effective_damp:.6e}; "
             "H_inv lost PSD due to FP drift in matmul"
         )
+    del h_inv
     u = l_hi.T.contiguous()
+    del l_hi
     return CholeskyResult(u=u, effective_damp=effective_damp)
 
 
 # ─── Frozen per-256-block grids ──────────────────────────────────────────
 
-def compute_frozen_block_grids(weights_flat: torch.Tensor) -> torch.Tensor:
-    """Per-256-element block (scale, min_val) pairs.
+def compute_frozen_block_grids(
+    weights_flat: torch.Tensor,
+    n_bits: int = 4,
+) -> torch.Tensor:
+    """Per-256-element block (scale, min_val) pairs for N-bit quantization.
 
     Input is the row-major flat `M*K`-length FP64 weight buffer (POST-
     FWHT and POST-AWQ-scale, per the pipeline). Output is shape
     `[n_blocks, 2]` where `n_blocks = M*K/256` and `[:, 0] = scale`,
-    `[:, 1] = min_val`. `scale = (max - min) / 15`; `scale = 1.0` when
-    `range == 0` (constant block, all-15 codeword is the dequant=min_val).
+    `[:, 1] = min_val`. `scale = (max - min) / (2^n_bits - 1)`;
+    `scale = 1.0` when `range == 0` (constant block).
+
+    `n_bits` choices currently supported by hipfire's runtime:
+      4 → MQ4G256 (default, 16 levels, scale = range/15)
+      3 → MQ3G256 (8 levels, scale = range/7) — note master-doc §5 warns
+            uniform MQ3 may collapse; pair with AWQ pre-scale + GPTQ for
+            best chance.
 
     Frozen pre-loop: matches `gptq.rs::compute_frozen_block_grids`. The
     layout is per-flat-block, NOT per-row-then-block — so block index
@@ -290,6 +318,9 @@ def compute_frozen_block_grids(weights_flat: torch.Tensor) -> torch.Tensor:
     asserts this exact convention in `block_idx_for`. The grid array
     stays in this (un-permuted) layout through the whole GPTQ loop.
     """
+    if n_bits not in (3, 4):
+        raise ValueError(f"unsupported n_bits={n_bits}; only 3 and 4 are wired up")
+    levels_minus_1 = (1 << n_bits) - 1  # 15 for 4-bit, 7 for 3-bit
     n = weights_flat.shape[0]
     assert n % 256 == 0, f"weight buffer length {n} must be divisible by 256"
     n_blocks = n // 256
@@ -299,7 +330,7 @@ def compute_frozen_block_grids(weights_flat: torch.Tensor) -> torch.Tensor:
     ranges = max_vals - min_vals
     scales = torch.where(
         ranges > 0,
-        ranges / 15.0,
+        ranges / float(levels_minus_1),
         torch.ones_like(ranges),
     )
     return torch.stack([scales, min_vals], dim=1)
@@ -309,16 +340,23 @@ def quantize_mq4_with_grid(
     w: torch.Tensor,
     scale: torch.Tensor,
     min_val: torch.Tensor,
+    n_bits: int = 4,
 ) -> torch.Tensor:
-    """Per-element MQ4 quantize+dequant using a frozen grid.
+    """Per-element N-bit quantize+dequant using a frozen grid.
 
-    `q = clamp(round((w - min) / scale), 0, 15)`,
+    `q = clamp(round((w - min) / scale), 0, 2^n_bits - 1)`,
     `dequant = q * scale + min`. Element-wise; `w`, `scale`, `min_val`
     broadcast against each other. Matches `gptq.rs::quantize_mq4_element`
     + Rust's `+ 0.5).floor()` round-half-up convention.
+
+    Despite the historical name, this function works for any 2-, 3-, or
+    4-bit quant — the only difference is the clamp upper bound.
     """
+    if n_bits not in (2, 3, 4):
+        raise ValueError(f"unsupported n_bits={n_bits}")
+    max_q = float((1 << n_bits) - 1)
     safe_scale = torch.where(scale != 0, scale, torch.ones_like(scale))
-    q = torch.floor((w - min_val) / safe_scale + 0.5).clamp(0.0, 15.0)
+    q = torch.floor((w - min_val) / safe_scale + 0.5).clamp(0.0, max_q)
     return torch.where(scale != 0, q * scale + min_val, min_val)
 
 

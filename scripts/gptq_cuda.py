@@ -206,6 +206,7 @@ def quantize_model(
     limit: int | None,
     skip_to: int,
     awq_f1_only: bool,
+    n_bits: int,
     verbose: bool,
 ) -> None:
     t_start = time.perf_counter()
@@ -306,6 +307,7 @@ def quantize_model(
                     signs1_per_device[device], signs2_per_device[device],
                     initial_damp_ratio=initial_damp_ratio,
                     max_damp_multiplier=max_damp_multiplier,
+                    n_bits=n_bits,
                     name=name,
                 )
                 del h_gpu
@@ -336,7 +338,7 @@ def quantize_model(
                     signs1_per_device[device],
                     signs2_per_device[device],
                 )
-                grids = compute_frozen_block_grids(w_rot.view(-1))
+                grids = compute_frozen_block_grids(w_rot.view(-1), n_bits=n_bits)
                 # Per-element RTN dequant — produces a w_out that is
                 # already on the grid, exactly what GPTQ's column loop
                 # would do without OBS propagation.
@@ -346,7 +348,7 @@ def quantize_model(
                 bidx = row_idx * n_blocks_per_row + col_idx // 256
                 scales = grids[bidx, 0]
                 mins = grids[bidx, 1]
-                w_out_f64 = quantize_mq4_with_grid(w_rot, scales, mins)
+                w_out_f64 = quantize_mq4_with_grid(w_rot, scales, mins, n_bits=n_bits)
                 st.mse_vs_original = ((w_out_f64 - w_rot) ** 2).mean().item()
                 weights_out[name] = w_out_f64.to(torch.bfloat16).cpu()
                 frozen_grids_out[f"{name}.grids"] = grids.to(torch.float16).cpu()
@@ -368,7 +370,7 @@ def quantize_model(
             signs1_cpu = gen_fwht_signs(42, 256)
             signs2_cpu = gen_fwht_signs(1042, 256)
             apply_fwht_per_256_to_weights(w_rot, signs1_cpu, signs2_cpu)
-            grids = compute_frozen_block_grids(w_rot.view(-1))
+            grids = compute_frozen_block_grids(w_rot.view(-1), n_bits=n_bits)
             weights_out[name] = w_rot.to(torch.bfloat16)
             frozen_grids_out[f"{name}.grids"] = grids.to(torch.float16)
 
@@ -398,12 +400,13 @@ def quantize_model(
 
     # ── Manifest ──
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,  # v2 adds `n_bits` field; v1 manifests imply n_bits=4
         "source_model_dir": str(input_dir),
         "hessian_path": str(hessian_path),
         "imatrix_path": str(imatrix_path) if imatrix_path else None,
         "alpha": alpha,
         "awq_f1_only": awq_f1_only,
+        "n_bits": n_bits,
         "gptq_initial_damp_ratio": initial_damp_ratio,
         "gptq_max_damp_multiplier": max_damp_multiplier,
         "devices": devices,
@@ -454,6 +457,12 @@ def main(argv: list[str] | None = None) -> int:
                   help="skip first N eligible tensors (resume / partial)")
     p.add_argument("--awq-f1-only", action="store_true",
                   help="restrict AWQ to F1 set (no o_proj/down_proj/wo); A/B parity with HIPFIRE_AWQ_F1_ONLY=1")
+    p.add_argument("--bits", type=int, default=4, choices=[3, 4],
+                  help="Quantization bit width: 4 (MQ4G256, default, well-tested) or "
+                       "3 (MQ3G256, uniform 3-bit — master-doc §5 warns uniform MQ3 may "
+                       "collapse; pair with --alpha 0.55 AWQ for best chance). The manifest "
+                       "writeback records n_bits so Rust's --precomputed-gptq-path dispatches "
+                       "to the matching pack function automatically.")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(argv)
 
@@ -469,6 +478,7 @@ def main(argv: list[str] | None = None) -> int:
         limit=args.limit,
         skip_to=args.skip_to,
         awq_f1_only=args.awq_f1_only,
+        n_bits=args.bits,
         verbose=args.verbose,
     )
     return 0

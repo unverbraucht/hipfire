@@ -4460,14 +4460,29 @@ fn main() {
                     // manifest. See `docs/plans/gptq_cuda.md` §1.2.
                     if let Some(m) = PRECOMPUTED_GPTQ.get() {
                         if let Some(grids) = m.frozen_grids(name) {
-                            // Promote weights to FP64 for `pack_mq4g256_from_rotated_f64`
-                            // (the Rust packer expects FP64; the manifest is
-                            // BF16, which we upcast lossily via to_f32 above —
-                            // BF16 ulp at typical post-rotated magnitudes is
-                            // ~3e-4, well below scale/2 ~ 8e-3, so re-quant
-                            // doesn't shift the int4 code).
+                            // Promote weights to FP64 for the packer (which
+                            // expects FP64; the manifest is BF16, which we
+                            // upcast lossily via to_f32 above — BF16 ulp at
+                            // typical post-rotated magnitudes is ~3e-4, well
+                            // below scale/2, so re-quant doesn't shift the
+                            // int code).
                             let weights_f64: Vec<f64> = f32_data.iter().map(|&v| v as f64).collect();
-                            let q = gptq::pack_mq4g256_from_rotated_f64(&weights_f64, &grids);
+                            // Dispatch on manifest's n_bits: 4 → MQ4G256
+                            // (136-byte block, 4-bit pack), 3 → MQ3G256
+                            // (104-byte block, 3-bit cross-byte pack).
+                            let (q, qt, label) = match m.meta.n_bits {
+                                4 => (
+                                    gptq::pack_mq4g256_from_rotated_f64(&weights_f64, &grids),
+                                    QuantType::MQ4G256,
+                                    "MQ4G256",
+                                ),
+                                3 => (
+                                    gptq::pack_mq3g256_from_rotated_f64(&weights_f64, &grids),
+                                    QuantType::MQ3G256,
+                                    "MQ3G256",
+                                ),
+                                other => panic!("manifest n_bits={other} not supported; precomputed_gptq::open should have rejected"),
+                            };
                             // AWQ sidecar — F16 bytes go straight through.
                             // The runtime emit-sidecar block looks for
                             // `awq_sidecar_scales` as Vec<f32>; convert from
@@ -4484,7 +4499,7 @@ fn main() {
                                     awq_sidecar_scales = Some(scales_f32);
                                 }
                             }
-                            (q, QuantType::MQ4G256, 256u32, "MQ4G256")
+                            (q, qt, 256u32, label)
                         } else {
                             // Manifest doesn't have grids for this tensor —
                             // would be a manifest gap. Fail loud so the

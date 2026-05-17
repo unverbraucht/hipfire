@@ -182,9 +182,16 @@ pub struct ManifestMeta {
     pub alpha: f32,
     #[serde(default)]
     pub awq_f1_only: bool,
+    /// Quantization bit width: 3 (MQ3G256) or 4 (MQ4G256, default).
+    /// Defaults to 4 for backward-compat with schema_version=1 manifests
+    /// that pre-date the field.
+    #[serde(default = "default_n_bits")]
+    pub n_bits: u8,
     pub gptq_initial_damp_ratio: f64,
     pub gptq_max_damp_multiplier: f64,
 }
+
+fn default_n_bits() -> u8 { 4 }
 
 /// Loaded manifest with all three safetensors files + parsed JSON meta.
 pub struct PrecomputedGptq {
@@ -221,8 +228,13 @@ impl PrecomputedGptq {
         let manifest_json = std::fs::read_to_string(&manifest_path)?;
         let meta: ManifestMeta = serde_json::from_str(&manifest_json)
             .map_err(|e| ManifestError::InvalidJson(e.to_string()))?;
-        if meta.schema_version != 1 {
+        if meta.schema_version != 1 && meta.schema_version != 2 {
             return Err(ManifestError::SchemaVersion(meta.schema_version));
+        }
+        if meta.n_bits != 3 && meta.n_bits != 4 {
+            return Err(ManifestError::InvalidJson(
+                format!("unsupported n_bits={} (only 3 and 4 are wired up)", meta.n_bits)
+            ));
         }
         Ok(Self {
             meta,

@@ -73,6 +73,7 @@ def gptq_one_tensor(
     *,
     initial_damp_ratio: float = 0.01,
     max_damp_multiplier: float = 1.0,
+    n_bits: int = 4,
     name: str = "<unnamed>",
 ) -> PipelineResult:
     """One MQ4G256 tensor through the GPTQ pipeline.
@@ -101,15 +102,20 @@ def gptq_one_tensor(
 
     m, k = weights_input.shape
 
-    # 1. AWQ-rescale H (no-op if awq_scales == ones)
-    h_target = h_unrot.clone()  # 1 K×K FP64 copy; freed after Cholesky
-    apply_awq_rescaling_h(h_target, awq_scales)
+    # 1. AWQ-rescale H (no-op if awq_scales == ones).
+    #
+    # MEMORY: We CONSUME `h_unrot` — mutating it in place rather than
+    # cloning saves a 2.4 GB allocation at K=17408. The orchestrator
+    # is expected to `del h_gpu` immediately after gptq_one_tensor
+    # returns; it doesn't re-use the Hessian. Document this in the
+    # contract.
+    apply_awq_rescaling_h(h_unrot, awq_scales)
 
     # 2. FWHT-similarity per 256-block
-    fwht_similarity_per_256_h(h_target, signs1, signs2)
+    fwht_similarity_per_256_h(h_unrot, signs1, signs2)
 
     # 3. Symmetrize — scrubs O(ε·K) drift from the FWHT row+col passes
-    symmetrize_in_place(h_target)
+    symmetrize_in_place(h_unrot)
 
     # 4. FWHT-rotate W per row (in place after cast to FP64)
     w_rot = weights_input.to(torch.float64).contiguous()
@@ -123,21 +129,28 @@ def gptq_one_tensor(
     # 5. Frozen per-256-block grids — computed from POST-rotated W, frozen
     #    through the loop. Row-major flat block index: `(row*K + col)/256`.
     w_flat = w_rot.view(-1)
-    frozen_grids = compute_frozen_block_grids(w_flat)
+    frozen_grids = compute_frozen_block_grids(w_flat, n_bits=n_bits)
 
-    # 6. WEIGHT-mode actorder + Cholesky-direct upper factor of H_inv
-    h_diag = h_target.diagonal()
+    # 6. WEIGHT-mode actorder + Cholesky-direct upper factor of H_inv.
+    #
+    # Permute h_unrot OUTSIDE compute_damped_inv_cholesky_upper so we
+    # can immediately free the un-permuted version (saves 2.4 GB peak
+    # at K=17408 — critical to fit on a 16 GB consumer card).
+    h_diag = h_unrot.diagonal()
     initial_damp = initial_damp_ratio * h_diag.mean().item()
     perm = weight_mode_actorder(h_diag)
+    del h_diag
+    h_perm = h_unrot[perm][:, perm].contiguous()
+    del h_unrot
     chol = compute_damped_inv_cholesky_upper(
-        h_target, perm, initial_damp, max_damp_multiplier,
+        h_perm, perm=None, initial_damp=initial_damp,
+        max_damp_multiplier=max_damp_multiplier,
     )
     u = chol.u  # [K, K] upper-tri, U^T U = (P^T (H+λI) P)^-1
     effective_damp = chol.effective_damp
-
-    # Free H — it's K² FP64 = K²·8 bytes; at K=12288 that's 1.2 GB.
-    # We no longer need it after Cholesky.
-    del h_target, h_diag
+    # `h_perm` was already consumed inside `compute_damped_inv_cholesky_upper`'s
+    # internal `del h_eff` — but we still hold our caller-side reference.
+    del h_perm
 
     # 7. Column-sequential GPTQ.
     #
@@ -183,12 +196,12 @@ def gptq_one_tensor(
 
         # Phase A: quantize column j_orig from residual; compute err.
         w_col_residual = w_residual[:, j_orig]
-        q = quantize_mq4_with_grid(w_col_residual, scale_col, min_col)
+        q = quantize_mq4_with_grid(w_col_residual, scale_col, min_col, n_bits=n_bits)
         # Clamp diagnostic — count pre-clamp grid indices outside [0, 15].
         safe_scale = torch.where(scale_col != 0, scale_col, torch.ones_like(scale_col))
         q_raw = torch.floor((w_col_residual - min_col) / safe_scale + 0.5)
         clamps_below += int((q_raw < 0).sum().item())
-        clamps_above += int((q_raw > 15).sum().item())
+        clamps_above += int((q_raw > float((1 << n_bits) - 1)).sum().item())
 
         w_out[:, j_orig] = q
         err_col = (w_col_residual - q) / u_ss     # [M]
