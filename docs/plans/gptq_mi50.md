@@ -1,15 +1,22 @@
 # GPTQ on AMD Instinct MI50 (gfx906) — hardware migration plan
 
-**Status**: proposal. Not started. Triggered by the wall-time hit on
-27B (Stage B 9.8h + Stage C ~5h on dual RTX 5070 Ti) — see
-`docs/plans/gptq_cuda.md` §11. MI50's HPC-tier FP64 + 32 GB HBM2 is
-a much better fit for this FP64-bound, VRAM-hungry workload than
+**Status**: partial bring-up complete (2026-05-17). Triggered by the
+wall-time hit on 27B (Stage B 9.8h + Stage C ~5h on dual RTX 5070 Ti)
+— see `docs/plans/gptq_cuda.md` §11. MI50's HPC-tier FP64 + 32 GB HBM2
+is a much better fit for this FP64-bound, VRAM-hungry workload than
 consumer Blackwell.
 
 This doc covers MIGRATING the existing quantize-time pipeline onto
 MI50 hardware. **The runtime target (.hfq consumer) is unchanged** —
 RDNA1/2/3 consumer cards remain the inference target; MI50 is offline
 quant-prep only.
+
+**See §11 for empirical findings** from the actual bring-up on this
+host — sections 1-10 were written speculatively before hardware
+contact and several of their assumptions (matching mixa3607 docker
+recommendation, dual-MI50 capacity, host-rocBLAS sufficiency) have
+been falsified or refined in §11. The §11 findings supersede the
+plan when they conflict.
 
 ## 1. Motivation: where consumer Blackwell hurts
 
@@ -332,10 +339,301 @@ GPU to clear.
   baseline — md5 match against `~/.hipfire/quantized/qwen3.5-4b.mq4-cuda.hfq`
   (`bf4063ded4182d8b5a7cd275c06641e5`)
 
-## 11. References
+## 11. Empirical findings — 2026-05-17 bring-up on the dev host
 
-- `docs/plans/gptq_cuda.md` — the canonical pipeline plan; §11 covers
-  what was needed for 27B that informs this migration's gains
-- `github.com/mixa3607/ML-gfx906` — gfx906-ported PyTorch Docker images
-- Hipfire CLAUDE.md — gfx906 is a supported runtime arch, MI50 quant
-  output (.hfq) is reusable on the same hardware family
+**TL;DR for future readers:** the §1-10 plan was substantially wrong
+about gfx906 being a viable GPTQ quantize-time target. rocBLAS FP64
+`cholesky_ex` is silently broken at K≥6144 on gfx906 in every
+available PyTorch build (§11.4-§11.6). The §10 `gptq_cuda` → `gptq_gpu`
+rename shipped successfully and is independently useful. The
+quantize-time MI50 migration is parked (§11.8); the 5070 Ti box
+remains primary. Re-check `probe_cholesky_only.py` after any ROCm
+upgrade.
+
+Sections 1-10 were written before hardware contact. This section
+records what actually happened on the dev host (Ryzen 5 4650G +
+**1× MI50 32 GB** + Renoir iGPU). The §10 rename (`gptq_cuda` →
+`gptq_gpu`) shipped here.
+
+### 11.1 Hardware reality vs §1-2 assumptions
+
+- **Single MI50, not dual.** Host has 1× MI50 32 GB visible as
+  `cuda:0`. The Renoir iGPU shows up as `cuda:1` (16.5 GB shared
+  system RAM, 7 CUs, gfx90c) — usable for CPU offload tier but not
+  a real second compute device.
+- **VRAM capacity for 27B BF16 (54 GB) is NOT met** on a single 32 GB
+  card. 27B work as described in §2 requires either a second MI50,
+  CPU offload (back to the page-fault problem we were trying to
+  avoid), or a quantized model as input. **9B and smaller fit
+  comfortably.**
+- **Host already runs ROCm 6.4.3** with full gfx906 support in system
+  rocBLAS (`/opt/rocm/lib/rocblas/library/` has `TensileLibrary_lazy_gfx906.dat`
+  + 156 gfx906 kernel objects). ROCm 6.4.4 in the mixa3607 PyTorch
+  vers-compatibility table is the upper supported pin; host 6.4.3 is
+  the same minor.
+
+### 11.2 PyTorch wheel choice (§4 supersession)
+
+§4 said "use mixa3607/ML-gfx906 Docker images because AMD dropped
+gfx906 in ROCm 6+". The mixa README's PyTorch compatibility table
+contradicts this — gfx906 is currently tested through ROCm 7.2.0
+with PyTorch 2.9.0+ — but stock PyPI `torch==2.9.1+rocm6.4` ships a
+**bundled rocBLAS** at `torch/lib/rocblas/library/` whose
+`TensileLibrary_lazy_*.dat` set **excludes gfx906** entirely (only
+gfx908/90a/942/1030/1100-1102/1200-1201 are present). So:
+
+| Path | Result |
+|---|---|
+| Stock `pip install torch==2.9.1+rocm6.4` | Aborts at first DGEMM with `Cannot read .../TensileLibrary.dat: No such file or directory for GPU arch : gfx906` |
+| Stock wheel + `ROCBLAS_TENSILE_LIBPATH=/opt/rocm/lib/rocblas/library` | Loads system rocBLAS kernels but throws `hipErrorInvalidDeviceFunction` — bundled `librocblas.so` cannot load system-compiled code objects (HIP runtime ABI mismatch) |
+| Mixa3607 `pytorch-gfx906:v2.9.0-rocm-6.4.4` image | Works; rocBLAS in the image is built with `AMDGPU_TARGETS=...gfx906...` |
+| Mixa3607 `vllm-gfx906:0.20.1-rocm-6.3.3-aiinfos` image (already cached on host) | Works (torch 2.11.0a0+rocm6.3); used for bring-up |
+
+**Resolution: use a mixa3607 image. Do not attempt to patch a stock
+PyPI wheel** — torch's bundled rocBLAS and the system rocBLAS are not
+ABI-interchangeable at the code-object level.
+
+### 11.3 Docker vs host venv
+
+§5 prescribes the full Docker recipe and §10 wishfully imagines a
+host venv after rename. The actual experience:
+
+- Docker is **the** path. The cached `mixa3607/vllm-gfx906:0.20.1-rocm-6.3.3-aiinfos`
+  image runs the renamed `gptq_gpu.py` end-to-end without modification.
+- A "wheel extraction onto host venv" is theoretically possible — pull
+  the image, `docker cp` the `site-packages/torch/` directory out, run
+  against host ROCm — but in practice the wheel + bundled rocBLAS +
+  HIP runtime ABI is one tight unit and any cross-version mixing
+  blows up at kernel-load time. Not worth the debugging budget.
+- The `.venv-cuda` references in `scripts/gptq_9b_overnight.sh` and
+  `scripts/mq3_sweep_4b.sh` are now load-bearing-stale — they invoke
+  `./.venv-cuda/bin/python scripts/gptq_gpu.py` which would not work
+  on this host. Wrap with a Docker invocation when used on MI50.
+  Cleanup deferred — the launchers are wrapper scripts, not the
+  load-bearing math.
+
+### 11.4 FP64 numerics on gfx906 rocBLAS — the K-scaling wall
+
+The §6 canary list checked the wrong thing. What actually matters:
+
+**FP64 Cholesky + cholesky_inverse residuals on cuda:0 (MI50):**
+
+| K | `\|H_inv·H − I\|_∞` | Notes |
+|---:|---:|---|
+| 4096 | 1.38e-14 | machine-precision, expected |
+| 17408 | 8.65e-2 | **OFF BY ORDERS OF MAGNITUDE** |
+
+rocBLAS emits `WARNING: Device memory allocation size is too small
+for TRSM; TRSM performance is degraded` at the larger K. Combined
+with the residual, this looks like a workspace-undersize-driven
+precision regression in `cholesky_inverse`'s internal TRSM at large
+K on gfx906. Not isolated to one of `cholesky` or `cholesky_inverse`
+— the factorization (`L L^T == H`) checks clean but the inverse-
+verification fails.
+
+**Concrete impact on 4B smoke (limit=8 tensors, alpha=0.55, bits=4):**
+
+- 7/8 tensors quantized successfully. MSE 1e-6 to 1e-5 range
+  (matching §5 canary criterion).
+- **1/8 tensor — `model.language_model.layers.0.mlp.down_proj.weight`
+  (K=9216) — hit `CholeskyFailedError: Second Cholesky on H_inv
+  failed; H_inv lost PSD due to FP drift in matmul`** and the script
+  fell back to RTN-equivalent packing (FWHT rotation + per-block RTN,
+  no Hessian-aware error redistribution). This is `gptq_gpu_pkg/algo.py:283-288`
+  exception path — `compute_damped_inv_cholesky_upper` does
+  `chol(H+λI) → cholesky_inverse → chol(H_inv)` and the second chol
+  is where gfx906 falls down.
+
+**The K-cutoff is somewhere between 4096 (clean) and 9216 (fails on
+real data).** The actual cliff depends on Hessian condition number
+plus rocBLAS workspace heuristics, not just K. For 9B (K_max=12288)
+expect more frequent fallbacks; for 27B (K_max=17408) expect the
+down_proj layers to all fall back.
+
+### 11.5 Resolution options tried — none work
+
+Probed under `docs/investigations/2026-05-17-mi50-bringup/`:
+
+| Variant | Result |
+|---|---|
+| A. Baseline `cholesky_inverse → chol(H_inv)` | `info=8161` (the production failure) |
+| B. + `H_inv = 0.5*(H_inv + H_inv.T)` symmetrize | **same `info=8161`** |
+| C. + symmetrize + 1e-8 diagonal ridge | **same `info=8161`** |
+| C2. + symmetrize + 1e-6 diagonal ridge | **same `info=8161`** |
+| D. `solve_triangular(L, eye) → L_inv.T @ L_inv → chol` | **same `info=8161`** |
+
+All four variants return the **exact same** error code on the real
+layer-0 down_proj Hessian (K=9216). That fingerprint means it's not
+a numerical-stability question — the rocBLAS gfx906 kernels themselves
+are broken at this K.
+
+Follow-up probe (`probe_cholesky_only.py`, K-sweep with clean
+diagonal-dominant random PSD):
+
+| K | `cholesky_ex` info | `L L^T vs H` residual | Verdict |
+|---:|---:|---:|---|
+| 2048 | 0 | 3.1e-15 | ✓ FP64-clean |
+| 4096 | 0 | 3.6e-15 | ✓ FP64-clean |
+| 6144 | 0 | **1.2e-2** | ✗ silently wrong by 10¹² |
+| 8192 | 0 | **7.9e-3** | ✗ silently wrong |
+| 9216 | 0 | **7.5e-3** | ✗ silently wrong |
+| 10240 | 0 | **5.9e-3** | ✗ silently wrong |
+| 12288 | 0 | **4.2e-3** | ✗ silently wrong |
+| 9216 (2·I trivial case) | 0 | 4.4e-16 | ✓ trivial PSD survives |
+
+**The conclusion: rocBLAS FP64 `cholesky_ex` is fundamentally broken
+on gfx906 at K≥6144** in the only PyTorch build that exposes it
+(`mixa3607/vllm-gfx906:0.20.1-rocm-6.3.3`, torch 2.11.0a0). It returns
+`info=0` (success) but produces an L that bears no resemblance to the
+true factorization. **The production 4B GPTQ run output is therefore
+suspect for every tensor processed at K≥6144**, not just the ones that
+loudly failed the second Cholesky step.
+
+### 11.6 No viable PyTorch build on gfx906 for this workload
+
+Re-probed in the matched `mixa3607/pytorch-gfx906:v2.9.0-rocm-6.4.4`
+image to check whether the ROCm 6.4 rocBLAS fixes the kernel bug:
+
+```
+torch 2.9.0a0+git0fabc3b  hip 6.4.43484
+GPU cholesky_ex: RuntimeError: requires compiling PyTorch with MAGMA
+CPU cholesky_ex: RuntimeError: requires compiling PyTorch with LAPACK
+```
+
+The matched-version build ships without **either** MAGMA or LAPACK.
+`torch.linalg.cholesky` simply cannot be called in this build — neither
+on GPU nor on CPU. So:
+
+| PyTorch build | GPU Cholesky | CPU Cholesky |
+|---|---|---|
+| Stock PyPI torch+rocm6.4 | rocBLAS has no gfx906 Tensile | — |
+| `vllm-gfx906:0.20.1-rocm-6.3.3` (cached) | Silently wrong at K≥6144 | No LAPACK |
+| `pytorch-gfx906:v2.9.0-rocm-6.4.4` (matched) | No MAGMA | No LAPACK |
+
+There is no off-the-shelf path to a correct GPTQ Cholesky on gfx906
+with the available builds.
+
+### 11.7 Resolution options that remain (all expensive)
+
+1. **Build PyTorch from source** with both LAPACK and MAGMA enabled,
+   then either (a) rely on CPU LAPACK for Cholesky (K=12288 FP64 ~30-60s
+   per tensor × ~200 tensors = 1-2h added per quant — undermines the
+   speedup motivation) or (b) hope MAGMA's Cholesky is built on a code
+   path that doesn't hit the rocBLAS kernel bug.
+2. **Hand-roll panel Cholesky in PyTorch ops** (block factorization
+   using only `tril`/`mm`/`addmm`). Bypasses rocBLAS `potrf` entirely.
+   2-3 day implementation; will be slow at runtime; numerical accuracy
+   is on us to verify.
+3. **Call rocSOLVER directly** via ctypes / a Rust extension —
+   rocSOLVER's `Dpotrf` is the underlying primitive PyTorch wraps. If
+   the bug is in rocSOLVER itself the bypass doesn't help; if it's in
+   PyTorch's MAGMA path, this could work. Untested.
+4. **Wait for ROCm 7.x** or for upstream patches. Mixa README's table
+   shows ROCm 7.2 + torch 2.10/2.11 is currently green — but until
+   we verify the Cholesky-at-K bug is fixed there, that's wishcasting.
+
+### 11.8 Decision: park gfx906 quantize-path exploration
+
+**Verdict: gfx906 is not viable as a GPTQ quantize-time host with
+available tooling as of 2026-05-17.** The original motivation (faster
+27B Stage C) is moot here anyway:
+
+- 1× MI50 = 32 GB VRAM, not enough for 27B BF16 (54 GB) without
+  CPU offload — defeating the §1 wall-time argument.
+- Even at 4B/9B, the rocBLAS Cholesky bug silently corrupts GPTQ
+  output for every K≥6144 tensor. The 4B run's manifest at
+  `/local/hipfire/gptq-precomputed/4b-mi50/` is kept as evidence of
+  the corruption pattern, not for production use.
+
+**Recommendation: keep the 5070 Ti box as the primary GPTQ quantize
+host.** gfx906 retains its value for runtime inference (`.hfq`
+consumer) per CLAUDE.md; the renamed `scripts/gptq_gpu.py` is now
+provably portable to ROCm and will work on future AMD generations
+(gfx908/90a/942 CDNA with HPC FP64, RDNA3+ wave32) once a non-buggy
+rocBLAS is in play, but **not on gfx906 today**.
+
+The reproducer scripts in `docs/investigations/2026-05-17-mi50-bringup/`
+are kept so the next attempt has a clean go/no-go gate before sinking
+time in. Re-run `probe_cholesky_only.py` after any rocBLAS upgrade;
+if the K=9216 `L L^T vs H` residual drops back to ~1e-14, the bug is
+fixed and the rest of the path becomes worth retrying.
+
+### 11.9 Wall-time observed on the partial 4B run
+
+Full 4B Stage C (355 eligible tensors, alpha=0.55, bits=4) on 1× MI50
+cuda:0 completed in **27.7 min** (1659.9 s) — `[done] 219 GPTQ, 136
+RTN fallback, 248 AWQ sidecars`. Of the 136 RTN fallbacks: 29 are
+K=9216 `down_proj` Cholesky failures (real defect), 107 are vision-
+encoder tensors that have no Hessian sidecar entry by design
+(`linear_fc1`, `linear_fc2`, `proj`, `qkv` from the multimodal
+front-end — RTN is the correct path for those).
+
+This timing is **misleading as a benchmark** — per §11.4 the 219
+"GPTQ-ok" tensors include K≥6144 tensors whose silently-garbage L was
+used to update weights. So the run completed but its output is
+not byte-correct. Compared to the §2 dual-MI50 ~10-min projection,
+single-card wall scales as expected given (a) 1 card vs 2, (b) docker
+overhead per invocation. The wall-time isn't the problem; the
+numerical correctness is.
+
+### 11.10 Decision: what to keep from the original plan
+
+| Section | Status | Notes |
+|---|---|---|
+| §1 motivation | Valid | The "consumer Blackwell hurts" framing is unchanged |
+| §2 hardware comparison | **Single-MI50 only**; capacity numbers for 2× are aspirational | Get a second MI50 before serious 27B work |
+| §3 compatibility audit | Mostly valid | Update: torch 2.9+ with ROCm 6.4 works (not just 5.7-via-Docker) |
+| §4 mixa3607 path | Valid | But §4 framed it as "rebuilt for legacy support" — actually still actively maintained, validated through ROCm 7.2 |
+| §5 migration steps | Partially valid | Steps 1-3 are unchanged (docker pull + run). Step 5 K=17408 canary IS the canary that catches the bug — re-purpose it as a go/no-go gate, not a smoke test. Step 6 llama.cpp HIP build is unchanged. Step 7 smoke "worked" but produced numerically wrong output — do not trust the §10 md5-match acceptance criterion until §11.4 is resolved |
+| §6 risks | **§6.1 + §6.6 are realized; deeper issue surfaced** | rocBLAS Cholesky at K≥6144 silently produces garbage on gfx906 (see §11.4-§11.5). Not a workspace tuning issue — kernel-level bug |
+| §7 cost/benefit | **Reversed at gfx906** | The savings story assumed Cholesky works. It doesn't. The 5070 Ti retains both correctness and wall-time advantage on this hardware until rocBLAS is fixed |
+| §8 open questions | Q1+Q2 now mostly answered | Q1 fla: untested. Q2 hessian locality: still applies. New Q3: does the bug persist in ROCm 7.x? (would re-open the path) |
+| §9 decision criteria | Stands but moot for gfx906 | A second MI50 still doesn't fix the Cholesky bug, and consumer CDNA2+ (gfx90a+) is where mixa's tooling is best maintained anyway |
+| §10 rename | **Done** | Shipped 2026-05-17. md5 of `bf4063ded4182d8b5a7cd275c06641e5` baseline is the reference; produced-on-MI50 output does NOT match it because of §11.4 corruption, not because of the rename |
+
+### 11.11 Docker recipe used during bring-up (supersedes §5 step 2)
+
+For one-shot quantize runs:
+
+```
+docker run --rm \
+  --device=/dev/kfd --device=/dev/dri \
+  --group-add video --group-add render \
+  --security-opt seccomp=unconfined \
+  --shm-size=8g \
+  --network=none \
+  -v $HOME/git/hipfire:/hipfire \
+  -v /data/models/qwen/Qwen3.5-4B:/model:ro \
+  -v /data/hipfire-refs:/refs:ro \
+  -v /local/hipfire/gptq-precomputed/4b-mi50:/out \
+  -w /hipfire \
+  --entrypoint /bin/bash \
+  mixa3607/vllm-gfx906:0.20.1-rocm-6.3.3-aiinfos \
+  -c '
+PYTHONPATH=scripts HIP_VISIBLE_DEVICES=0 python3 scripts/gptq_gpu.py \
+    --input /model \
+    --hessian /refs/qwen3.5-4b-bf16.hessian.bin \
+    --imatrix /hipfire/benchmarks/quality-baselines/refs/qwen3.5-4b-bf16.imatrix.gguf \
+    --alpha 0.55 --bits 4 \
+    --output /out \
+    --devices cuda:0 \
+    --verbose
+'
+```
+
+`HIP_VISIBLE_DEVICES=0` is required — the iGPU is `cuda:1` in the
+container and would otherwise also be available. The script would
+try to round-robin onto it and OOM. (If a second MI50 lands, drop
+this and use `--devices cuda:0 cuda:1`.)
+
+`--network=none` is paranoia — the container has no network needs
+once the model and references are mounted. Saves a syscall surface.
+
+The `mixa3607/vllm-gfx906:0.20.1-rocm-6.3.3-aiinfos` tag is the one
+already cached on this host (31 GB, mostly vLLM that we don't use).
+The smaller `mixa3607/pytorch-gfx906:v2.9.0-rocm-6.4.4` would be a
+better fit (matches the plan's target torch version exactly); not
+yet pulled — open question whether the K=9216 second-Cholesky issue
+is also present there.
+
+## 12. References
