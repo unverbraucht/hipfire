@@ -725,37 +725,6 @@ fn load_norm_weight(hfq: &HfqFile, gpu: &mut Gpu, name: &str, shape: &[usize]) -
     gpu.upload_f32(&f32_data, shape)
 }
 
-/// Load norm weight without the +1.0 offset — for standard RMSNorm tensors
-/// (e.g., the final `model.language_model.norm.weight` stored as raw scale,
-/// mean ~1.6 on Qwen3.5-MoE A3B). Applying +1.0 would over-amplify by ~60%.
-fn load_norm_weight_raw(hfq: &HfqFile, gpu: &mut Gpu, name: &str, shape: &[usize]) -> HipResult<GpuTensor> {
-    let full_name = format!("model.language_model.{name}");
-    let (info, data) = hfq.tensor_data_vec(&full_name)
-        .or_else(|| hfq.tensor_data_vec(name))
-        .unwrap_or_else(|| panic!("tensor not found: {name} or {full_name}"));
-    let f32_data: Vec<f32> = match info.quant_type {
-        1 => data.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect(),
-        2 => data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
-        _ => panic!("expected F16/F32 for {name}, got qt={}", info.quant_type),
-    };
-    gpu.upload_f32(&f32_data, shape)
-}
-
-/// Should the MoE final norm fall back to the pre-fix raw load (no `+= 1.0`)?
-///
-/// Default is false (correct GemmaRMSNorm convention for everyone). Setting
-/// `HIPFIRE_QWEN_MOE_FINAL_NORM_RAW=1` opts MoE models back into the
-/// pre-93c015e under-scaled behavior. See `load_weights` (the main load
-/// path) for the rationale block, and `docs/plans/qwen35-moe-rmsnorm-fix.md`
-/// for the full audit trail.
-fn moe_final_norm_raw_fallback(num_experts: usize) -> bool {
-    num_experts > 0
-        && std::env::var("HIPFIRE_QWEN_MOE_FINAL_NORM_RAW")
-            .map(|v| v == "1")
-            .unwrap_or(false)
-}
-
-
 /// Load weight tensor from raw bytes + quant_type (no name lookup needed).
 fn load_weight_tensor_raw(gpu: &Gpu, quant_type: u8, data: &[u8], m: usize, k: usize) -> HipResult<WeightTensor> {
     match quant_type {
@@ -1379,25 +1348,21 @@ pub fn load_weights(hfq: &mut HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> 
     // llama.cpp's GGUF-conversion-time bake. See
     // docs/plans/qwen35-moe-rmsnorm-fix.md for the concrete arithmetic trace.
     //
-    // The earlier `if config.num_experts > 0` fork (commit 1e01c0b) called
-    // `load_norm_weight_raw` for MoE to silence a `<think>` infinite-spiral
-    // on Qwen3.6-A3B reasoning prompts. That under-scaled the MoE final norm
-    // by ~38% (e.g. on 3.6-A3B: stored mean +1.63 → effective scale 1.63
-    // instead of the correct 2.63 = 1 + 1.63 that vLLM/llama.cpp produce).
-    // The spiral is most likely a separate precision bug elsewhere in the
-    // MoE path (expert routing numerics, quantization interaction); reducing
-    // the final-norm scale was a fortuitous magnitude mask, not a fix.
-    //
-    // The fork is removed. If the spiral returns on Qwen3.6-A3B reasoning
-    // prompts, set `HIPFIRE_QWEN_MOE_FINAL_NORM_RAW=1` to fall back to the
-    // old behavior while the underlying MoE precision bug gets a separate
-    // audit. Default is correct convention for everyone.
-    let output_norm = if moe_final_norm_raw_fallback(config.num_experts) {
-        eprintln!("    HIPFIRE_QWEN_MOE_FINAL_NORM_RAW=1: skipping +1 bake on MoE final norm (workaround mode)");
-        load_norm_weight_raw(hfq, gpu, "norm.weight", &[config.dim])?
-    } else {
-        load_norm_weight(hfq, gpu, "norm.weight", &[config.dim])?
-    };
+    // The earlier `if config.num_experts > 0` fork (commit 1e01c0b) skipped
+    // the `+= 1.0` bake on MoE final norms to silence a `<think>` infinite-
+    // spiral on Qwen3.6-A3B reasoning prompts. That under-scaled the MoE
+    // final norm by ~38% (e.g. on 3.6-A3B: stored mean +1.63 → effective
+    // scale 1.63 instead of the correct 2.63 = 1 + 1.63 that vLLM/llama.cpp
+    // produce). It was a magnitude mask, not a fix — the spiral's real root
+    // cause was the daemon's `repeat_penalty` default of 1.3 over a 128-token
+    // window penalizing legitimately repeated chain-of-thought formatting
+    // tokens, which fell off the model's well-trained reasoning path into a
+    // self-doubt / number-hallucination attractor (fixed in commit 9b4ab74a:
+    // default repeat_penalty 1.3 → 1.0). Bench A/B on Qwen3.6-35B-A3B MQ4
+    // confirms the spiral is dissolved with the new default; the prior
+    // `HIPFIRE_QWEN_MOE_FINAL_NORM_RAW=1` env-var escape hatch was removed
+    // together with this fork.
+    let output_norm = load_norm_weight(hfq, gpu, "norm.weight", &[config.dim])?;
 
     // Try separate lm_head first (untied embeddings, e.g. 9B), fall back to tied embed_tokens
     let lm_head_info = hfq.tensor_data_vec("lm_head.weight")
@@ -1622,14 +1587,9 @@ fn load_output_into(
     gpu: &mut Gpu,
 ) -> HipResult<(GpuTensor, WeightTensor)> {
     eprintln!("  loading output_norm...");
-    // See the matching block in the main load path for the rationale and
-    // the `HIPFIRE_QWEN_MOE_FINAL_NORM_RAW` env-var fallback.
-    let output_norm = if moe_final_norm_raw_fallback(config.num_experts) {
-        eprintln!("    HIPFIRE_QWEN_MOE_FINAL_NORM_RAW=1: skipping +1 bake on MoE final norm (workaround mode)");
-        load_norm_weight_raw(hfq, gpu, "norm.weight", &[config.dim])?
-    } else {
-        load_norm_weight(hfq, gpu, "norm.weight", &[config.dim])?
-    };
+    // See the matching block in the main load path for the rationale —
+    // GemmaRMSNorm `+= 1.0` bake applies uniformly for dense and MoE.
+    let output_norm = load_norm_weight(hfq, gpu, "norm.weight", &[config.dim])?;
 
     let lm_head_info = hfq
         .tensor_data("lm_head.weight")

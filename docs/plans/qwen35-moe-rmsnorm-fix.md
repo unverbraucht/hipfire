@@ -201,10 +201,22 @@ cause:
    keeping outputs within a regime where attention error stayed below
    that threshold, restoring the correct scale could push it over.
 
-**Mitigation:** ship with an opt-out env var
-`HIPFIRE_QWEN_MOE_FINAL_NORM_RAW=1` (default off post-fix) so we can
+**Mitigation:** the original PR shipped an opt-out env var
+`HIPFIRE_QWEN_MOE_FINAL_NORM_RAW=1` (default off post-fix) so we could
 A/B back to the broken-but-stable behavior on a single command without
-redeploying. Then the actual root cause gets a separate audit.
+redeploying.
+
+**Update 2026-05-17:** the underlying root cause was identified and
+fixed in commit `9b4ab74a` — the daemon's `repeat_penalty` default of
+1.3 over a 128-token window was penalizing legitimately repeated
+chain-of-thought formatting tokens, dropping the trajectory into a
+self-doubt / number-hallucination attractor. The 1.3 → 1.0 default
+flip dissolves the spiral on Qwen3.6-A3B reasoning prompts without
+needing the under-scaled final norm. A/B verified on /local/hipfire/
+qwen3.6-35b-a3b.mq4 (post-merge `f57e07df`): correct GemmaRMSNorm +
+`repeat_penalty=1.0` produces the same clean step-by-step reasoning
+as the `HIPFIRE_QWEN_MOE_FINAL_NORM_RAW=1` workaround. The env-var
+fallback was therefore removed.
 
 ### Risk 2: Dense quality-gate baselines may shift
 
@@ -223,37 +235,18 @@ independently. If any step fails, the diagnosis needs another revision.
 
 ### Code change as shipped
 
-The fix replaces the unconditional `if config.num_experts > 0` fork
-with an env-var-gated fallback so we can A/B back to the buggy-but-
-stable behavior on a single command. Default is correct convention
-for everyone:
+The fix removes the `if config.num_experts > 0` fork (1e01c0b) so
+MoE and dense both go through `load_norm_weight` (with the `+= 1.0`
+GemmaRMSNorm bake) unconditionally. Two sites: `load_weights` (main
+path) and `load_output_into` (multi-GPU output reload).
 
 ```rust
-// qwen35.rs:1230 (load path #1) and qwen35.rs:1459 (load path #2)
-let moe_raw_fallback = config.num_experts > 0
-    && std::env::var("HIPFIRE_QWEN_MOE_FINAL_NORM_RAW")
-        .map(|v| v == "1")
-        .unwrap_or(false);
-let output_norm = if moe_raw_fallback {
-    load_norm_weight_raw(hfq, gpu, "norm.weight", &[config.dim])?
-} else {
-    load_norm_weight(hfq, gpu, "norm.weight", &[config.dim])?
-};
+let output_norm = load_norm_weight(hfq, gpu, "norm.weight", &[config.dim])?;
 ```
 
-Path #1 site has the full rationale block in a leading comment; path
-#2 site (in `load_output_into`) has a one-liner pointing at #1.
-
-`HIPFIRE_QWEN_MOE_FINAL_NORM_RAW=1` restores the pre-fix MoE behavior
-(no `+= 1.0` baking on the final norm). Use it to:
-- Diagnose whether a MoE quality regression post-fix is the spiral
-  returning (workaround=1 should restore the prior output) or
-  unrelated.
-- Ship a stable Qwen3.6-A3B build while the underlying MoE precision
-  bug gets a separate audit.
-
-Default behavior produces correct convention for all models; the
-fallback is opt-in.
+The `load_weights` site carries the rationale block citing 1e01c0b
+(the under-scaling workaround that this PR removes) and 9b4ab74a (the
+`repeat_penalty` default that actually fixed the spiral).
 
 ### What does NOT change
 
@@ -280,10 +273,12 @@ fallback is opt-in.
    logits for one prompt; compare against vLLM logits on the same
    prompt at the same position. NRMSE should drop on MoE post-fix
    (final norm now matches vLLM). NRMSE on dense should be unchanged.
-5. **MoE spiral path.** If reasoning prompts spiral, enable
-   `HIPFIRE_QWEN_MOE_FINAL_NORM_RAW=1` to confirm the spiral ties to
-   the final-norm change (rather than something else in the PR). Then
-   open a separate audit for the underlying precision bug.
+5. **MoE spiral path.** Was load-bearing in earlier revisions of this
+   plan; superseded after commit `9b4ab74a` (repeat_penalty 1.3 → 1.0
+   default) dissolved the spiral. See the updated mitigation note
+   above and the script `scripts/test_pr228_spiral_check.sh` which
+   reproduces the A/B (rp=1.0 coherent / rp=1.3 spiral / workaround
+   coherent) for any future agent who needs to re-confirm.
 
 ## Files referenced
 
