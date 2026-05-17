@@ -872,14 +872,18 @@ async function runViaHttp(
   port: number, model: string, prompt: string,
   image: string | undefined,
   temp: number, maxTokens: number, repeatPenalty: number, topP: number,
+  system?: string,
 ): Promise<boolean> {
   // VL flows go through the image-base64 path on the daemon which the HTTP
   // wrapper doesn't expose — fall back to local spawn.
   if (image) return false;
 
+  const messages: any[] = [];
+  if (system) messages.push({ role: "system", content: system });
+  messages.push({ role: "user", content: prompt });
   const body: any = {
     model, stream: true,
-    messages: [{ role: "user", content: prompt }],
+    messages,
     temperature: temp, max_tokens: maxTokens,
     repeat_penalty: repeatPenalty, top_p: topP,
   };
@@ -1191,7 +1195,7 @@ async function pull(tag: string): Promise<string> {
 
 // ─── Commands ───────────────────────────────────────────
 
-async function run(model: string, prompt: string, image?: string, temp = 0.3, maxTokens = 512, repeatPenalty = 1.3, topP = 0.8) {
+async function run(model: string, prompt: string, image?: string, temp = 0.3, maxTokens = 512, repeatPenalty = 1.3, topP = 0.8, system?: string) {
   let path = findModel(model);
 
   // Auto-pull if model tag is recognized but not downloaded
@@ -1215,7 +1219,7 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
   // Local spawn falls through only when no serve is present (or HTTP errors out).
   const useLocal = process.env.HIPFIRE_LOCAL === "1" || image !== undefined;
   if (!useLocal && await isServeUp(cfg.port)) {
-    const ok = await runViaHttp(cfg.port, model, prompt, image, temp, maxTokens, repeatPenalty, topP);
+    const ok = await runViaHttp(cfg.port, model, prompt, image, temp, maxTokens, repeatPenalty, topP, system);
     if (ok) return;
     // runViaHttp logged its own failure reason; fall back to local spawn.
   }
@@ -1241,14 +1245,20 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
     temperature: temp * TEMP_CORRECTION, max_tokens: maxTokens,
     repeat_penalty: repeatPenalty, top_p: topP,
   };
-  // thinking=off: hard-suppress by capping thinking to 1 token (model still
-  // emits <think> but is immediately force-closed). This mirrors the
-  // enable_thinking=false semantics from the OpenAI API path.
+  // thinking=off: hard-suppress by capping thinking to 1 token AND emitting
+  // a closed `<think></think>` block via assistant_prefix=closed_think, so
+  // the model never starts a thinking turn at all. This mirrors the
+  // enable_thinking=false semantics from the OpenAI API path
+  // (cli/index.ts ~1668-1680). The Jinja path keys off max_think_tokens==1
+  // for `enable_thinking=false`; the legacy ChatFrame path keys off
+  // assistant_prefix=closed_think. Setting both makes either daemon path
+  // do the right thing.
   // Previous attempts to inject prose directives with <think>/<no_think>
   // caused Qwen3.5 to halt at 3-4 tokens — the token-cap approach works
   // reliably because it operates at the daemon level, not in the prompt.
   if (modelCfg.thinking === "off") {
     genMsg.max_think_tokens = 1;
+    genMsg.assistant_prefix = "closed_think";
   } else if (modelCfg.max_think_tokens > 0) {
     genMsg.max_think_tokens = modelCfg.max_think_tokens;
   }
@@ -1256,6 +1266,7 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
     genMsg.image = resolve(image);
     console.error(`[VL: ${image}]`);
   }
+  if (system) genMsg.system = system;
 
   let inThink = false;
   let stripNextLeadingNl = false;
@@ -1468,6 +1479,67 @@ async function serve(port: number) {
           return "";
         };
 
+        // Strip <think>...</think> blocks from historical assistant text. Same
+        // rationale as the inline-ChatML builder below (line 1513): the Qwen3.5
+        // chat template doesn't carry thinking forward, and including it in
+        // history-shaped structured messages pollutes the KV cache.
+        const stripThinkingInline = (s: string): string =>
+          s.replace(/<think>[\s\S]*?<\/think>\s*/g, "")
+           .replace(/<think>[\s\S]*$/, "");
+
+        // Map OpenAI chat-completion messages to the daemon's structured
+        // `messages` JSONL field (Phase 2 of Jinja-everywhere). Roles:
+        //   developer → system (OpenAI o1/o3 alias — chat templates
+        //                       only know system/user/assistant/tool).
+        //   tool_calls.function.arguments is JSON-string in OpenAI;
+        //   the daemon expects a raw JSON value, so we parse here and
+        //   pass through any non-string `arguments` unchanged.
+        //
+        // The daemon arbitrates whether to consume `messages` or fall
+        // back to the legacy inline-ChatML `prompt` based on
+        // HIPFIRE_JINJA_CHAT — clients don't need to know which path
+        // fires. We always send both shapes so backward-compat with
+        // Jinja-off daemons holds.
+        const mapMessagesToStructured = (msgs: any[]): any[] => {
+          const out: any[] = [];
+          for (const m of msgs) {
+            if (!m || typeof m !== "object") continue;
+            let role: string = m.role;
+            if (role === "developer") role = "system";
+            if (role !== "system" && role !== "user" && role !== "assistant" && role !== "tool") {
+              continue;
+            }
+            const entry: any = { role, content: "" };
+            if (role === "assistant") {
+              entry.content = stripThinkingInline(extractText(m.content));
+              if (Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
+                const tcs: any[] = [];
+                for (const tc of m.tool_calls) {
+                  const fn = tc?.function ?? tc ?? {};
+                  let args: any = {};
+                  if (typeof fn.arguments === "string") {
+                    try { args = JSON.parse(fn.arguments); }
+                    catch { args = { _raw: fn.arguments }; }
+                  } else if (fn.arguments !== undefined) {
+                    args = fn.arguments;
+                  }
+                  tcs.push({ name: fn.name ?? "unknown", arguments: args });
+                }
+                if (tcs.length > 0) entry.tool_calls = tcs;
+              }
+            } else if (role === "tool") {
+              entry.content = extractText(m.content);
+              if (typeof m.tool_call_id === "string" && m.tool_call_id.length > 0) {
+                entry.tool_call_id = m.tool_call_id;
+              }
+            } else {
+              entry.content = extractText(m.content);
+            }
+            out.push(entry);
+          }
+          return out;
+        };
+
         // Extract system message. OpenAI's o1/o3-style reasoning surface
         // (and pi-coding-agent) sends `role:"developer"` instead of
         // `role:"system"` for the same purpose — strict instructions that
@@ -1665,17 +1737,39 @@ async function serve(port: number) {
           if (reasoningEffort === 0) delete genParams.max_think_tokens;
           else genParams.max_think_tokens = reasoningEffort;
         }
-        // thinking=off is currently a no-op at the CLI layer. Earlier
-        // versions injected a prose system directive ("Respond directly
-        // without using <think>...</think> reasoning blocks") here, but
-        // the literal special tokens in that string caused Qwen3.5 to
-        // halt at 3-4 tokens — coherence-gate (which hits the daemon
-        // direct, no system injection) consistently passes on the same
-        // models, while CLI-routed requests with this directive break.
-        // Pass through whatever system prompt the client sent, no
-        // augmentation. The downstream <think>...</think> filter still
-        // strips visible reasoning so users get clean answers.
+        // Wire thinking control for both legacy assistant_prefix
+        // (ChatFrame::ClosedThink) and the new Jinja template path.
+        // The Jinja path uses max_think_tokens==1 as the signal for
+        // enable_thinking=false (daemon.rs line 3099). For the legacy
+        // ChatFrame path, assistant_prefix="closed_think" is sufficient.
+        if (effective.thinking === "off") {
+          genParams.assistant_prefix = "closed_think";
+        } else if ((body as any).chat_template_kwargs?.enable_thinking === false) {
+          genParams.assistant_prefix = "closed_think";
+          genParams.max_think_tokens = 1; // Jinja path signal
+        } else if ((body as any).reasoning?.effort === "none") {
+          genParams.assistant_prefix = "closed_think";
+          genParams.max_think_tokens = 1;
+        }
         if (systemPrompt) genParams.system = systemPrompt;
+
+        // Phase 2: structured tools + messages passed alongside the
+        // legacy prompt/system text. Under HIPFIRE_JINJA_CHAT=1 the
+        // daemon's Jinja path renders `messages` + `tools` through the
+        // model's upstream chat_template (XML tool-call format on
+        // Qwen3.5/3.6 etc.) and ignores `prompt`/`system`. Under
+        // HIPFIRE_JINJA_CHAT=0 (default) the daemon ignores the
+        // structured fields and falls back to the inline-ChatML prompt
+        // + text-rendered tools-block already built above. We send both
+        // shapes so the same OpenAI request works against either
+        // daemon mode without per-client awareness.
+        if (Array.isArray(body.tools) && body.tools.length > 0) {
+          genParams.tools = body.tools;
+        }
+        const structuredMessages = mapMessagesToStructured(messages);
+        if (structuredMessages.length > 0) {
+          genParams.messages = structuredMessages;
+        }
 
         // Parse tool calls from model output: <tool_call>{"name":..., "arguments":...}</tool_call>
         //
@@ -1769,28 +1863,87 @@ async function serve(port: number) {
             }
           } catch {}
 
-          // Form 3: XML-tag corruption. Look for a function name in
-          //   <plain>NAME</param>  or  <function=NAME>  or  <NAME>
-          // patterns at the head of the block, followed by a JSON object.
+          // Form 3: XML-tag forms.
+          //
+          // Originally introduced as a defensive repair for MQ4
+          // quantization drift (`<plain>NAME</param> {ARGS}`), this branch
+          // now also serves as the primary path for Qwen3.5/3.6's
+          // upstream chat_template, which emits a fully-structured
+          //   <function=NAME>
+          //     <parameter=KEY>VALUE</parameter>
+          //     <parameter=KEY>VALUE</parameter>
+          //   </function>
+          // shape under the Jinja-everywhere path (Phase 2).
+          //
+          // Order of probes:
+          //   1) `<function=NAME>` followed by `<parameter=K>V</parameter>`
+          //       siblings — Qwen3.5/3.6 native (Jinja path).
+          //   2) Any of the 3 legacy XML name patterns + a JSON-object
+          //       args tail — MQ4-corruption repair shape.
+          //   3) Any of the 3 name patterns w/ empty args — last-resort
+          //       so we never silently drop a call we can identify by name.
           const xmlPatterns = [
             /^<\s*plain\s*>\s*([A-Za-z_][\w.]*)\s*<\s*\/\s*param\s*>/,
             /^<\s*function\s*=\s*([A-Za-z_][\w.]*)\s*>/,
             /^<\s*tool\s*name\s*=\s*"?([A-Za-z_][\w.]*)"?\s*>/,
           ];
+          // Probe (1): Qwen3.5/3.6 `<function=NAME>...<parameter=K>V</parameter>...</function>`.
+          const fnMatch = raw.match(/^<\s*function\s*=\s*([A-Za-z_][\w.]*)\s*>([\s\S]*?)(?:<\s*\/\s*function\s*>|$)/);
+          if (fnMatch) {
+            const fname = fnMatch[1];
+            const body = fnMatch[2];
+            const params: Record<string, any> = {};
+            const paramRe = /<\s*parameter\s*=\s*([A-Za-z_][\w.]*)\s*>([\s\S]*?)<\s*\/\s*parameter\s*>/g;
+            let anyParam = false;
+            for (const pm of body.matchAll(paramRe)) {
+              const key = pm[1];
+              // VALUE often arrives with one leading + one trailing newline
+              // (the template emits `<parameter=K>\nVALUE\n</parameter>`).
+              // Trim whitespace; coerce strings that look like JSON values
+              // (numbers, booleans, null, objects, arrays) so downstream
+              // tool runners see typed args instead of stringy "42".
+              const valueRaw = pm[2].trim();
+              params[key] = coerceParamValue(valueRaw);
+              anyParam = true;
+            }
+            if (anyParam) {
+              return { name: fname, arguments: params, repaired: true };
+            }
+            // No parameter siblings: fall through to JSON-object probe
+            // below (the JSON-corruption repair case may still apply).
+          }
+          // Probe (2): name pattern + JSON-object args tail (legacy
+          // MQ4-corruption repair).
           for (const pat of xmlPatterns) {
             const nm = raw.match(pat);
             if (!nm) continue;
             const after = raw.slice(nm[0].length).trim();
-            // Find the first balanced JSON object in the remainder.
             const args = extractFirstJsonObject(after);
             if (args !== null) {
               return { name: nm[1], arguments: args, repaired: true };
             }
-            // Even if we cannot parse args, the function name is usable;
-            // emit empty args rather than dropping the call entirely.
+            // Probe (3): emit empty args so the call isn't silently
+            // dropped when only the name is recoverable.
             return { name: nm[1], arguments: {}, repaired: true };
           }
           return null;
+        }
+
+        // Coerce a `<parameter=K>VALUE</parameter>` body. Strings that
+        // parse as JSON (numbers, booleans, null, objects, arrays)
+        // become typed values; everything else stays as a string.
+        function coerceParamValue(s: string): any {
+          if (s === "") return "";
+          if (s === "true" || s === "false" || s === "null") return JSON.parse(s);
+          if (/^-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?$/.test(s)) {
+            const n = Number(s);
+            if (Number.isFinite(n)) return n;
+          }
+          // Object/array literal — try a strict parse; on fail keep raw.
+          if ((s.startsWith("{") && s.endsWith("}")) || (s.startsWith("[") && s.endsWith("]"))) {
+            try { return JSON.parse(s); } catch {}
+          }
+          return s;
         }
 
         // Best-effort balanced-brace JSON extraction. Returns the parsed
@@ -2011,12 +2164,20 @@ async function serve(port: number) {
         // intact in message.content for clients that want a single-string
         // representation including reasoning. <|im_end|> stripping always
         // applies (it would break clients that re-encode message history).
+        const strippedContent = content;
         if (preserveThinking) {
           content = content.replace(/<\|im_end\|>/g, "").trim();
         } else {
           content = content.replace(/<think>[\s\S]*?<\/think>\s*/g, "")
             .replace(/<think>[\s\S]*$/, "") // unclosed think block
             .replace(/<\|im_end\|>/g, "").trim();
+        }
+
+        // Diagnostic: detect empty-after-unclosed-think-strip.
+        let thinkWarning: string | null = null;
+        if (!content && completionTokens > 0 && strippedContent.includes("<think>")) {
+          thinkWarning = "empty after unclosed think strip";
+          console.error(`[hipfire] ${reqId}: ${thinkWarning} — ${completionTokens} tokens consumed, all inside unclosed <think> block`);
         }
 
         // Check for tool calls in response
@@ -2029,11 +2190,15 @@ async function serve(port: number) {
         }
 
         safeRelease();
-        return Response.json({
+        const responseBody: any = {
           id: reqId, object: "chat.completion", created, model: modelName,
           choices: [choice],
           usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens }
-        });
+        };
+        if (thinkWarning) {
+          responseBody.x_hipfire_warning = thinkWarning;
+        }
+        return Response.json(responseBody);
       } catch (err: any) {
         safeRelease();
         return Response.json({ error: err?.message || "internal error" }, { status: 500 });
@@ -2385,7 +2550,7 @@ function listLocal() {
     let entries: string[];
     try { entries = readdirSync(dir); } catch { continue; }
     for (const f of entries) {
-      if ((f.endsWith(".hf4") || f.endsWith(".hf6") || f.endsWith(".hfq") || f.endsWith(".mq4") || f.endsWith(".mq6")) && !seen.has(f)) {
+      if ((f.endsWith(".hf4") || f.endsWith(".hf6") || f.endsWith(".hfq") || f.endsWith(".mq3") || f.endsWith(".mq4") || f.endsWith(".mq6")) && !seen.has(f)) {
         seen.add(f);
         // statSync may throw on dangling symlinks or files removed mid-scan;
         // skip those individually instead of aborting the rest of the loop
@@ -3979,13 +4144,15 @@ switch (cmd) {
   }
   case "run": {
     const model = rest[0];
-    if (!model) { console.error("Usage: hipfire run <model> [flags] [prompt]\n\nFlags:\n  --temp <float>           Temperature (default 0.3)\n  --top-p <float>          Top-p sampling (default 0.8)\n  --repeat-penalty <float> Repeat penalty (default 1.05)\n  --max-tokens <int>       Max tokens to generate (default 512)\n  --image <path>           Image for VL models\n\nExamples:\n  hipfire run qwen3.5:9b \"Hello\"\n  hipfire run qwen3.5:9b --temp 0.7 --max-tokens 256 \"Write a poem\"\n  hipfire run qwen3.5:4b --image photo.png \"Describe this\""); process.exit(1); }
+    if (!model) { console.error("Usage: hipfire run <model> [flags] [prompt]\n\nFlags:\n  --temp <float>           Temperature (default 0.3)\n  --top-p <float>          Top-p sampling (default 0.8)\n  --repeat-penalty <float> Repeat penalty (default 1.05)\n  --max-tokens <int>       Max tokens to generate (default 512)\n  --image <path>           Image for VL models\n  --system <text>          System prompt (overrides per-model default)\n\nExamples:\n  hipfire run qwen3.5:9b \"Hello\"\n  hipfire run qwen3.5:9b --temp 0.7 --max-tokens 256 \"Write a poem\"\n  hipfire run qwen3.5:4b --image photo.png \"Describe this\"\n  hipfire run qwen3.5:9b --system \"You are terse.\" \"Summarize quantum mechanics\""); process.exit(1); }
     // Parse --key value flags
     const flagDefs: Record<string, { default: number | string | undefined }> = {
       "--image": { default: undefined }, "--temp": { default: 0.3 },
       "--top-p": { default: 0.8 }, "--repeat-penalty": { default: 1.05 },
       "--max-tokens": { default: 512 },
+      "--system": { default: undefined },
     };
+    const stringFlags = new Set(["--image", "--system"]);
     const flags: Record<string, string> = {};
     const flagIndices = new Set<number>();
     for (const key of Object.keys(flagDefs)) {
@@ -3995,7 +4162,7 @@ switch (cmd) {
         // Reject flag values that look like other flags
         if (val.startsWith("--")) { console.error(`Error: ${key} requires a value, got '${val}'`); process.exit(1); }
         // Validate numeric flags
-        if (key !== "--image" && isNaN(Number(val))) { console.error(`Error: ${key} requires a number, got '${val}'`); process.exit(1); }
+        if (!stringFlags.has(key) && isNaN(Number(val))) { console.error(`Error: ${key} requires a number, got '${val}'`); process.exit(1); }
         flags[key] = val;
         flagIndices.add(idx); flagIndices.add(idx + 1);
       } else if (idx >= 0) {
@@ -4003,6 +4170,7 @@ switch (cmd) {
       }
     }
     const image = flags["--image"];
+    const system = flags["--system"];
     const runCfg = resolveModelConfig(model);
     const temp = Number(flags["--temp"] ?? runCfg.temperature);
     const topP = Number(flags["--top-p"] ?? runCfg.top_p);
@@ -4014,7 +4182,7 @@ switch (cmd) {
     if (maxTokens < 1) { console.error("Error: --max-tokens must be >= 1"); process.exit(1); }
     const filtered = rest.slice(1).filter((_, i) => !flagIndices.has(i + 1));
     const prompt = filtered.join(" ") || (image ? "Describe this image." : "Hello");
-    await run(model, prompt, image, temp, maxTokens, repeatPenalty, topP);
+    await run(model, prompt, image, temp, maxTokens, repeatPenalty, topP, system);
     break;
   }
   case "chat": {
