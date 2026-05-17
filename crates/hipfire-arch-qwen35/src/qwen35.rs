@@ -2119,10 +2119,18 @@ fn moe_ffn_decode_impl(
         None
     };
 
-    // GPU-topk fast path requires the 4-way fused preamble (gate_side_mq4)
-    // for atomically-safe softmax-over-routed-logits. Routed-only-MQ4 paths
-    // still fall through to the CPU-top-K kernarg-fused branch.
-    let use_gpu_topk = k == 8 && gate_side_mq4 && routed_mq4 && routed_gate_up_mq4;
+    // GPU-topk fast path: requires k==8 and routed-side MQ4 (both gate_up
+    // AND down) plus x_rot_local. The earlier `gate_side_mq4` requirement
+    // was over-strict — softmax-over-router_logits doesn't care whether the
+    // preamble was fused (HFQ4G256 router) or split (Q8 router via
+    // weight_gemv); router_logits is just a regular [n_exp] buffer either
+    // way. Dropping gate_side_mq4 here unblocks the GPU-topk indexed MoE
+    // kernels (issue #207 Gap 1 dp4a + Gap 5 prefetch) on post-#171 quants
+    // where router is forced to Q8.
+    let use_gpu_topk = k == 8
+        && routed_mq4
+        && routed_gate_up_mq4
+        && x_rot_local.is_some();
 
     // ── 1+2b+3a. Fused 4-way GEMV (router + shared_expert_gate + shared.gate + shared.up) ──
     // All four read the SAME rotated x_rot_local with the SAME K. Fusing them
