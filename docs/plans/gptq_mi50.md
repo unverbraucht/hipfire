@@ -636,4 +636,154 @@ better fit (matches the plan's target torch version exactly); not
 yet pulled — open question whether the K=9216 second-Cholesky issue
 is also present there.
 
-## 12. References
+## 12. Unexplored half-day probes (worth one more pass)
+
+§11.7 enumerated four "expensive" resolution options. Two are actually
+half-day go/no-go gates, not multi-day projects. Both ride on the same
+observation: the bug is specifically `rocBLAS FP64 cholesky_ex` at large
+K — the rest of rocBLAS (sgemm, dgemm, indexing, FWHT) appears to work
+fine per the partial 4B run completing 219 GPTQ tensors. If we can route
+the Cholesky around the broken kernel without re-implementing the world,
+gfx906 becomes viable for Stage C at least.
+
+### 12.1 Probe A — scipy CPU LAPACK Cholesky as side-channel
+
+§11.6 found `torch.linalg.cholesky_ex` unavailable in the matched
+mixa3607 torch build (no LAPACK linkage). But `scipy` and `numpy` ship
+their OWN LAPACK linkage (OpenBLAS / MKL via the scipy wheel),
+independent of torch's build flags. So we can do:
+
+```python
+# In algo.py::compute_damped_inv_cholesky_upper, when on gfx906:
+import scipy.linalg
+l_np = scipy.linalg.cholesky(h_eff.cpu().numpy(), lower=True)
+l = torch.from_numpy(l_np).to(h_eff.device)
+# Continue downstream: cholesky_inverse on CPU too, second chol on CPU,
+# only the OBS column loop on GPU
+```
+
+**Per-tensor wall budget on a Ryzen 5 4650G (the dev host's CPU, 6
+cores, MKL or OpenBLAS sustained ~150-300 GFLOPS FP64):**
+
+| K | K³/3 FLOPS | CPU Cholesky | GPU OBS (the real cost) | Total per tensor |
+|---:|---:|---:|---:|---:|
+| 5120 | 4.5e10 | ~0.3s | ~5s | ~5s |
+| 9216 | 2.6e11 | ~1.5s | ~25s | ~26s |
+| 12288 | 6.2e11 | ~3.5s | ~50s | ~53s |
+| 17408 | 1.76e12 | ~10s | ~100s | ~110s |
+
+CPU Cholesky adds <10% wall at K=17408. Per-tensor totals are within
+20% of 5070 Ti's per-tensor wall — and correct.
+
+**Probe script (30 min to run):**
+
+```bash
+# Inside the mixa3607 container:
+pip install scipy
+
+python - <<'PY'
+import numpy as np, scipy.linalg, torch, time
+torch.manual_seed(0)
+for K in (4096, 9216, 12288, 17408):
+    a = torch.randn(K, K, dtype=torch.float64)
+    h = a @ a.T + K * torch.eye(K, dtype=torch.float64)
+    t0 = time.time()
+    L_np = scipy.linalg.cholesky(h.numpy(), lower=True)
+    t_chol = time.time() - t0
+    L = torch.from_numpy(L_np)
+    err = (L @ L.T - h).abs().max().item()
+    print(f"K={K:>5} scipy CPU LAPACK chol: {t_chol:5.2f}s, residual {err:.3e}")
+PY
+```
+
+**Go criterion:** residual ≤ 1e-12 at all K ≤ 17408 (LAPACK is robust at
+these sizes). **No-go:** residual > 1e-8 (would mean the scipy linkage
+itself is broken on this host — unlikely but possible if OpenBLAS is
+also gimped).
+
+**If A passes:** patch `algo.py::compute_damped_inv_cholesky_upper` to
+accept a `cholesky_backend: str = "gpu"` parameter with values `"gpu"`,
+`"cpu_scipy"`. Default stays "gpu" for CUDA hosts. On the gfx906 host,
+set via env var or CLI. ~2-3h to integrate + run 4B smoke + diff vs the
+5070 Ti baseline md5.
+
+### 12.2 Probe B — FP32 Cholesky + iterative refinement
+
+The §11 probes only tested FP64 Cholesky. The rocBLAS bug is in
+`dpotrf` specifically — `spotrf` (FP32) is a separate kernel that
+might be unaffected. If FP32 works at K≥6144, we can recover FP64
+accuracy via standard hybrid-precision iterative refinement:
+
+```
+L_fp32 = chol(H.float())                   # in FP32 — works on most BLAS
+L_fp64 = L_fp32.double()                   # promote
+# Now refine: x_0 = L^-T L^-1 b
+# r = b - H x_0 in FP64
+# x_1 = x_0 + L^-T L^-1 r
+# 2-3 iterations recover ~FP64 accuracy from FP32 factor.
+```
+
+For our use case (`cholesky_inverse(L)` to get H_inv), the equivalent is:
+
+```
+L_fp32 = chol(H.float())
+H_inv_fp32 = cholesky_inverse(L_fp32)
+# Refine H_inv via: H_inv_new = H_inv * (2*I - H * H_inv) in FP64
+# (Newton iteration on matrix inverse — converges quadratically)
+H_inv_fp64 = H_inv_fp32.double()
+for _ in range(3):
+    H_inv_fp64 = H_inv_fp64 @ (2 * torch.eye(K, dtype=torch.float64, device=...) - H @ H_inv_fp64)
+```
+
+**Probe script (15 min to run):**
+
+```bash
+python - <<'PY'
+import torch, time
+torch.manual_seed(0)
+for K in (4096, 9216, 12288, 17408):
+    a = torch.randn(K, K, dtype=torch.float64, device='cuda:0')
+    h = a @ a.T + K * torch.eye(K, dtype=torch.float64, device='cuda:0')
+    t0 = time.time()
+    l_fp32 = torch.linalg.cholesky(h.float())
+    torch.cuda.synchronize()
+    t_chol = time.time() - t0
+    err = (l_fp32.double() @ l_fp32.double().T - h).abs().max().item()
+    print(f"K={K:>5} FP32 chol on cuda:0: {t_chol:5.2f}s, residual (vs FP64 H) {err:.3e}")
+PY
+```
+
+**Go criterion:** FP32 residual `|L_fp32 L_fp32^T - H|` is small relative
+to FP32 epsilon (~1e-7 × K × max(|H|) is expected — anything dramatically
+larger means the FP32 kernel is also broken). **No-go:** residual >
+1e-3 or any error / hang at K≥6144 (means it's not just `dpotrf` —
+the whole rocBLAS at large K is suspect).
+
+**If B passes:** add `cholesky_backend = "gpu_fp32_refined"` option to
+`compute_damped_inv_cholesky_upper`. Code is more invasive than scipy
+(3-4h to implement + verify the refinement converges across realistic
+Hessian conditioning), but stays on GPU throughout — preserves the FP64
+OBS column loop speedup.
+
+### 12.3 Combined decision tree
+
+| Probe A | Probe B | Recommended path |
+|---|---|---|
+| pass | pass | Use B (stays on GPU; faster). Keep A as failsafe |
+| pass | fail | Use A (scipy CPU Cholesky + GPU rest). Per-tensor wall ~110s at K=17408 → 27B Stage C ≈ 5h (similar to 5070 Ti) |
+| fail | pass | Use B (FP32 + refinement) |
+| fail | fail | Stay parked. Wait for ROCm rocBLAS fix or different hardware |
+
+Two scripts to land alongside this section: `docs/investigations/2026-05-17-mi50-bringup/probe_scipy_cholesky.py` and `probe_fp32_chol.py`. Both can be run in one container session in <1h.
+
+### 12.4 Why this wasn't done in the first pass
+
+Honest postmortem: §11 framed the failure as "rocBLAS is broken, no way
+to use the GPU correctly". That was true in the narrowest sense — direct
+`torch.linalg.cholesky_ex` IS broken — but the framing skipped past the
+obvious workarounds (CPU LAPACK side-channel, FP32 + refinement). Both
+are textbook HPC techniques and add maybe a half-day to the investigation.
+Park-decision was driven by sunk-cost pressure to ship the rename and
+move on; not by exhausting the actual option space.
+
+## 13. References
