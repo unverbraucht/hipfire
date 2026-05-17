@@ -559,3 +559,134 @@ branches mid-flight.
 - **Do NOT skip the AWQ sidecar emission step.** Without `awq_scale.weight`
   in the `.hfq`, the runtime breaks (kernel path divergence + magnitude
   mismatch on activations).
+
+## 11. Phase 8 — 27B endpoint (post-9B follow-up, 2026-05-16/17)
+
+Added after Phases 0-7 (9B) shipped. Covers the changes needed to scale
+the same pipeline from 9B (hidden=4096, intermediate=12288) to
+Qwen3.6-27B (hidden=5120, intermediate=17408, 64 hybrid-arch layers).
+Most of the math is unchanged; the surprises were memory + I/O.
+
+### 11.1 Why 27B is harder than 9B
+
+| Constraint | 9B impact | 27B impact |
+|---|---|---|
+| K_max for Cholesky | 12288 | **17408** — FP64 K×K = 2.4 GB, peak compute graph hits 15.7 GB on a 16 GB card |
+| Total Hessian sidecar | 33 GB | **126 GB** — fits on /data (244 GB free) but won't fit in system RAM, ever |
+| Per-tensor accumulator RAM | ~600 MB (K=12288 max) | **1.2 GB** (K=17408 max); × 64 layers = ~77 GB just on down_projs |
+| Model BF16 | 18 GB (fits on 2× 16 GB GPU) | **54 GB** — must spread across 2× 16 GB GPU + CPU offload |
+
+### 11.2 Patches landed for the 27B path
+
+All on `feat/mq-v2-quant-format-cuda`. Cherry-pickable into other models
+without changing semantics for ≤9B (defaults preserve 9B behavior).
+
+| Commit | Change | Why |
+|---|---|---|
+| `9860597` | `collect_hessian.py --accumulator-dir` (memmap) + `--n-passes N` (multi-pass) | 126 GB Hessian doesn't fit in 32 GB RAM. Memmap accumulators to disk + multi-pass over disjoint layer subsets bound per-pass RAM to ~30 GB |
+| `16b9551` | `collect_hessian.py --max-gpu-mem` | `device_map="auto"` without an explicit cap packs everything to GPU first, OOMs during `_init_weights`'s FP32 cast. Cap to 14 GiB/card → forces ~31 layers to CPU |
+| `5c50d16` | `collect_hessian.py` always passes `logits_to_keep=1` | Default forward runs lm_head on all 2048 positions → [B, 2048, 248320] BF16 ≈ 1 GB on whichever device lm_head lives on, OOMs the GPU. Hessian collector never uses logits anyway |
+| `2c453fb` | Memory-frugal `compute_damped_inv_cholesky_upper` | K=17408 cholesky workspace peaked at ~17 GB. Switch `solve_triangular → cholesky_inverse`, in-place damp on diagonal, aggressive `del`, consume `h_unrot` instead of cloning, pre-permute outside helper. Drops peak to 15.7 GB |
+
+### 11.3 Stage breakdown for 27B (measured wall on dual RTX 5070 Ti)
+
+| Stage | Tool | Wall | Output |
+|---|---|---:|---|
+| A. Imatrix | `llama-imatrix -ngl 28` (28 GPU + 36 CPU layers) on Qwen3.6-27B-BF16 GGUF, 128 chunks × 2048 ctx | **3.3h** | `benchmarks/quality-baselines/refs/qwen3.6-27b-bf16.imatrix.gguf` (13.6 MB, PPL 7.92 ± 0.07 on wikitext-2) |
+| B. Hessian collection | `collect_hessian.py --n-passes 4 --accumulator-dir ~/.hipfire/hessian-acc-27b/ --max-gpu-mem 14GiB --n-sequences 32` | **9.8h** (4× ~2h passes + 18min merge) | `/data/hipfire-refs/qwen3.6-27b-bf16.hessian.bin` (125.83 GB) |
+| C. GPTQ pipeline | `gptq_cuda.py --alpha 0.55 --bits 4 --devices cuda:0 cuda:1` | **~5h** (in flight; K=17408 down_projs at ~130s each are the cost driver) | `/data/hipfire/precomputed-gptq/qwen3.6-27b-mq4-awq-gptq-f2/` (~52 GB manifest) |
+| D. Rust pack | `hipfire-quantize --format mq4 --precomputed-gptq-path <manifest>` | ~15 min | `~/.hipfire/quantized/qwen3.6-27b.mq4-awq-gptq-f2-cuda.hfq` (~14 GB) |
+
+**Stage B note (--n-sequences 32):** the canonical hipfire calibration
+is 128 sequences × 2048 ctx. 27B at 128 seq × `--n-passes 4` was on
+track for ~60h on this hardware due to CPU-offload page-fault thrashing;
+dropped to 32 seq to fit in an overnight window. The Hessian is a
+smoothed expectation that converges fast; 65k tokens vs 262k tokens
+should be within ~5% of asymptotic quality (untested at 27B scale,
+but the 9B equivalent at 128 seq had per-tensor MSE in the 1e-6 range
+and 27B's pass-by-pass per-tensor MSEs look similar so far).
+
+### 11.4 Bottleneck on RTX 5070 Ti for 27B Stage C
+
+K=17408 OBS column-sequential loop is the dominant cost. Per-tensor
+~130s breakdown:
+
+| Phase | ~Time | Why |
+|---|---:|---|
+| Hessian read from NFS (1.2 GB) | 5-12s | NFS ~100 MB/s, OS prefetch helps |
+| Cholesky + cholesky_inverse | ~10s | FP64 matmul, 5×10¹² ops on 0.5 TFLOPS FP64 (Blackwell consumer 1:64 ratio) |
+| **OBS column loop** | **~100s** | 17408 serial steps × scatter-subtract `M × (K-step)` FP64 values — GPU memory bandwidth + Python overhead bound |
+
+**Implication for sizing:** for 35B+ models with K>20k, this scaling
+gets prohibitive on consumer cards. See `docs/plans/gptq_mi50.md` for
+a hardware alternative (Instinct MI50 = 1:2 FP64 ratio, ~13× faster).
+
+## 12. Phase 9 — MQ3 (3-bit) parameterization + 4-variant sweep
+
+Added 2026-05-17 to address the question: does GPTQ + AWQ activation-
+aware uplift make uniform 3-bit grids viable, sidestepping the need
+for Lloyd-Max non-uniform codebooks?
+
+### 12.1 Pipeline parameterization
+
+Commit `2c453fb` makes the bit-width a pipeline parameter. The same
+GPTQ math applies; only the quant grid + bit packing differ:
+
+| Bits | Levels | scale formula | Block layout | Rust pack function |
+|---|---:|---|---|---|
+| 4 | 16 | `range / 15` | 136 B (4B scale + 4B min + 128B nibble pack) | `gptq::pack_mq4g256_from_rotated_f64` |
+| 3 | 8 | `range / 7` | 104 B (4B scale + 4B min + 32 chunks × 3B cross-byte) | `gptq::pack_mq3g256_from_rotated_f64` |
+
+CLI: `gptq_cuda.py --bits {3, 4}`. Manifest schema bumped to v2;
+v1 manifests imply `n_bits=4` for backward-compat. Rust's
+`precomputed_gptq.rs::ManifestMeta.n_bits` reads it and `main.rs`'s
+MQ4G256 branch dispatches on the value (no separate MQ3 branch needed
+— same precomputed-fast-path code runs with a different packer).
+
+### 12.2 The 4-variant sweep
+
+`scripts/mq3_sweep_4b.sh` runs all four cells of the calibration matrix
+at MQ3 on Qwen3.5-4B:
+
+| Variant | --hessian | --imatrix | Hypothesis |
+|---|---|---|---|
+| **RTN** | no | no | Pure round-to-nearest. Master-doc §5 reports collapse on every locally-tested model. Baseline; should be unusable. |
+| **AWQ-only** | no | yes | AWQ pre-scale + RTN pack. Activation balancing without Hessian-aware error propagation. Mid-tier. |
+| **GPTQ-only** | yes | no | Hessian-aware OBS without grid pre-scale. The other agent's proposal. Tests whether GPTQ's error redistribution alone tames 3-bit quantization noise. |
+| **AWQ + GPTQ** | yes | yes | Full pipeline. Best-case for uniform MQ3. If this collapses too, Lloyd-Max non-uniform codebooks (`quantize_mq3g256_lloyd`) are necessary at 3-bit. |
+
+Wall per variant on 4B: ~25 min Stage C + ~2 min Stage D. Total ~1h40m.
+Outputs land in `~/.hipfire/quantized/mq3-sweep/`, then ship to
+gfx1100 for coherence-gate.
+
+### 12.3 Decision tree from sweep results
+
+Run coherence-gate on each .hfq:
+
+- **All 4 collapse** → uniform MQ3 is unviable as a quant format at any
+  calibration. Path D Lloyd-Max non-uniform codebooks are required for
+  3-bit. Reuse existing `quantize_mq3g256_lloyd` (Rust path) — but
+  it doesn't yet integrate with the precomputed-GPTQ manifest, so a
+  separate PR.
+- **Only AWQ+GPTQ is coherent** → uniform MQ3 is salvageable but needs
+  the full activation-aware stack. Default the runtime to require
+  AWQ+GPTQ for any MQ3 .hfq.
+- **GPTQ-only is coherent without AWQ** → simpler quant story; the
+  other agent's proposal works. Lloyd-Max becomes optional optimization.
+- **AWQ-only is enough** → simpler still; Hessian collection isn't
+  necessary at 3-bit. Saves ~10h per model on 27B-class quants.
+
+The empirical answer drives whether 9B and 27B get MQ3 quants and which
+variant.
+
+### 12.4 Future: MQ3 on 9B and 27B
+
+Same flow once the 4B sweep nominates a winner:
+
+- 9B: existing 9B Hessian (`/data/hipfire-refs/qwen3.5-9b-bf16.hessian.bin`,
+  33 GB) + imatrix already on disk. Re-run `gptq_cuda.py --bits 3` ~65 min.
+- 27B: existing 27B Hessian (`/data/hipfire-refs/qwen3.6-27b-bf16.hessian.bin`,
+  126 GB) + imatrix already on disk. Re-run `gptq_cuda.py --bits 3` ~5h.
+
+No Hessian re-collection needed — the Hessian only depends on the
+calibration corpus and the BF16 model, not on the quant bit-width.
