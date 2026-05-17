@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""GPTQ on CUDA — one-shot quantize-time math for hipfire MQ4G256.
+"""GPTQ on GPU — one-shot quantize-time math for hipfire MQ4G256.
 
 Replaces the ~14h CPU-bound GPTQ inner loop in
-`crates/hipfire-quantize/src/gptq.rs` with a Python+CUDA implementation.
-Target: full 9B GPTQ pass in 1-3h wall on a 5070 Ti (per
-`docs/plans/gptq_cuda.md`).
+`crates/hipfire-quantize/src/gptq.rs` with a Python+PyTorch implementation
+that runs on either CUDA (NVIDIA) or HIP/ROCm (AMD) via the standard
+torch.cuda API. Target: full 9B GPTQ pass in 1-3h wall on dual 5070 Ti
+or comparable AMD MI50 (per `docs/plans/gptq_cuda.md` /
+`docs/plans/gptq_mi50.md`).
 
 Produces a "precomputed GPTQ" manifest directory consumed downstream by
 `hipfire-quantize --precomputed-gptq-path <dir>`:
@@ -20,7 +22,7 @@ Produces a "precomputed GPTQ" manifest directory consumed downstream by
     manifest.json              # alpha / damp / source md5 / per-tensor stats.
 
 Usage:
-    python scripts/gptq_cuda.py \\
+    python scripts/gptq_gpu.py \\
         --input ~/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots/<sha> \\
         --hessian /data/hipfire-refs/qwen3.5-9b-bf16.hessian.bin \\
         --imatrix benchmarks/quality-baselines/refs/qwen3.5-9b-bf16.imatrix.gguf \\
@@ -53,18 +55,18 @@ from safetensors.torch import save_file
 
 # Local package import — allow running as a script from repo root.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from gptq_cuda_pkg.algo import (  # noqa: E402
+from gptq_gpu_pkg.algo import (  # noqa: E402
     compute_awq_scales,
     gen_fwht_signs,
 )
-from gptq_cuda_pkg.hfhs import HessianSidecar  # noqa: E402
-from gptq_cuda_pkg.imatrix import imatrix_weights_for, load_imatrix  # noqa: E402
-from gptq_cuda_pkg.names import (  # noqa: E402
+from gptq_gpu_pkg.hfhs import HessianSidecar  # noqa: E402
+from gptq_gpu_pkg.imatrix import imatrix_weights_for, load_imatrix  # noqa: E402
+from gptq_gpu_pkg.names import (  # noqa: E402
     awq_eligible,
     to_hfhs_key,
 )
-from gptq_cuda_pkg.algo import CholeskyFailedError  # noqa: E402
-from gptq_cuda_pkg.pipeline import gptq_one_tensor  # noqa: E402
+from gptq_gpu_pkg.algo import CholeskyFailedError  # noqa: E402
+from gptq_gpu_pkg.pipeline import gptq_one_tensor  # noqa: E402
 
 
 # ─── Eligibility ──────────────────────────────────────────────────────────
@@ -333,7 +335,7 @@ def quantize_model(
                 # from THIS rotated weight. The "GPTQ" step is a no-op.
                 # Same byte-level result Rust's `quantize_mq4g256`
                 # would produce when called without a Hessian sidecar.
-                from gptq_cuda_pkg.algo import (
+                from gptq_gpu_pkg.algo import (
                     apply_fwht_per_256_to_weights,
                     compute_frozen_block_grids,
                     quantize_mq4_with_grid,
@@ -369,7 +371,7 @@ def quantize_model(
             st.error = f"cholesky failed: {e}"
             # Fall back to RTN — same path as no-Hessian above.
             print(f"[fallback] {name}: {e}; emitting RTN pack")
-            from gptq_cuda_pkg.algo import (
+            from gptq_gpu_pkg.algo import (
                 apply_fwht_per_256_to_weights, compute_frozen_block_grids,
             )
             w_rot = w_cpu.to(torch.float64).contiguous()

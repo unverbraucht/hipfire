@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# 9B GPTQ overnight pipeline — CUDA path.
+# 9B GPTQ overnight pipeline — GPU path (CUDA / HIP-ROCm).
 #
-# Replaces the ~14h Rust-CPU GPTQ run with the Python+CUDA pipeline at
-# `scripts/gptq_cuda.py` (per `docs/plans/gptq_cuda.md`). Target wall:
-# 1-3h on the dual RTX 5070 Ti box.
+# Replaces the ~14h Rust-CPU GPTQ run with the Python+GPU pipeline at
+# `scripts/gptq_gpu.py` (per `docs/plans/gptq_cuda.md`). Target wall:
+# 1-3h on the dual RTX 5070 Ti box, or comparable on MI50/MI60
+# (see `docs/plans/gptq_mi50.md`).
 #
 # Stage 1 (Python+CUDA): build the precomputed-gptq manifest.
 # Stage 2 (Rust):        consume manifest, emit .hfq.
@@ -74,7 +75,7 @@ mkdir -p "$(dirname "$MANIFEST_OUT")" "$(dirname "$HFQ_OUT")"
 
 LOG="$MANIFEST_OUT.log"
 
-echo "=== Stage 1: Python+CUDA GPTQ → manifest ==="
+echo "=== Stage 1: Python+GPU GPTQ → manifest ==="
 echo "    source:   $SOURCE_MODEL"
 echo "    hessian:  $HESSIAN"
 echo "    imatrix:  $IMATRIX"
@@ -85,7 +86,7 @@ echo "    log:      $LOG"
 echo
 
 # Tee output so the user can watch and grep clamp counts mid-run.
-./.venv-cuda/bin/python scripts/gptq_cuda.py \
+./.venv-cuda/bin/python scripts/gptq_gpu.py \
     --input "$SOURCE_MODEL" \
     --hessian "$HESSIAN" \
     --imatrix "$IMATRIX" \

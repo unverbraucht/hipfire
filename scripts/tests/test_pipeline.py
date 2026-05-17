@@ -25,13 +25,13 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from gptq_cuda_pkg.algo import (  # noqa: E402
+from gptq_gpu_pkg.algo import (  # noqa: E402
     apply_fwht_per_256_to_weights,
     compute_frozen_block_grids,
     gen_fwht_signs,
     quantize_mq4_with_grid,
 )
-from gptq_cuda_pkg.pipeline import gptq_one_tensor  # noqa: E402
+from gptq_gpu_pkg.pipeline import gptq_one_tensor  # noqa: E402
 
 
 def _synth_tensor(m: int, k: int, *, seed: int = 0, device: str = "cpu") -> tuple[torch.Tensor, torch.Tensor]:

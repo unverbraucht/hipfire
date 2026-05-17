@@ -1,7 +1,7 @@
 """Per-tensor GPTQ pipeline: full quantize-time chain for one MQ4G256 tensor.
 
 Mirrors `gptq.rs::gptq_pipeline_mq4g256` step-by-step, all in FP64 on
-CUDA. Inputs: BF16/F32 weight, FP32 unrotated Hessian (from HFHS sidecar),
+GPU (CUDA or HIP/ROCm). Inputs: BF16/F32 weight, FP32 unrotated Hessian (from HFHS sidecar),
 AWQ scale vector (or `ones(K)` for non-AWQ tensors), FWHT signs.
 
 Output: the **PipelineResult** dataclass holding the post-GPTQ weights

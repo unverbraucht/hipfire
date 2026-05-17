@@ -67,8 +67,8 @@ run_variant() {
         PY_ARGS+=(--imatrix "$IMATRIX")
     fi
 
-    echo "[$(date '+%H:%M:%S')] Stage C — Python+CUDA → manifest"
-    ./.venv-cuda/bin/python scripts/gptq_cuda.py "${PY_ARGS[@]}" \
+    echo "[$(date '+%H:%M:%S')] Stage C — Python+GPU → manifest"
+    ./.venv-cuda/bin/python scripts/gptq_gpu.py "${PY_ARGS[@]}" \
         > "$STAGE_C_LOG" 2>&1
     echo "[$(date '+%H:%M:%S')] Stage C done. Last 3 log lines:"
     tail -3 "$STAGE_C_LOG"
