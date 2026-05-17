@@ -242,7 +242,97 @@ memory-frugal Cholesky, etc. — see `gptq_cuda.md` §11.2) mean the
 slowness is structural to consumer-Blackwell FP64 + VRAM, not fixable
 in software.
 
-## 10. References
+## 10. Companion proposal: rename `gptq_cuda` → `gptq_gpu`
+
+**Status**: not done. Worth doing as part of MI50 migration prep, or
+as a standalone cleanup whenever the GPU is idle (~30 min mechanical
+work including verification).
+
+### Motivation
+
+§3 above audits that the entire pipeline is backend-agnostic — every
+GPU op is `torch.*` or `torch.cuda.*`, and `torch.cuda.*` is the
+shared API surface for both NVIDIA CUDA and AMD ROCm/HIP (PyTorch's
+design choice for compatibility). The current naming
+(`scripts/gptq_cuda.py`, `scripts/gptq_cuda_pkg/`) misleadingly
+suggests NVIDIA-only when in fact the code runs unmodified on MI50
+via the mixa3607 ROCm path.
+
+Renaming makes the portability explicit, removes a friction point for
+anyone reading the code and wondering "do I need NVIDIA hardware to
+contribute?", and avoids the awkward `scripts/gptq_cuda.py` invocation
+on a ROCm box.
+
+### Scope
+
+Mechanical file moves + import updates:
+
+| Path before | Path after |
+|---|---|
+| `scripts/gptq_cuda.py` | `scripts/gptq_gpu.py` |
+| `scripts/gptq_cuda_pkg/` (dir + 6 files) | `scripts/gptq_gpu_pkg/` |
+
+Reference updates:
+
+- Imports in renamed `gptq_gpu.py` (top-level + 2 lazy imports inside
+  fallback paths)
+- Imports in `scripts/tests/test_gptq_algo.py`, `scripts/tests/test_pipeline.py`
+- Path references in `scripts/mq3_sweep_4b.sh`, `scripts/gptq_9b_overnight.sh`
+- Doc pointers in `docs/plans/gptq_cuda.md`, `docs/plans/gptq_mi50.md`
+- Rust comments in `crates/hipfire-quantize/src/main.rs` (~107) and
+  `crates/hipfire-quantize/src/precomputed_gptq.rs` (~1, ~304)
+
+Functional code is unaffected — the rename touches only paths and
+identifiers, not algorithm or API.
+
+### Verification after rename
+
+```
+PYTHONPATH=scripts ./.venv-cuda/bin/python \
+    -m unittest scripts/tests/test_gptq_algo.py \
+                scripts/tests/test_pipeline.py
+# Expect: 30/30 tests pass
+
+cargo build --release -p hipfire-quantize
+# Expect: clean build (only pre-existing dead-code warnings)
+```
+
+### Timing — when NOT to do it
+
+If a `gptq_gpu.py` (formerly `gptq_cuda.py`) process is currently
+running, the rename mid-flight risks crashing it if a lazy import path
+fires after the rename:
+
+- `gptq_cuda.py:336` — `from gptq_cuda_pkg.algo import (...)` inside
+  the RTN-fallback branch (triggers when a tensor has no Hessian
+  entry — at 27B this never fires because all eligible tensors have
+  Hessians, but at 4B/9B with vision encoder tensors it does)
+- `gptq_cuda.py:372` — `from gptq_cuda_pkg.algo import (...)` inside
+  the `except CholeskyFailedError` block (triggers on adaptive-damping
+  failure — hasn't fired in any production run so far, but possible)
+
+A running process has the OLD module paths in `sys.modules` from
+startup; if it lazy-imports the OLD path after we rename the dir,
+ImportError. Two mitigations:
+
+1. **Defer**: do the rename when no `gptq_*.py` process is in flight.
+2. **Temporary symlink** during the run: `ln -sfn gptq_gpu_pkg scripts/gptq_cuda_pkg`
+   so the old import path still resolves until the running process
+   finishes. Drop the symlink in a follow-up commit.
+
+For typical re-quant runs the rename takes ~30 min; just wait for the
+GPU to clear.
+
+### Acceptance criteria
+
+- 30/30 Python tests pass
+- Rust build clean
+- One representative end-to-end smoke (4B Stage C+D on the renamed
+  `gptq_gpu.py`) produces a byte-identical `.hfq` to the pre-rename
+  baseline — md5 match against `~/.hipfire/quantized/qwen3.5-4b.mq4-cuda.hfq`
+  (`bf4063ded4182d8b5a7cd275c06641e5`)
+
+## 11. References
 
 - `docs/plans/gptq_cuda.md` — the canonical pipeline plan; §11 covers
   what was needed for 27B that informs this migration's gains
