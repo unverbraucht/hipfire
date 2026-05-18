@@ -201,62 +201,125 @@ gate to a new format is one diff. Same shape here:
 
 5. **Tied-embed assertion** (runtime check at quantize start) — see §3.4.
 
-### 3.2 Phase 2 — runtime: AWQ-aware lm_head dispatch (BLOCKING)
+### 3.2 Phase 2 — runtime: AWQ-aware lm_head dispatch — SHIPPED on `fix/lm-head-awq-runtime`
 
-**Phase 1 alone produces an unusable `.hfq`.** If the runtime doesn't
-apply `x / s` between the final norm and the lm_head gemv, the
-AWQ-pre-scaled weights produce `(W·s)·x ≠ W·x` — the exact corruption
-master-doc §6 rule 5 warns about (KLD 0.67 → 13.5 on 0.8B Qwen3.5
-measured when this guard was missing). Phase 1 and Phase 2 **must
-ship as a single PR**.
+**Status (2026-05-18 PM)**: PR open on `fix/lm-head-awq-runtime` by the
+gfx1151 agent (t20). Architecture is cleaner than this plan originally
+sketched; this section is rewritten to reflect what actually shipped.
 
-Safety guard: **gate the Phase 1 quantizer flag behind a second env
-var until Phase 2 lands**:
+The original architecture sketch (manual `awq_scale.is_some()` checks
+at each of ~7 lm_head call sites + a `weight_gemv_with_optional_awq`
+helper) is **superseded**. t20 shipped a centralized
+`DType::supports_awq_sidecar()` allow-list approach + caught dispatch
+sites this plan hadn't enumerated.
+
+#### What shipped
+
+**`DType::supports_awq_sidecar()` allow-list** (`rdna-compute/dispatch.rs`):
 
 ```rust
-if env::var("HIPFIRE_QUANTIZE_LM_HEAD_MQ4_AWQ").is_ok()
-    && env::var("HIPFIRE_LM_HEAD_AWQ_UNSAFE").as_deref() != Ok("1")
-{
-    eprintln!("error: HIPFIRE_QUANTIZE_LM_HEAD_MQ4_AWQ requires \
-              HIPFIRE_LM_HEAD_AWQ_UNSAFE=1 until runtime support lands. \
-              Setting only the first env produces .hfq files that the \
-              current runtime cannot consume correctly.");
-    std::process::exit(2);
+pub fn supports_awq_sidecar(self) -> bool {
+    matches!(self, DType::MQ4G256 | DType::MQ3G256)
 }
 ```
 
-Drop the `_UNSAFE=1` requirement in the same commit that lands Phase 2.
+Centralizes the gate. Future format additions (MQ6, MQ2, MQ2Lloyd,
+MQ3Lloyd, MFP4) are explicitly enumerated as "forward-path-ready
+candidates not currently in the allow-list — widen only after the
+quantizer side is verified to emit sidecars and at least one
+coherence-gate row exercises the combination." MQ8G256 is explicitly
+excluded (no AWQ-aware kernel path, uses its own INT8-quantized
+scratch path).
 
-**Dispatch design — single option, no flip-flop**:
+**Loader rewiring** (`hipfire-runtime/hfq.rs::load_weight_tensor`):
 
-Reuse `kernels/src/rotate_x_mq_awq.hip` (already exists for o_proj /
-out_proj input prep). It does FWHT-256 rotation + AWQ divide on x.
-For lm_head:
+The old code attached `awq_scale = load_awq_scale()` inline at the
+MQ4G256 arm only. New code attaches the sidecar at the END of the
+match, gated by `supports_awq_sidecar()` — so adding a new
+AWQ-eligible format is a one-line edit to the allow-list, not a
+per-arm hunt across loaders.
+
+**lm_head sidecar attachment** at `qwen35.rs::load_weights` AND
+`qwen35.rs::load_weights_vl` (the multimodal variant the original
+plan missed). Naming-variant fallback chain:
 
 ```rust
-// Pseudocode at each of the ~7 lm_head call sites in llama.rs:
-gpu.rmsnorm_f32(&scratch.x, &weights.output_norm, &scratch.tmp, eps)?;
-if let Some(awq) = weights.output.awq_scale.as_ref() {
-    gpu.rotate_x_mq_awq(&scratch.tmp, awq, &scratch.tmp_rotated)?;
-    weight_gemv(gpu, &weights.output, &scratch.tmp_rotated, &scratch.logits)?;
-} else {
-    weight_gemv(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
-}
+output.awq_scale = load_awq_scale_for(hfq, gpu, "lm_head.weight", config.dim)
+    .or_else(|| load_awq_scale_for(hfq, gpu, "model.language_model.lm_head.weight", config.dim))
+    .or_else(|| load_awq_scale_for(hfq, gpu, "model.language_model.embed_tokens.weight", config.dim));
 ```
 
-(The `rotate_x_mq_awq` call subsumes the rotation that the MQ4G256
-gemv kernel currently expects on its input — for Q8 storage there's
-no rotation, hence the branch.)
+The third lookup is the **tied-embed fallback** — if lm_head shares
+storage with embed_tokens, the AWQ scale would be stored under
+embed_tokens's name. For our `.hfq` files this fallback is dormant
+(our quantizer-side gate refuses tied models), but t20 added it as
+forward-defensive.
 
-Performance: this is one extra kernel launch (FWHT-256 + divide on
-hidden=5120) per decoded token. Sub-microsecond on 5070 Ti.
-Optimization to a fused `fused_final_rmsnorm_rotate_awq` kernel is a
-follow-up if profiling shows it on the critical path; not needed for
-correctness.
+**Spec-decode (DFlash) coverage** — sites this plan completely missed:
 
-Refactor: rather than copy-paste the if/else at 7 sites, introduce a
-helper `weight_gemv_with_optional_awq` or similar that encapsulates the
-branch. Call sites become one line each.
+`hipfire-arch-qwen35/speculative.rs` has **7 additional lm_head
+dispatch sites** beyond the decode path:
+- Target-verify branches (2)
+- Drafter dispatch (3)
+- Recovery / fallback (2)
+
+All seven changed from `gpu.rotate_x_mq_batched(...)` to
+`llama::rotate_x_mq_batched_for(gpu, w_out, ...)` — the `_for` suffix
+indicates the AWQ-aware variant that dispatches based on
+`w_out.awq_scale.is_some()`. Numerically identical to the original
+when no sidecar exists; correct when a sidecar is attached.
+
+t20's commit message explicitly references the failure mode this
+fixed: *"Pre-fix, attaching a sidecar on lm_head would have produced
+`(W·s)·x ≠ W·x` via the spec-verify path's plain `rotate_x_mq_batched`
+and driven the KLD 0.67 → 13.5 corruption documented at
+`docs/plans/awq_fix_claude.md`."*
+
+**Drafter loader** (`hipfire-runtime/dflash.rs`): the DFlash speculative
+decoder has its own weight loader. Same `supports_awq_sidecar()`
+attachment pattern applied. Third copy of the load logic — t20 flagged
+factoring to a shared helper as follow-up.
+
+**Coherence-gate regression rows** (`scripts/coherence-gate.sh`):
+- `mq3-awq-paris` — catches a regression of the May 18 MQ3 sidecar
+  loader bug
+- `lm-head-awq-...` — catches a regression of the lm_head AWQ
+  dispatch
+
+#### `HIPFIRE_LM_HEAD_AWQ_UNSAFE=1` gate disposition
+
+The Phase 1 quant-time gate (refuses to produce a `.hfq` with
+`HIPFIRE_QUANTIZE_LM_HEAD_MQ4_AWQ=1` unless `_UNSAFE=1` is also set)
+is **still in our branch** (`feat/mq-v2-quant-format-cuda`) but
+**should be dropped** once `fix/lm-head-awq-runtime` merges.
+
+The drop sequence:
+1. `fix/lm-head-awq-runtime` merges to master
+2. `feat/configurable-kmap-pair` rebases on master, merges
+3. `feat/mq-v2-quant-format-cuda` (us) rebases on the result
+4. In our rebase, remove the `_UNSAFE=1` requirement check at
+   `main.rs:3958+`
+
+The `--lm-head-format mq4` CLI surface (from `feat/configurable-kmap-pair`)
+then becomes the canonical path; our env var is honored as a
+deprecated alias for one release cycle per their merge.
+
+#### Performance impact (per t20's notes)
+
+One extra kernel launch per decoded token (`rotate_x_mq_for`
+selecting the AWQ-aware variant). Sub-microsecond on RDNA3+
+hardware. Fused `fused_final_rmsnorm_rotate_awq` is a future
+optimization if profiling shows it on the critical path; not needed
+for correctness or shipping.
+
+#### What our (CUDA branch) work needs to do
+
+- **Nothing blocking before t20's PR merges.** Our quant-side gates
+  ensure correctness; the runtime drops the `_UNSAFE=1` gate.
+- **After merge**: rebase our branch, drop the `_UNSAFE=1` check
+  (~5 lines), update any test/doc references.
+- **Vision Phase 3**: still our work, still hard-blocked on runtime
+  AWQ-aware vision kernels (separate from lm_head's path).
 
 ### 3.3 Phase 3 — vision encoder AWQ (FOLLOW-UP, HARD-BLOCKED)
 
@@ -633,9 +696,12 @@ was contingent on Stage B re-run cost being free, which it isn't.
 | Imatrix-coverage gate (`--awq` + `--precomputed-gptq-path` modes) | ✅ shipped | `50077a4` + `53e613f` |
 | Python `is_mq4g256_eligible` honors env for lm_head | ✅ shipped (today) | `53e613f` |
 | 4B MQ3+AWQ+GPTQ validation on gfx1151 | ✅ done | KLD 0.197, PPL 11.65 |
-| 9B MQ4+AWQ+GPTQ+lm_head .hfq production | 🔄 in flight | A100 cloud box, ETA 15:13 UTC |
-| 27B equivalent | ⏳ auto-launches after 9B | ~8-12h wall expected |
-| **Runtime AWQ-aware lm_head dispatch** | **🚧 handed off** to gfx1151 agent (`fix/mq3-awq-loader` lineage) | `/tmp/awq_lm_head_handoff.md` |
+| 9B MQ4+AWQ+GPTQ+lm_head .hfq production | ✅ landed 15:07 UTC | md5 `c6335cd0…` (subsequently deleted to free disk for 27B) |
+| 27B MQ4+AWQ+GPTQ+lm_head .hfq production | 🔄 in flight on A100 | Stage A ~50% as of 15:40 UTC |
+| 9B MQ3+AWQ+GPTQ+lm_head .hfq (queued) | ⏳ auto-fires after 27B done | Path A serial; ~30-60 min |
+| **Runtime AWQ-aware lm_head dispatch (decode + spec-decode + drafter)** | **✅ shipped on `fix/lm-head-awq-runtime`** by t20 (PR open) | `DType::supports_awq_sidecar` allow-list + 13+ dispatch sites patched; coherence-gate rows added |
+| `--lm-head-format` / `--kmap-promote` CLI | ✅ shipped on `feat/configurable-kmap-pair` | `QuantLevel::Override` + `QuantLevel::Promote(fmt)`; our env var honored as deprecated alias |
+| Drop `HIPFIRE_LM_HEAD_AWQ_UNSAFE=1` safety gate | ⏳ pending merge of `fix/lm-head-awq-runtime` | ~5 LOC in our `main.rs:3958+` |
 
 ### Bugs encountered + fixes (2026-05-18)
 
@@ -712,11 +778,17 @@ next data point.
    not be sufficient and we'd want the mixed-precision Plan B
    variant.
 
-3. **Phase 1/2 ship together — release coordination risk.** A
-   developer running quantize in isolation could produce a `.hfq`
+3. **Phase 1/2 ship together — release coordination risk** —
+   ~~A developer running quantize in isolation could produce a `.hfq`
    that triggers the runtime AWQ path on a runtime build that lacks
-   it. **The `HIPFIRE_LM_HEAD_AWQ_UNSAFE=1` gate in §3.2 prevents
-   accidental shipping.** Drop only in the runtime PR.
+   it.~~ **Resolved (2026-05-18 PM)**: runtime side shipped on
+   `fix/lm-head-awq-runtime` (t20). The `HIPFIRE_LM_HEAD_AWQ_UNSAFE=1`
+   gate becomes redundant once that PR merges; we drop it in our
+   rebase (§3.2's "drop sequence"). Coherence-gate has regression
+   rows that exercise both the MQ3-AWQ and lm_head-AWQ paths to catch
+   future loader regressions. Original `.hfq` files produced today
+   are now consumable by `fix/lm-head-awq-runtime`'s runtime; no
+   ABI break.
 
 4. **Coherence-gate masks subtle drift.** Coherence-gate looks for
    attractors/structural failures. AWQ-on-lm_head could shift
