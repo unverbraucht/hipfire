@@ -1375,24 +1375,9 @@ pub fn load_weights(hfq: &mut HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> 
     };
 
     // Try separate lm_head first (untied embeddings, e.g. 9B), fall back to tied embed_tokens.
-    //
-    // **No AWQ sidecar attachment on this path.** The runtime
-    // dispatch for lm_head goes through `gemm_*_batched_lmhead`
-    // kernels which have NO AWQ inverse — they do not divide `x`
-    // by the sidecar before the matmul. Attaching a sidecar here
-    // (today: no-op since the quantizer's `awq_eligible` whitelist
-    // at `hipfire-quantize/src/main.rs:3849` excludes lm_head and
-    // embed_tokens; future: would silently produce `(W·s)·x ≠ W·x`
-    // with KLD blowup of the 0.67 → 13.5 class documented at
-    // `docs/plans/awq_fix_claude.md`) is the exact failure mode the
-    // quantizer-side whitelist is fail-closed against. Routing
-    // `output.gpu_dtype` through `DType::supports_awq_sidecar` would
-    // remove that fail-closed property. When AWQ-aware lm_head
-    // dispatch lands (kernel + fused-norm path), add `output.awq_scale`
-    // attachment AT THAT POINT, not before.
     let lm_head_info = hfq.tensor_data_vec("lm_head.weight")
         .or_else(|| hfq.tensor_data_vec("model.language_model.lm_head.weight"));
-    let output = if let Some((lm_info, lm_data)) = lm_head_info {
+    let mut output = if let Some((lm_info, lm_data)) = lm_head_info {
         eprintln!("  loading output (separate lm_head, qt={})...", lm_info.quant_type);
         load_weight_tensor_raw(gpu, lm_info.quant_type, &lm_data, config.vocab_size, config.dim)?
     } else {
@@ -1424,6 +1409,21 @@ pub fn load_weights(hfq: &mut HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> 
             WeightTensor { buf, gpu_dtype: DType::F32, m: config.vocab_size, k: config.dim, row_stride: 0, awq_scale: None }
         }
     };
+    // AWQ sidecar attachment for lm_head / tied embed_tokens. Safe now
+    // that both decode (`weight_gemv` → `rotate_x_mq_for`) AND spec-
+    // decode verify (`speculative.rs::rotate_x_mq_batched_for`) apply
+    // the `x /= s` inverse when `output.awq_scale.is_some()`. Pre-fix,
+    // attaching a sidecar here would have driven the 0.67 → 13.5 KLD
+    // corruption documented at `docs/plans/awq_fix_claude.md` because
+    // the spec-verify path used the non-AWQ `rotate_x_mq_batched`.
+    // Try each plausible tensor name; `load_awq_scale_for` returns
+    // None when no sidecar exists, so this is a no-op for current
+    // pre-CUDA-pipeline files.
+    if output.gpu_dtype.supports_awq_sidecar() {
+        output.awq_scale = load_awq_scale_for(hfq, gpu, "lm_head.weight", config.dim)
+            .or_else(|| load_awq_scale_for(hfq, gpu, "model.language_model.lm_head.weight", config.dim))
+            .or_else(|| load_awq_scale_for(hfq, gpu, "model.language_model.embed_tokens.weight", config.dim));
+    }
 
     let is_moe = config.num_experts > 0;
     let mut layers = Vec::with_capacity(config.n_layers);
@@ -1621,14 +1621,7 @@ fn load_output_into(
     let lm_head_info = hfq
         .tensor_data("lm_head.weight")
         .or_else(|| hfq.tensor_data("model.language_model.lm_head.weight"));
-    // No AWQ sidecar attachment here — see the sister load_weights
-    // function's lm_head block for the full rationale. TL;DR: the
-    // `gemm_*_batched_lmhead` runtime dispatch lacks an AWQ inverse,
-    // so attaching a sidecar would silently corrupt logits (KLD
-    // 0.67 → 13.5 class per `docs/plans/awq_fix_claude.md`). The
-    // quantizer's `awq_eligible` whitelist is the only fail-closed
-    // safety — keep this path consistent with it.
-    let output = if let Some((lm_info, lm_data)) = lm_head_info {
+    let mut output = if let Some((lm_info, lm_data)) = lm_head_info {
         eprintln!("  loading output (separate lm_head, qt={})...", lm_info.quant_type);
         load_weight_tensor_raw(gpu, lm_info.quant_type, lm_data, config.vocab_size, config.dim)?
     } else {
@@ -1667,6 +1660,15 @@ fn load_output_into(
             WeightTensor { buf, gpu_dtype: DType::F32, m: config.vocab_size, k: config.dim, row_stride: 0, awq_scale: None }
         }
     };
+    // AWQ sidecar attachment — sister of the `load_weights` block.
+    // Safe because both `weight_gemv` (decode) and `speculative.rs`
+    // (spec-verify) route through AWQ-aware rotations on
+    // `output.awq_scale.is_some()`. No-op on current files.
+    if output.gpu_dtype.supports_awq_sidecar() {
+        output.awq_scale = load_awq_scale_for(hfq, gpu, "lm_head.weight", config.dim)
+            .or_else(|| load_awq_scale_for(hfq, gpu, "model.language_model.lm_head.weight", config.dim))
+            .or_else(|| load_awq_scale_for(hfq, gpu, "model.language_model.embed_tokens.weight", config.dim));
+    }
     Ok((output_norm, output))
 }
 

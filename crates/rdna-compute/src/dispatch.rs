@@ -482,21 +482,23 @@ impl DType {
     /// `rotate_x_mq_for`, so there is no AWQ-aware kernel to dispatch
     /// to.
     ///
-    /// **Important — this helper governs per-layer linear projection
-    /// loaders ONLY.** It must NOT be applied to `lm_head` or tied
-    /// `embed_tokens` constructors. Their forward dispatch goes
-    /// through `gemm_*_batched_lmhead` kernels which have no AWQ
-    /// inverse (no `x /= s` divide before the matmul), so attaching
-    /// a sidecar would silently produce `(W·s)·x ≠ W·x` — the
-    /// KLD 0.67 → 13.5 corruption class documented at
-    /// `docs/plans/awq_fix_claude.md`. The quantizer's `awq_eligible`
-    /// whitelist (`hipfire-quantize/src/main.rs:3849`) is the single
-    /// source of truth for which tensors should ever ship sidecars,
-    /// and it excludes lm_head / embed_tokens. The loader sites at
-    /// `qwen35.rs::load_weights` / `load_weights_vl`'s `output`
-    /// construction intentionally do not call this helper — keep
-    /// them consistent with the whitelist until an AWQ-aware
-    /// lm_head dispatch path lands.
+    /// **lm_head / embed_tokens callers:** as of the lm_head-AWQ
+    /// runtime PR, this helper IS safe for the `output` weight in
+    /// `qwen35.rs::load_weights` / `load_weights_vl`. Both dispatch
+    /// paths that consume `weights.output` now route through
+    /// AWQ-aware rotations when a sidecar is attached:
+    /// - Decode: `weight_gemv` → `rotate_x_mq_for` (llama.rs)
+    /// - Spec-decode verify: `speculative.rs::rotate_x_mq_batched_for`
+    ///
+    /// Pre-runtime-fix, attaching a sidecar on lm_head would have
+    /// produced `(W·s)·x ≠ W·x` via the spec-verify path's plain
+    /// `rotate_x_mq_batched` and driven the KLD 0.67 → 13.5
+    /// corruption documented at `docs/plans/awq_fix_claude.md`. The
+    /// quantizer-side `awq_eligible` whitelist
+    /// (`hipfire-quantize/src/main.rs:3849`) still gates which
+    /// tensors actually receive `W' = W·s` pre-multiplication at
+    /// quant time — this helper governs only whether the loader
+    /// attaches an already-emitted sidecar.
     pub fn supports_awq_sidecar(self) -> bool {
         matches!(self, DType::MQ4G256 | DType::MQ3G256)
     }
