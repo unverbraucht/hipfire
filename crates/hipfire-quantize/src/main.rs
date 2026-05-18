@@ -3349,11 +3349,11 @@ fn main() {
 
     let input_dir = args.iter().position(|a| a == "--input")
         .map(|i| &args[i + 1])
-        .unwrap_or_else(|| { eprintln!("Usage: hipfire-quantize --input <model_dir> --output <output.hfq>"); std::process::exit(1); });
+        .unwrap_or_else(|| { eprintln!("Usage: hipfire-quantize --input <model_dir> --output <output.hfq> [--format <fmt>] [--kmap-mode 0|1|2] [--kmap-promote <fmt>] [--lm-head-format <fmt>]"); std::process::exit(1); });
 
     let output_path = args.iter().position(|a| a == "--output")
         .map(|i| &args[i + 1])
-        .unwrap_or_else(|| { eprintln!("Usage: hipfire-quantize --input <model_dir> --output <output.hfq> [--format q8f16|q4f16]"); std::process::exit(1); });
+        .unwrap_or_else(|| { eprintln!("Usage: hipfire-quantize --input <model_dir> --output <output.hfq> [--format <fmt>] [--kmap-mode 0|1|2] [--kmap-promote <fmt>] [--lm-head-format <fmt>]"); std::process::exit(1); });
 
     let format = args.iter().position(|a| a == "--format")
         .map(|i| args[i + 1].as_str())
@@ -4400,12 +4400,12 @@ fn main() {
                             (q, QuantType::MQ3G256Lloyd, 256u32, "MQ3G256Lloyd")
                         }
                         GgufFormat::Mfp4 => {
-                            let m = meta.shape[0];
+                            let m = if meta.shape.len() == 2 { meta.shape[0] } else { 1 };
                             let q = quantize_mfp4g32_2d(&f32_data, m, k_dim, &signs1, &signs2);
                             (q, QuantType::MFP4G32, 32u32, "MFP4G32")
                         }
                         GgufFormat::Hfp4 => {
-                            let m = meta.shape[0];
+                            let m = if meta.shape.len() == 2 { meta.shape[0] } else { 1 };
                             let q = quantize_hfp4g32_2d(&f32_data, m, k_dim);
                             (q, QuantType::HFP4G32, 32u32, "HFP4G32")
                         }
