@@ -79,7 +79,17 @@ def is_mq4g256_eligible(name: str, shape: tuple[int, ...]) -> bool:
 
     Excludes embed/lm_head/norms/conv1d/A_log/dt_bias and any tensor
     whose last-dim K is not divisible by 256.
+
+    Exception: when HIPFIRE_QUANTIZE_LM_HEAD_MQ4_AWQ=1 is set, lm_head
+    becomes eligible (mirrors the Rust kmap override in main.rs:2170+).
+    This lets Stage C compute AWQ scales + frozen grids + GPTQ for
+    lm_head, which then flow through the manifest into Stage D's
+    precomputed-gptq-path. Without this branch, Python silently skips
+    lm_head and produces a manifest with NO AWQ sidecar for it — Stage D
+    would emit lm_head as MQ4 but unscaled. See
+    docs/plans/gptq_lm_head_awq.md §3.1.
     """
+    import os
     if len(shape) != 2:
         return False
     if shape[1] % 256 != 0:
@@ -87,7 +97,7 @@ def is_mq4g256_eligible(name: str, shape: tuple[int, ...]) -> bool:
     if "embed_tokens" in name:
         return False
     if name.endswith("lm_head.weight"):
-        return False
+        return os.environ.get("HIPFIRE_QUANTIZE_LM_HEAD_MQ4_AWQ") == "1"
     if "conv1d" in name:
         return False
     if name.endswith("A_log") or name.endswith("dt_bias"):

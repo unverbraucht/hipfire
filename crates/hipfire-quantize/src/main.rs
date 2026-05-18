@@ -3995,41 +3995,74 @@ fn main() {
             );
             std::process::exit(2);
         }
-        // (c) Imatrix MUST cover output.weight (GGUF twin of lm_head.weight).
-        //     llama-imatrix's default skips lm_head; the wrapper at
-        //     `crates/hipfire-runtime/examples/imatrix_collect.rs` requires
-        //     `--process-output` to opt in. Without coverage, the existing
-        //     `apply_awq_prescale` path silently returns identity scales —
-        //     lm_head would end up MQ4-packed with NO AWQ pre-scaling and
-        //     NO awq_scale.weight sidecar, producing an .hfq that LOOKS
-        //     like an opt-in but isn't. Fail loud here so the operator
-        //     regenerates the imatrix with `--process-output` rather than
-        //     silently shipping a broken-by-design quant.
+        // (c) Source of lm_head AWQ scales MUST be available. Two valid
+        //     sources, depending on which CLI path the operator used:
         //
-        //     Discovered 2026-05-18 — see gptq_lm_head_awq.md §4.1 (which
-        //     v1 marked as a "check"; promoted to hard-block here after
-        //     the 9B smoke produced an AWQ-less lm_head with no warning).
+        //     i.  Direct `--awq --imatrix` mode: scales come from the
+        //         imatrix at quant-time. Require `output.weight` (GGUF
+        //         twin of HF's `lm_head.weight`) in the loaded imatrix.
+        //
+        //     ii. `--precomputed-gptq-path` mode: scales come from the
+        //         manifest's `awq_scales.safetensors`, computed by Stage
+        //         C (Python gptq_gpu.py). No --imatrix is loaded at
+        //         Stage D in this mode. Require an `lm_head.*.awq_scale`
+        //         entry in the manifest.
+        //
+        //     Both default-skip lm_head: llama-imatrix without
+        //     `--process-output` doesn't dump lm_head, and gptq_gpu.py
+        //     without HIPFIRE_QUANTIZE_LM_HEAD_MQ4_AWQ=1 set during its
+        //     run skips lm_head via `is_mq4g256_eligible`. Either way
+        //     the .hfq would emit lm_head as MQ4 but unscaled — fail
+        //     loud here so the operator regenerates the imatrix or
+        //     re-runs Stage C with the right env.
+        //
+        //     Discovered 2026-05-18 (initial gate) + extended same day
+        //     after Stage C-then-Stage D combo found both default-skip
+        //     paths existed.
         let imatrix_has_output = IMATRIX.get()
             .map(|im| im.contains_key("output.weight"))
             .unwrap_or(false);
-        if !imatrix_has_output {
+        let manifest_has_lm_head_awq = PRECOMPUTED_GPTQ.get()
+            .map(|m| {
+                // Try common safetensors naming variants
+                m.has_awq_scale("lm_head.weight")
+                || m.has_awq_scale("output.weight")
+                || m.has_awq_scale("model.lm_head.weight")
+                || m.has_awq_scale("model.language_model.lm_head.weight")
+            })
+            .unwrap_or(false);
+        if !imatrix_has_output && !manifest_has_lm_head_awq {
             eprintln!(
-                "error: HIPFIRE_QUANTIZE_LM_HEAD_MQ4_AWQ=1 is set but the loaded imatrix \
-                does not contain an `output.weight` entry — lm_head AWQ pre-scaling \
-                cannot be computed.\n\
+                "error: HIPFIRE_QUANTIZE_LM_HEAD_MQ4_AWQ=1 is set but NO source of \
+                lm_head AWQ scales is available.\n\
                 \n\
-                Cause: the imatrix file was generated without `--process-output`. \
-                Default llama-imatrix behavior skips lm_head/output to save calibration \
-                time; the hipfire wrapper at `crates/hipfire-runtime/examples/imatrix_collect.rs` \
-                exposes `--process-output` to opt in.\n\
+                Checked:\n\
+                  - loaded imatrix for `output.weight`:    {}\n\
+                  - precomputed-gptq manifest for `lm_head.weight.awq_scale` (or HF/GGUF variants): {}\n\
                 \n\
-                Fix: regenerate the imatrix on the source model with `--process-output`. \
-                Example (cloud-box A100 recipe):\n\
+                Causes:\n\
+                  - llama-imatrix's default skips lm_head/output. Use\n\
+                    `imatrix_collect --process-output` to opt in.\n\
+                  - gptq_gpu.py's `is_mq4g256_eligible` skips lm_head unless\n\
+                    HIPFIRE_QUANTIZE_LM_HEAD_MQ4_AWQ=1 is set during Stage C.\n\
+                \n\
+                Fix path A (direct AWQ+imatrix):\n\
                   cargo run --release --example imatrix_collect -- \\\n\
                     --bf16-gguf <model.gguf> --corpus <slice.txt> \\\n\
                     --output <new.imatrix.gguf> --process-output\n\
+                  Then re-run hipfire-quantize with --awq --imatrix <new>.\n\
                 \n\
-                Wall: ~30-60 min on A100 80 GB for a 9B-class model."
+                Fix path B (precomputed-gptq):\n\
+                  HIPFIRE_QUANTIZE_LM_HEAD_MQ4_AWQ=1 /venv/main/bin/python \\\n\
+                    scripts/gptq_gpu.py --input <model> --hessian <h.bin> \\\n\
+                    --imatrix <imatrix.gguf> --alpha 0.55 --bits 4 \\\n\
+                    --output <manifest-dir> --devices cuda:0\n\
+                  Then re-run hipfire-quantize with --precomputed-gptq-path <manifest-dir>.\n\
+                \n\
+                Wall: ~30 min for Stage C re-run if the Hessian + (process-output) \
+                imatrix are already on disk.",
+                if imatrix_has_output { "YES" } else { "no / not loaded" },
+                if manifest_has_lm_head_awq { "YES" } else { "no / not loaded" },
             );
             std::process::exit(2);
         }
