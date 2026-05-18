@@ -690,3 +690,235 @@ Same flow once the 4B sweep nominates a winner:
 
 No Hessian re-collection needed — the Hessian only depends on the
 calibration corpus and the BF16 model, not on the quant bit-width.
+
+## 13. Vast.ai cloud runbook — user-provided SSH, V100 32 GB
+
+Added 2026-05-18 after a successful Qwen3.6-27B end-to-end on a rented
+vast.ai V100 32 GB box. The full pipeline (Stage B + C + D) ran ~11.5h
+wall on a single card, supervised from this machine over SSH with the
+user's ssh-agent forwarded. This section captures the hand-off pattern
++ the V100 (`sm_70`) specifics that ate time, so the next run is faster
+and a sub-`sm_75` card is avoided when possible.
+
+### 13.1 Hardware sizing
+
+- **`sm_75` floor.** sm_70 (V100) is borderline: PyTorch nightly wheels
+  routinely ship sm_75+ only, the new `fla-core` Triton fast-path can't
+  compile for sm_70, and the cu13.x wheels shipped on most vast templates
+  omit sm_70 kernels entirely (silent `cudaErrorNoKernelImageForDevice`).
+  **Rent a card sm_75 or newer** — T4 (sm_75), RTX 2080/3090/4090, A6000,
+  A100, A40, L4, H100 all qualify and side-step this whole class of
+  breakage. We used V100 only because it was the cheapest 32 GB card on
+  vast at the time.
+- **FP64 matters.** Stage C is K=17408 Cholesky-bound on 27B; ~130-160s
+  per `down_proj` tensor at FP64. V100 has 1:2 FP32:FP64 (excellent);
+  consumer Blackwell `sm_120` (RTX 5070 Ti / 5090) is **1:64** and Stage C
+  blows out to ~10-15h. MI50 = 1:2 but ROCm `cholesky_ex` is broken at
+  K≥6144 (see `gptq_mi50.md`). Pick a card with FP64 ≥ 1:8 or rent more
+  of them.
+- **VRAM ≥ 24 GB** to fit the K=17408 workspace without two-card juggling.
+  32 GB comfortable. 16 GB needs `--max-gpu-mem` + CPU offload (slow path).
+- **Host RAM ≥ 192 GB** if Stage B will offload (any BF16 model >16 GB on
+  a single 16 GB card). 27B Stage B on V100 peaked at **152 GB RSS**.
+- **`/workspace` ≥ 256 GB** for 27B. Tight even then — see §13.4.
+
+### 13.2 Bring-up (user side, before this agent attaches)
+
+1. Spin up vast instance; note SSH port + host.
+2. `ssh-add ~/.ssh/id_rsa` in your local shell (vast's `Welcome to
+   vast.ai` banner is normal).
+3. On the instance: `git clone <fork>/hipfire && cd hipfire && git
+   checkout feat/mq-v2-quant-format-cuda` (or whichever branch carries
+   the parameterized pipeline + Stage D Rust support).
+4. Verify Python ≥ 3.12 and rustup present. The "PyTorch 2.x devel"
+   templates work after a torch reinstall (§13.3); skip the "Jupyter"
+   templates — they preinstall conflicting CUDA stacks.
+5. **Pin the working torch wheel** (V100 only — see §13.3):
+   `pip install 'torch==2.7.1+cu126' --index-url https://download.pytorch.org/whl/cu126`
+6. **Purge `fla-core` entirely** if preinstalled: `pip uninstall -y
+   fla-core`. transformers' `qwen3_5` model_type hard-imports fla; once
+   gone, `is_flash_linear_attention_available()` returns False and the
+   PyTorch reference attention path runs (slower but correct on any card).
+7. Paste the instance's ssh command into your local shell + tell this
+   agent the agent socket path (`echo $SSH_AUTH_SOCK`). Without that
+   path none of the SSH-driven steps below work.
+
+### 13.3 V100 / sm_70 specifics (the hassle to avoid)
+
+- **Torch wheel:** torch 2.11 (cu13.0) ships sm_75+ only. Symptom:
+  `cudaErrorNoKernelImageForDevice` on first `cuda.is_available()`
+  call, otherwise the instance "looks fine." Fix: install
+  `torch==2.7.1+cu126` via the explicit cu126 wheel index. 2.7.x is
+  the last branch packaging sm_70 stably.
+- **`fla-core` Triton compile fails on sm_70:** `PassManager::run
+  failed` during JIT of the first attention kernel. fla-core 0.5.0+
+  also requires torch ≥ 2.7. transformers imports fla unconditionally
+  for qwen3_5; purging it bypasses the import.
+- **`ptrace_scope` is read-only in vast containers:** py-spy can't
+  attach across user namespaces (`Failed to copy Py_Version symbol /
+  Permission denied`). Diagnose hangs via `/proc/<pid>/stat`,
+  `/proc/<pid>/task/*/stat`, `/proc/<pid>/io`. Steadily-growing
+  `utime+stime` with `wchan=0` and high R-thread count = CPU-bound,
+  not deadlocked.
+- **`/venv/main` lives on a 16 GB overlay**, NOT on `/workspace`.
+  pip-installing torch on top of the existing venv exhausts it fast.
+  Run `pip cache purge` before any heavy install; if you need more,
+  install to a fresh venv under `/workspace/.venv-cuda/` and skip the
+  system venv.
+
+### 13.4 Disk layout for 27B (256 GB `/workspace`)
+
+```
+/workspace/
+  hipfire/                              # cloned repo (~500 MB w/ build)
+  .hf_home/hub/models--Qwen--Qwen3.6-27B/  # ~54 GB
+  hipfire-refs/<model>.hessian.bin      # ~118 GB; deletable after Stage C
+  gptq-precomputed/<model>-<variant>/   # ~53 GB manifest; deletable after Stage D
+  <model>.mq4-awq-gptq-f2-<host>.hfq    # ~14 GB final artifact
+  pipeline.log, 27b-stage-{a,b,c,d}.log
+```
+
+Peak: 54 + 118 + 53 + 14 + overhead ≈ **245 GB on 256 GB partition**.
+Delete the Hessian the moment Stage C is verified to give Stage D
+headroom. If you can't, rent a bigger `/workspace`.
+
+### 13.5 Driving from this side — the SSH agent dance
+
+The user's ssh-agent socket from their local shell is the load-bearing
+piece. When they restart their shell (tmux respawn, terminal reopen),
+the old socket goes stale and SSH stops working from our side. Recovery:
+
+```bash
+ssh-add -l   # → "Error connecting to agent: No such file or directory"
+ls -la /tmp/ssh-*/agent.* 2>/dev/null      # find a live one
+export SSH_AUTH_SOCK=/tmp/ssh-<latest>/agent.<pid>
+ssh-add -l   # → lists id_rsa, ready
+```
+
+When neither succeeds, ask the user to `eval "$(ssh-agent -s)" &&
+ssh-add ~/.ssh/id_rsa` in the shell that spawned this session, then
+re-share `$SSH_AUTH_SOCK`. If they're AFK, the supervisor loop simply
+waits — the vast box keeps running.
+
+### 13.6 Detached, supervised stages
+
+Each long stage runs in a detached `tmux` session so the SSH transport
+can die without killing the job:
+
+```bash
+tmux new-session -d -s stage-b \
+  "cd /workspace/hipfire && /venv/main/bin/python scripts/collect_hessian.py \
+     --model <snapshot> --output /workspace/hipfire-refs/<model>.hessian.bin \
+     --n-sequences 32 --ctx-len 2048 --corpus <slice> \
+     --device cuda --dtype bfloat16 --max-gpu-mem 14GiB \
+     --max-cpu-mem 600GiB --n-passes 1 \
+     > /workspace/27b-stage-b.log 2>&1"
+```
+
+Gotchas hit in this run:
+
+- **Use absolute venv paths** inside the tmux command — `/venv/main/bin/python`,
+  not `python`. A detached tmux inherits no shell rc; `python` won't
+  resolve. Same for `cargo`: `source /root/.cargo/env` first or use
+  `/root/.cargo/bin/cargo`.
+- **Redirect inside the tmux invocation**, not outside. `tmux new -d
+  "cmd" > log` captures *tmux's* (empty) stdout, not the cmd's. The
+  `>` must live inside the quoted command string.
+- **`tmux capture-pane -t <session> -p`** is the non-attaching way to
+  peek at live output.
+- **Sessions terminate when the command exits.** If you want
+  post-completion output (md5sum, final size, "DONE" marker), append
+  it inside the command **and** `tee` to a file — once bash exits the
+  pane is gone, `capture-pane` returns `no server running`.
+
+### 13.7 Monitoring the long stages
+
+**Stage B** emits a progress line **every 8 seqs**, not every seq. Logs
+silent for 60-70 min while `etime` and CPU keep climbing is the normal
+pattern, not a hang. Diagnose:
+
+```bash
+grep -cE "^      seq [0-9]+/[0-9]+" /workspace/27b-stage-b.log
+ps -p <pid> -o stat,pcpu,rss,etime
+nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv,noheader
+grep wchar /proc/<pid>/io       # bytes written to stdout
+```
+
+When `wchar` stops growing **and** `utime+stime` in `/proc/<pid>/stat`
+also stops → genuine hang. Both growing → slow but progressing.
+
+**Stage C** emits one line per tensor (cheap to monitor):
+
+```bash
+grep -cE "^  \[[ 0-9]+/[0-9]+\]" stage-c.log
+grep -E "(RTN fallback|CholeskyFailed|OutOfMemory|Traceback)" stage-c.log
+```
+
+**Stage D** emits little. Verify by `.hfq` file size growing toward the
+expected size + md5sum capture.
+
+### 13.8 Recovery: Stage C flag mismatch
+
+Encountered in this run: the V100's checkout had an older `gptq_gpu.py`
+that didn't recognize the driver's `--checkpoint-interval` /
+`--watchdog-timeout-sec` flags. Symptom: Stage C exits in <1s with
+`argparse: unrecognized arguments`. Recovery without code changes — the
+Hessian sidecar is already on disk so nothing is lost:
+
+```bash
+tmux new -d -s stage-c \
+  "cd /workspace/hipfire && /venv/main/bin/python scripts/gptq_gpu.py \
+     --input <snapshot> \
+     --hessian /workspace/hipfire-refs/<model>.hessian.bin \
+     --imatrix <imatrix.gguf> \
+     --alpha 0.55 --bits 4 \
+     --output /workspace/gptq-precomputed/<model>-mq4-awq-gptq-f2 \
+     --devices cuda:0 \
+     -v > /workspace/27b-stage-c.log 2>&1"
+```
+
+If your local has newer fixes, `git fetch origin && git reset --hard
+origin/<branch>` on the box first — but if vast's outbound git auth
+fails (we hit this), strip the unsupported flags and re-launch instead.
+
+### 13.9 Cleanup + hand-back
+
+After Stage D produces a verified `.hfq`:
+
+```bash
+md5sum /workspace/<model>.hfq                       # capture this BEFORE deleting anything
+scp -P <port> root@<host>:/workspace/<model>.hfq <local-dest>/
+# Then on the box:
+rm /workspace/hipfire-refs/<model>.hessian.bin       # 118 GB
+rm -rf /workspace/gptq-precomputed/<model>-*/        # 53 GB
+rm -rf /workspace/.hf_home/hub                        # 54 GB
+df -h /workspace
+```
+
+**Generic Hessian compression is not worth doing.** Empirical test on a
+1 GB slice of the 27B Hessian: `zstd -3` gives 1.071× ratio (8 GB saved
+on 118 GB), `zstd -19` gives 1.073× ratio — same compressed size, 20×
+slower. FP64 mantissa noise is near-maximum byte-entropy. If you want a
+smaller Hessian for future iteration (e.g. MQ3 retry without redoing
+Stage B), change the dump format instead — FP32 + upper-triangle only
+gets the on-disk Hessian to ~30 GB. That's a `collect_hessian.py` patch,
+not a post-processing thing.
+
+### 13.10 Measured 27B wall on V100 32 GB (2026-05-17/18)
+
+| Stage | Wall | Notes |
+|---|---:|---|
+| Bring-up (torch reinstall + fla purge + HF download) | ~30 min | one-time per instance |
+| B. Hessian (32 seq × 2048 ctx, 1 pass) | **5h 32m** | CPU/GPU hybrid; forward pass dominates |
+| C. GPTQ → manifest (496 GPTQ + 10 RTN-fallback + 496 AWQ) | **5h 32m** | K=17408 down_projs at ~130-160s each are the cost driver |
+| D. Rust pack (cargo build 57s + pack ~5 min) | **6 min** | one-shot |
+| **Total** | **~11.5h** | + bring-up |
+
+Stage C composition is the headline quality signal: **only 10 of 506
+eligible tensors fell to RTN-fallback at 4-bit** (2%), vs ~30% at 3-bit
+on Qwen3.5-4B. The OBS pipeline scales cleanly to 27B at MQ4.
+
+On an sm_75+ card with comparable FP64 throughput, bring-up disappears
+and the realistic next-time wall is **~11h pure compute** for a 27B-class
+GPTQ. For 9B, scale down by ~3× (smaller K, fewer layers); ~3-4h end to
+end is the right expectation.
