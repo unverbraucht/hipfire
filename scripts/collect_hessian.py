@@ -89,6 +89,28 @@ GPTQ_TARGET_SUFFIXES = (
     "out_proj",
     # MoE router
     "gate",
+    # Final logits projection — added 2026-05-18 for gptq_lm_head_awq.md
+    # Phase 1. lm_head (HF dense + multimodal naming) and `output` (GGUF
+    # twin). Only matters when --lm-head-format mq4-awq is selected at
+    # quantize time; the Hessian is collected unconditionally because the
+    # cost is small (one extra K×K FP64 matrix, K=hidden) and lets us
+    # decide at pack time whether to use it.
+    "lm_head", "output",
+    # Vision encoder (Qwen3.5/3.6 VL) — added 2026-05-18 for
+    # gptq_lm_head_awq.md Phase 3 quant-side prep. Names match the
+    # visual tower's attention QKV / attention output / MLP first &
+    # second linears, plus the merger MLPs. Catches modules whose last
+    # path segment is one of these literals — e.g. `model.visual.blocks.<N>.
+    # attn.qkv`, `model.visual.blocks.<N>.mlp.linear_fc1`,
+    # `model.visual.merger.linear_fc2`. AWQ eligibility for vision is
+    # NOT yet enabled (the runtime AWQ-aware vision kernels are the
+    # gating dependency — see plan §3.3). Adding Hessian coverage now
+    # lets a single Stage B pass also support future vision AWQ + GPTQ
+    # work without a second 5-10h re-collection.
+    "qkv",         # visual attn fused QKV  (last segment of .attn.qkv)
+    "proj",        # visual attn output projection  (last segment of .attn.proj)
+    "linear_fc1",  # visual MLP fc1 (blocks AND merger)
+    "linear_fc2",  # visual MLP fc2 (blocks AND merger)
 )
 
 
