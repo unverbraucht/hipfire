@@ -4441,10 +4441,12 @@ fn main() {
                 // shared_expert_gate.weight at Q8 regardless of --format.
                 let q = quantize_q8f16(&f32_data);
                 (q, QuantType::Q8F16, 32u32, "Q8_F16")
-            } else if (use_mq4g256 || use_mq4_mq6exp) && is_embed {
+            } else if (use_mq4g256 || use_mq4_mq6exp
+                || (use_mq3g256 && PRECOMPUTED_GPTQ.get().is_some())) && is_embed {
                 let q = quantize_q8f16(&f32_data);
                 (q, QuantType::Q8F16, 32u32, "Q8_F16")
-            } else if use_mq4g256 || use_mq4_mq6exp {
+            } else if use_mq4g256 || use_mq4_mq6exp
+                || (use_mq3g256 && PRECOMPUTED_GPTQ.get().is_some()) {
                 let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
                 if k_dim % 256 == 0 {
                     let signs1 = gen_fwht_signs(42, 256);
@@ -4503,15 +4505,22 @@ fn main() {
                         } else {
                             // Manifest doesn't have grids for this tensor —
                             // would be a manifest gap. Fail loud so the
-                            // operator notices.
+                            // operator notices. Dispatch fallback packer on
+                            // the manifest's n_bits so MQ3 sweeps don't get
+                            // an MQ4 surprise.
                             eprintln!(
                                 "warning: --precomputed-gptq-path: tensor {name} missing frozen_grids \
-                                in manifest. Falling back to plain MQ4 pack on the manifest's f32_data \
+                                in manifest. Falling back to plain pack on the manifest's f32_data \
                                 (which is unrotated for passthrough tensors → result will diverge from a \
                                 regular --awq --gptq run for THIS tensor)."
                             );
-                            (quantize_mq4g256(&f32_data, &signs1, &signs2),
-                             QuantType::MQ4G256, 256u32, "MQ4G256")
+                            let (q, qt, label) = match m.meta.n_bits {
+                                3 => (quantize_mq3g256(&f32_data, &signs1, &signs2),
+                                      QuantType::MQ3G256, "MQ3G256"),
+                                _ => (quantize_mq4g256(&f32_data, &signs1, &signs2),
+                                      QuantType::MQ4G256, "MQ4G256"),
+                            };
+                            (q, qt, 256u32, label)
                         }
                     } else
                     // Phase A Stage A — AWQ pre-scaling, when --awq is enabled
