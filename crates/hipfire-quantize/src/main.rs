@@ -1813,18 +1813,34 @@ enum QuantType {
 }
 
 /// Per-tensor precision level assigned by the K-map pre-pass.
-/// Determines whether a tensor gets the base format, a 6-bit promotion,
-/// Q8, or F16. See docs/superpowers/specs/2026-05-08-mixed-quant-kmap-design.md.
+/// Determines whether a tensor gets the base format, a kmap promotion,
+/// Q8, or F16. See docs/superpowers/specs/2026-05-08-mixed-quant-kmap-design.md
+/// and docs/plans/configurable-kmap-pair.md.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum QuantLevel {
     /// Store as F16 (norms, biases, 1D tensors).
     F16,
     /// Store as Q8_F16 (embeddings, lm_head, MoE routers).
     Q8,
-    /// Promote to 6-bit variant of the base format (edge layers, MoE expert FFN).
-    Promote6,
+    /// Promote to the carried format (edge layers, MoE expert FFN).
+    /// The target was historically hardcoded to MQ6; now parameterized
+    /// per `--kmap-promote` (introduced in the configurable-kmap-pair plan).
+    Promote(GgufFormat),
     /// Use the base format as-is.
     Base,
+}
+
+/// Default kmap promote target for a given base format. Preserves the
+/// pre-`--kmap-promote` behavior byte-for-byte: MQ-family bases promote to
+/// MQ6, HFQ-family to HFQ6, FP4-family is a no-op (no FP6 sibling).
+fn default_promote_target(base: GgufFormat) -> GgufFormat {
+    match base {
+        GgufFormat::Mq2 | GgufFormat::Mq3 | GgufFormat::Mq4 | GgufFormat::Mq6
+        | GgufFormat::Mq2Lloyd | GgufFormat::Mq3Lloyd => GgufFormat::Mq6,
+        GgufFormat::Hfq4 | GgufFormat::Hfq6 => GgufFormat::Hfq6,
+        GgufFormat::Hfp4 => GgufFormat::Hfp4,
+        GgufFormat::Mfp4 => GgufFormat::Mfp4,
+    }
 }
 
 /// Extract layer index from a tensor name.
@@ -1877,10 +1893,19 @@ fn is_positional_promote(idx: usize, n_layers: usize, stride: usize) -> bool {
 /// Note: In the safetensors path, norms/biases are filtered by `should_quantize()`
 /// before this function is called. Rules 1-2 exist for the GGUF path and completeness.
 fn kmap_resolve(name: &str, n_layers: usize, is_moe: bool) -> QuantLevel {
-    kmap_resolve_mode(name, n_layers, is_moe, 0)
+    // Test-and-internal wrapper. Defaults to MQ6 promote target (the
+    // pre-`--kmap-promote` behavior). Real callers should use
+    // `kmap_resolve_mode` directly with a CLI-driven promote target.
+    kmap_resolve_mode(name, n_layers, is_moe, 0, GgufFormat::Mq6)
 }
 
-fn kmap_resolve_mode(name: &str, n_layers: usize, is_moe: bool, kmap_mode: u8) -> QuantLevel {
+fn kmap_resolve_mode(
+    name: &str,
+    n_layers: usize,
+    is_moe: bool,
+    kmap_mode: u8,
+    promote_to: GgufFormat,
+) -> QuantLevel {
     // Rule 1: norms, biases, 1D (GGUF path mainly)
     if name.contains("norm") || name.contains("bias") {
         return QuantLevel::F16;
@@ -1907,12 +1932,12 @@ fn kmap_resolve_mode(name: &str, n_layers: usize, is_moe: bool, kmap_mode: u8) -
             // Alternating: promote expert groups only in positional layers
             if let Some(idx) = parse_layer_idx(name) {
                 if is_positional_promote(idx, n_layers, ALTERNATING_STRIDE) {
-                    return QuantLevel::Promote6;
+                    return QuantLevel::Promote(promote_to);
                 }
                 return QuantLevel::Base;
             }
         }
-        return QuantLevel::Promote6;
+        return QuantLevel::Promote(promote_to);
     }
 
     // Mode 2 (typed): promote ffn_down and attn_v in all layers.
@@ -1920,12 +1945,12 @@ fn kmap_resolve_mode(name: &str, n_layers: usize, is_moe: bool, kmap_mode: u8) -
         let is_down = name.contains("down_proj") || name.contains("ffn_down");
         let is_v = name.contains("v_proj") || name.contains("attn_v");
         if is_down || is_v {
-            return QuantLevel::Promote6;
+            return QuantLevel::Promote(promote_to);
         }
         if n_layers > 0 {
             if let Some(idx) = parse_layer_idx(name) {
                 if idx < 2 || idx >= n_layers.saturating_sub(2) {
-                    return QuantLevel::Promote6;
+                    return QuantLevel::Promote(promote_to);
                 }
             }
         }
@@ -1942,16 +1967,16 @@ fn kmap_resolve_mode(name: &str, n_layers: usize, is_moe: bool, kmap_mode: u8) -
         if n_layers > 0 {
             if let Some(idx) = parse_layer_idx(name) {
                 if is_down && is_positional_promote(idx, n_layers, ALTERNATING_STRIDE) {
-                    return QuantLevel::Promote6;
+                    return QuantLevel::Promote(promote_to);
                 }
                 // Edge layers: attn+FFN for MoE, FFN only for dense.
                 if idx < 2 || idx >= n_layers.saturating_sub(2) {
                     if is_moe {
-                        return QuantLevel::Promote6;
+                        return QuantLevel::Promote(promote_to);
                     }
                     let is_ffn = name.contains("mlp.") || name.contains("ffn");
                     if is_ffn {
-                        return QuantLevel::Promote6;
+                        return QuantLevel::Promote(promote_to);
                     }
                 }
             }
@@ -1968,12 +1993,12 @@ fn kmap_resolve_mode(name: &str, n_layers: usize, is_moe: bool, kmap_mode: u8) -
             if idx < 2 || idx >= n_layers.saturating_sub(2) {
                 if is_moe {
                     // MoE: promote all tensors in edge layers (attn + FFN)
-                    return QuantLevel::Promote6;
+                    return QuantLevel::Promote(promote_to);
                 }
                 // Dense: promote FFN only — attn stays at Base
                 let is_ffn = name.contains("mlp.") || name.contains("ffn");
                 if is_ffn {
-                    return QuantLevel::Promote6;
+                    return QuantLevel::Promote(promote_to);
                 }
             }
         }
@@ -2814,7 +2839,7 @@ fn mv_to_json(v: &gguf_input::MetaValue) -> serde_json::Value {
 /// `rotate_x_mq` overhead with no quality benefit — those rotations were
 /// calibrated for Qwen3.5+ training.** Default is HFQ4 for dense GGUFs;
 /// pass `--format mq4` only when the source is a Qwen3.5+ family model.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GgufFormat {
     Hfq4,
     Hfq6,
@@ -2927,6 +2952,7 @@ fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat, no_kmap: b
     // ship-default is the conservative shape per maintainer directive
     // (2026-05-08): never silently change dense quantization. Users who
     // want K-map on dense pass `--kmap-dense` (see flag parsing below).
+    let promote_to = default_promote_target(format);
     let kmap: HashMap<String, QuantLevel> = if no_kmap || (!is_moe && !kmap_dense) {
         HashMap::new()
     } else {
@@ -2935,23 +2961,24 @@ fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat, no_kmap: b
         for info in &gguf.tensors {
             let out_name = gguf_to_safetensors_name(&info.name)
                 .unwrap_or_else(|| info.name.clone());
-            let level = kmap_resolve_mode(&out_name, n_layers, is_moe, kmap_mode);
+            let level = kmap_resolve_mode(&out_name, n_layers, is_moe, kmap_mode, promote_to);
             match level {
                 QuantLevel::F16 => counts[0] += 1,
                 QuantLevel::Q8 => counts[1] += 1,
-                QuantLevel::Promote6 => counts[2] += 1,
+                QuantLevel::Promote(_) => counts[2] += 1,
                 QuantLevel::Base => counts[3] += 1,
             }
             map.insert(out_name, level);
         }
         if !map.is_empty() {
             let mode_label = match kmap_mode { 0 => "full", 1 => "alternating", 2 => "typed", _ => "?" };
-            eprintln!("K-map plan ({} base, {n_layers} layers{}, mode={mode_label}):",
+            eprintln!("K-map plan ({} base → {} promote, {n_layers} layers{}, mode={mode_label}):",
                 format.label(),
+                promote_to.label(),
                 if is_moe { ", MoE" } else { "" });
             eprintln!("  F16:       {:>4} tensors", counts[0]);
             eprintln!("  Q8:        {:>4} tensors", counts[1]);
-            eprintln!("  Promote6:  {:>4} tensors", counts[2]);
+            eprintln!("  Promote:   {:>4} tensors (→ {})", counts[2], promote_to.label());
             eprintln!("  Base:      {:>4} tensors", counts[3]);
         }
         map
@@ -2999,33 +3026,61 @@ fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat, no_kmap: b
             let q = quantize_q8f16(&f32_data);
             quant_params += n_elements as u64;
             (q, QuantType::Q8F16, 32u32, "Q8_F16")
-        } else if kmap_level == QuantLevel::Promote6 && k_dim % 256 == 0 {
-            // K-map promote to 6-bit
+        } else if let (QuantLevel::Promote(promote_fmt), true) = (kmap_level, k_dim % 256 == 0) {
+            // K-map promote to the carried format. Default mapping for each
+            // base format is documented in `default_promote_target`; a future
+            // `--kmap-promote` CLI flag will let users override.
             let f32_data = gguf_input::tensor_to_f32(info, raw);
             quant_params += n_elements as u64;
-            match format {
-                GgufFormat::Mq4 | GgufFormat::Mq3 | GgufFormat::Mq2
-                | GgufFormat::Mq2Lloyd | GgufFormat::Mq3Lloyd | GgufFormat::Mq6 => {
+            match promote_fmt {
+                GgufFormat::Mq6 => {
                     let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
                     (q, QuantType::MQ6G256, 256u32, "MQ6G256")
                 }
-                GgufFormat::Hfq4 | GgufFormat::Hfq6 => {
+                GgufFormat::Hfq6 => {
                     let q = quantize_hfq6g256(&f32_data);
                     (q, QuantType::HFQ6G256, 256u32, "HFQ6G256")
                 }
                 GgufFormat::Hfp4 => {
-                    // No HFP6 variant in v1. Promote6 for HFP4 stays at HFP4G32 (4.25 bpw).
+                    // No HFP6 variant in v1. Promote-to-HFP4 stays at HFP4G32 (4.25 bpw, no-op).
                     let m = info.shape[0] as usize;
                     let k = info.shape[1] as usize;
                     let q = quantize_hfp4g32_2d(&f32_data, m, k);
                     (q, QuantType::HFP4G32, 32u32, "HFP4G32")
                 }
                 GgufFormat::Mfp4 => {
-                    // No MFP6 variant. Promote6 for MFP4 stays at MFP4G32 (4.25 bpw).
+                    // No MFP6 variant. Promote-to-MFP4 stays at MFP4G32 (4.25 bpw, no-op).
                     let m = info.shape[0] as usize;
                     let k = info.shape[1] as usize;
                     let q = quantize_mfp4g32_2d(&f32_data, m, k, &signs1, &signs2);
                     (q, QuantType::MFP4G32, 32u32, "MFP4G32")
+                }
+                // Sub-6-bit promote targets: available for `--kmap-promote mq{2,3,4}`
+                // pairings (e.g. MQ2 base + MQ3 promote alternating). Same kernels
+                // as the Base arm below; just dispatched via the promote target.
+                GgufFormat::Mq4 => {
+                    let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
+                    (q, QuantType::MQ4G256, 256u32, "MQ4G256")
+                }
+                GgufFormat::Mq3 => {
+                    let q = quantize_mq3g256(&f32_data, &signs1, &signs2);
+                    (q, QuantType::MQ3G256, 256u32, "MQ3G256")
+                }
+                GgufFormat::Mq2 => {
+                    let q = quantize_mq2g256(&f32_data, &signs1, &signs2);
+                    (q, QuantType::MQ2G256, 256u32, "MQ2G256")
+                }
+                GgufFormat::Mq2Lloyd => {
+                    let q = quantize_mq2g256_lloyd(&f32_data, &signs1, &signs2);
+                    (q, QuantType::MQ2G256Lloyd, 256u32, "MQ2G256Lloyd")
+                }
+                GgufFormat::Mq3Lloyd => {
+                    let q = quantize_mq3g256_lloyd(&f32_data, &signs1, &signs2);
+                    (q, QuantType::MQ3G256Lloyd, 256u32, "MQ3G256Lloyd")
+                }
+                GgufFormat::Hfq4 => {
+                    let q = quantize_hfq4g256(&f32_data);
+                    (q, QuantType::HFQ4G256, 256u32, "HFQ4G256")
                 }
             }
         } else if k_dim % 256 == 0 {
@@ -3478,28 +3533,38 @@ fn main() {
     // the K-map default-on path because the routed-expert promotion is
     // the headline win and the empirical regression there is tighter
     // (+1.7% PPL at 2K, gated below the dense regression threshold).
+    // Promote target carried in `QuantLevel::Promote(<fmt>)`. Default is
+    // `default_promote_target(base)` — same as the pre-`--kmap-promote`
+    // hardcoded behavior. If `format` doesn't parse to a GgufFormat (e.g.
+    // `--format q8` or `--format mixed`), use Mq6 as a placeholder; the
+    // Promote arm's `use_*` boolean dispatch below ignores the carried
+    // format and falls through to its existing Q8 fallback for non-promotable
+    // bases. Byte-exact behavior on this path.
+    let parsed_base = GgufFormat::from_flag(format).unwrap_or(GgufFormat::Mq4);
+    let promote_to = default_promote_target(parsed_base);
     let kmap: HashMap<String, QuantLevel> = if no_kmap || (!is_moe && !kmap_dense) {
         HashMap::new()
     } else {
         let mut map = HashMap::new();
-        let mut counts = [0u32; 4]; // F16, Q8, Promote6, Base
+        let mut counts = [0u32; 4]; // F16, Q8, Promote, Base
         for (name, _fi) in &all_tensors {
-            let level = kmap_resolve_mode(name, n_layers, is_moe, kmap_mode);
+            let level = kmap_resolve_mode(name, n_layers, is_moe, kmap_mode, promote_to);
             match level {
                 QuantLevel::F16 => counts[0] += 1,
                 QuantLevel::Q8 => counts[1] += 1,
-                QuantLevel::Promote6 => counts[2] += 1,
+                QuantLevel::Promote(_) => counts[2] += 1,
                 QuantLevel::Base => counts[3] += 1,
             }
             map.insert(name.to_string(), level);
         }
         if !map.is_empty() {
             let mode_label = match kmap_mode { 0 => "full", 1 => "alternating", 2 => "typed", _ => "?" };
-            eprintln!("K-map plan ({format} base, {n_layers} layers{}, mode={mode_label}):",
+            eprintln!("K-map plan ({format} base → {} promote, {n_layers} layers{}, mode={mode_label}):",
+                promote_to.label(),
                 if is_moe { ", MoE" } else { "" });
             eprintln!("  F16:       {:>4} tensors (norms, biases)", counts[0]);
             eprintln!("  Q8:        {:>4} tensors (embed, lm_head, routers)", counts[1]);
-            eprintln!("  Promote6:  {:>4} tensors", counts[2]);
+            eprintln!("  Promote:   {:>4} tensors (→ {})", counts[2], promote_to.label());
             eprintln!("  Base:      {:>4} tensors (remaining)", counts[3]);
         }
         map
@@ -3582,7 +3647,7 @@ fn main() {
             // (e.g. "...mlp.experts.gate_up_proj") contains "mlp.experts."
             // so kmap_resolve rule 4 matches it. The kmap HashMap was built
             // from all_tensors which has these parent names as keys.
-            let kmap_promote = kmap.get(*name) == Some(&QuantLevel::Promote6);
+            let kmap_promote = matches!(kmap.get(*name), Some(QuantLevel::Promote(_)));
             let expert_mq6 = (use_mq6g256 || use_mq4_mq6exp || (kmap_promote && use_mq4g256)) && supports_g256;
             let expert_hfq6 = (use_hfq6 || (kmap_promote && use_hfq4g256)) && supports_g256;
             let expert_hfq4 = use_hfq4g256 && !kmap_promote && supports_g256;
@@ -3716,8 +3781,14 @@ fn main() {
                     .flat_map(|&v| f32_to_f16(v).to_le_bytes())
                     .collect();
                 (f16_bytes, QuantType::F16, 0u32, "F16")
-            } else if kmap_level == QuantLevel::Promote6 {
-                // K-map says promote to 6-bit
+            } else if matches!(kmap_level, QuantLevel::Promote(_)) {
+                // K-map says promote. The carried format (in Promote(<fmt>))
+                // is the target, used by the GGUF pipeline's dispatcher.
+                // The safetensors path's dispatcher uses the pre-existing
+                // `use_*` boolean fall-through below; behavior is byte-exact
+                // with the pre-refactor code. The `--kmap-promote` CLI flag
+                // (next commit) will rewrite this arm to read the carried
+                // format directly.
                 let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
                 if (use_mq4g256 || use_mq4_mq6exp || use_mq3g256 || use_mq2g256
                     || use_mq2g256_lloyd || use_mq3g256_lloyd) && k_dim % 256 == 0
@@ -4320,21 +4391,21 @@ mod tests {
     fn kmap_moe_expert_ffn_promote6() {
         assert_eq!(
             kmap_resolve("model.language_model.layers.30.mlp.experts.5.gate_up_proj.weight", 64, true),
-            QuantLevel::Promote6
+            QuantLevel::Promote(GgufFormat::Mq6)
         );
         assert_eq!(
             kmap_resolve("model.language_model.layers.30.mlp.experts.5.down_proj.weight", 64, true),
-            QuantLevel::Promote6
+            QuantLevel::Promote(GgufFormat::Mq6)
         );
     }
 
     #[test]
     fn kmap_edge_layers_dense_ffn_only() {
         // Dense: FFN in edge layers — promoted
-        assert_eq!(kmap_resolve("model.layers.0.mlp.gate_proj.weight", 64, false), QuantLevel::Promote6);
-        assert_eq!(kmap_resolve("model.layers.1.mlp.down_proj.weight", 64, false), QuantLevel::Promote6);
-        assert_eq!(kmap_resolve("model.layers.62.mlp.up_proj.weight", 64, false), QuantLevel::Promote6);
-        assert_eq!(kmap_resolve("model.layers.63.mlp.down_proj.weight", 64, false), QuantLevel::Promote6);
+        assert_eq!(kmap_resolve("model.layers.0.mlp.gate_proj.weight", 64, false), QuantLevel::Promote(GgufFormat::Mq6));
+        assert_eq!(kmap_resolve("model.layers.1.mlp.down_proj.weight", 64, false), QuantLevel::Promote(GgufFormat::Mq6));
+        assert_eq!(kmap_resolve("model.layers.62.mlp.up_proj.weight", 64, false), QuantLevel::Promote(GgufFormat::Mq6));
+        assert_eq!(kmap_resolve("model.layers.63.mlp.down_proj.weight", 64, false), QuantLevel::Promote(GgufFormat::Mq6));
         // Dense: attn in edge layers — NOT promoted
         assert_eq!(kmap_resolve("model.layers.0.self_attn.q_proj.weight", 64, false), QuantLevel::Base);
         assert_eq!(kmap_resolve("model.layers.63.self_attn.v_proj.weight", 64, false), QuantLevel::Base);
@@ -4344,10 +4415,10 @@ mod tests {
     #[test]
     fn kmap_edge_layers_moe_attn_and_ffn() {
         // MoE: both attn and FFN in edge layers — promoted
-        assert_eq!(kmap_resolve("model.language_model.layers.0.self_attn.q_proj.weight", 64, true), QuantLevel::Promote6);
-        assert_eq!(kmap_resolve("model.language_model.layers.0.mlp.gate_proj.weight", 64, true), QuantLevel::Promote6);
-        assert_eq!(kmap_resolve("model.language_model.layers.0.linear_attn.in_proj_qkv.weight", 64, true), QuantLevel::Promote6);
-        assert_eq!(kmap_resolve("model.language_model.layers.63.self_attn.v_proj.weight", 64, true), QuantLevel::Promote6);
+        assert_eq!(kmap_resolve("model.language_model.layers.0.self_attn.q_proj.weight", 64, true), QuantLevel::Promote(GgufFormat::Mq6));
+        assert_eq!(kmap_resolve("model.language_model.layers.0.mlp.gate_proj.weight", 64, true), QuantLevel::Promote(GgufFormat::Mq6));
+        assert_eq!(kmap_resolve("model.language_model.layers.0.linear_attn.in_proj_qkv.weight", 64, true), QuantLevel::Promote(GgufFormat::Mq6));
+        assert_eq!(kmap_resolve("model.language_model.layers.63.self_attn.v_proj.weight", 64, true), QuantLevel::Promote(GgufFormat::Mq6));
     }
 
     #[test]
@@ -4360,11 +4431,11 @@ mod tests {
     #[test]
     fn kmap_edge_layers_small_model_24_layers() {
         // 24 layers: edge = 0,1 and 22,23
-        assert_eq!(kmap_resolve("model.layers.0.mlp.gate_proj.weight", 24, false), QuantLevel::Promote6);
-        assert_eq!(kmap_resolve("model.layers.1.mlp.gate_proj.weight", 24, false), QuantLevel::Promote6);
+        assert_eq!(kmap_resolve("model.layers.0.mlp.gate_proj.weight", 24, false), QuantLevel::Promote(GgufFormat::Mq6));
+        assert_eq!(kmap_resolve("model.layers.1.mlp.gate_proj.weight", 24, false), QuantLevel::Promote(GgufFormat::Mq6));
         assert_eq!(kmap_resolve("model.layers.2.mlp.gate_proj.weight", 24, false), QuantLevel::Base);
-        assert_eq!(kmap_resolve("model.layers.22.mlp.gate_proj.weight", 24, false), QuantLevel::Promote6);
-        assert_eq!(kmap_resolve("model.layers.23.mlp.gate_proj.weight", 24, false), QuantLevel::Promote6);
+        assert_eq!(kmap_resolve("model.layers.22.mlp.gate_proj.weight", 24, false), QuantLevel::Promote(GgufFormat::Mq6));
+        assert_eq!(kmap_resolve("model.layers.23.mlp.gate_proj.weight", 24, false), QuantLevel::Promote(GgufFormat::Mq6));
     }
 
     #[test]
@@ -4375,9 +4446,9 @@ mod tests {
     #[test]
     fn kmap_edge_layers_tiny_model_3_layers() {
         // 3 layers: first-2 = {0,1}, last-2 = {1,2}. All layers promoted.
-        assert_eq!(kmap_resolve("model.layers.0.mlp.gate_proj.weight", 3, false), QuantLevel::Promote6);
-        assert_eq!(kmap_resolve("model.layers.1.mlp.gate_proj.weight", 3, false), QuantLevel::Promote6);
-        assert_eq!(kmap_resolve("model.layers.2.mlp.gate_proj.weight", 3, false), QuantLevel::Promote6);
+        assert_eq!(kmap_resolve("model.layers.0.mlp.gate_proj.weight", 3, false), QuantLevel::Promote(GgufFormat::Mq6));
+        assert_eq!(kmap_resolve("model.layers.1.mlp.gate_proj.weight", 3, false), QuantLevel::Promote(GgufFormat::Mq6));
+        assert_eq!(kmap_resolve("model.layers.2.mlp.gate_proj.weight", 3, false), QuantLevel::Promote(GgufFormat::Mq6));
     }
 
     #[test]
@@ -4392,12 +4463,12 @@ mod tests {
     #[test]
     fn kmap_gguf_names() {
         // GGUF edge-layer FFN (dense) — promoted
-        assert_eq!(kmap_resolve("blk.0.ffn_gate.weight", 64, false), QuantLevel::Promote6);
-        assert_eq!(kmap_resolve("blk.63.ffn_gate.weight", 64, false), QuantLevel::Promote6);
+        assert_eq!(kmap_resolve("blk.0.ffn_gate.weight", 64, false), QuantLevel::Promote(GgufFormat::Mq6));
+        assert_eq!(kmap_resolve("blk.63.ffn_gate.weight", 64, false), QuantLevel::Promote(GgufFormat::Mq6));
         // GGUF edge-layer attn (dense) — NOT promoted
         assert_eq!(kmap_resolve("blk.0.attn_q.weight", 64, false), QuantLevel::Base);
         // GGUF edge-layer attn (MoE) — promoted
-        assert_eq!(kmap_resolve("blk.0.attn_q.weight", 64, true), QuantLevel::Promote6);
+        assert_eq!(kmap_resolve("blk.0.attn_q.weight", 64, true), QuantLevel::Promote(GgufFormat::Mq6));
         // GGUF middle-layer — base
         assert_eq!(kmap_resolve("blk.30.ffn_gate.weight", 64, false), QuantLevel::Base);
     }
@@ -4428,15 +4499,15 @@ mod tests {
     fn kmap_alternating_moe_experts() {
         // MoE experts: promoted in positional layers, base in others
         assert_eq!(
-            kmap_resolve_mode("model.language_model.layers.0.mlp.experts.5.gate_up_proj.weight", 40, true, 1),
-            QuantLevel::Promote6 // edge layer
+            kmap_resolve_mode("model.language_model.layers.0.mlp.experts.5.gate_up_proj.weight", 40, true, 1, GgufFormat::Mq6),
+            QuantLevel::Promote(GgufFormat::Mq6) // edge layer
         );
         assert_eq!(
-            kmap_resolve_mode("model.language_model.layers.5.mlp.experts.5.gate_up_proj.weight", 40, true, 1),
-            QuantLevel::Promote6 // stride hit (5-2=3, 3%3==0)
+            kmap_resolve_mode("model.language_model.layers.5.mlp.experts.5.gate_up_proj.weight", 40, true, 1, GgufFormat::Mq6),
+            QuantLevel::Promote(GgufFormat::Mq6) // stride hit (5-2=3, 3%3==0)
         );
         assert_eq!(
-            kmap_resolve_mode("model.language_model.layers.3.mlp.experts.5.gate_up_proj.weight", 40, true, 1),
+            kmap_resolve_mode("model.language_model.layers.3.mlp.experts.5.gate_up_proj.weight", 40, true, 1, GgufFormat::Mq6),
             QuantLevel::Base // not on stride
         );
     }
@@ -4445,20 +4516,20 @@ mod tests {
     fn kmap_alternating_ffn_down() {
         // ffn_down promoted in positional layers, base in others
         assert_eq!(
-            kmap_resolve_mode("model.layers.0.mlp.down_proj.weight", 40, false, 1),
-            QuantLevel::Promote6 // edge
+            kmap_resolve_mode("model.layers.0.mlp.down_proj.weight", 40, false, 1, GgufFormat::Mq6),
+            QuantLevel::Promote(GgufFormat::Mq6) // edge
         );
         assert_eq!(
-            kmap_resolve_mode("model.layers.5.mlp.down_proj.weight", 40, false, 1),
-            QuantLevel::Promote6 // stride
+            kmap_resolve_mode("model.layers.5.mlp.down_proj.weight", 40, false, 1, GgufFormat::Mq6),
+            QuantLevel::Promote(GgufFormat::Mq6) // stride
         );
         assert_eq!(
-            kmap_resolve_mode("model.layers.3.mlp.down_proj.weight", 40, false, 1),
+            kmap_resolve_mode("model.layers.3.mlp.down_proj.weight", 40, false, 1, GgufFormat::Mq6),
             QuantLevel::Base // not on stride
         );
         // gate_proj NOT promoted in middle layers
         assert_eq!(
-            kmap_resolve_mode("model.layers.5.mlp.gate_proj.weight", 40, false, 1),
+            kmap_resolve_mode("model.layers.5.mlp.gate_proj.weight", 40, false, 1, GgufFormat::Mq6),
             QuantLevel::Base
         );
     }
@@ -4467,7 +4538,7 @@ mod tests {
     fn kmap_alternating_n_layers_zero() {
         // With n_layers=0, alternating mode should return Base for everything
         assert_eq!(
-            kmap_resolve_mode("model.layers.0.mlp.down_proj.weight", 0, false, 1),
+            kmap_resolve_mode("model.layers.0.mlp.down_proj.weight", 0, false, 1, GgufFormat::Mq6),
             QuantLevel::Base
         );
     }
@@ -4476,17 +4547,17 @@ mod tests {
     fn kmap_alternating_gguf_names() {
         // GGUF ffn_down in edge layer
         assert_eq!(
-            kmap_resolve_mode("blk.0.ffn_down.weight", 40, false, 1),
-            QuantLevel::Promote6
+            kmap_resolve_mode("blk.0.ffn_down.weight", 40, false, 1, GgufFormat::Mq6),
+            QuantLevel::Promote(GgufFormat::Mq6)
         );
         // GGUF ffn_down in middle non-stride layer
         assert_eq!(
-            kmap_resolve_mode("blk.3.ffn_down.weight", 40, false, 1),
+            kmap_resolve_mode("blk.3.ffn_down.weight", 40, false, 1, GgufFormat::Mq6),
             QuantLevel::Base
         );
         // GGUF ffn_gate stays base in middle
         assert_eq!(
-            kmap_resolve_mode("blk.5.ffn_gate.weight", 40, false, 1),
+            kmap_resolve_mode("blk.5.ffn_gate.weight", 40, false, 1, GgufFormat::Mq6),
             QuantLevel::Base
         );
     }
@@ -4494,16 +4565,16 @@ mod tests {
     #[test]
     fn kmap_typed_promotes_down_and_v() {
         assert_eq!(
-            kmap_resolve_mode("model.layers.15.mlp.down_proj.weight", 40, false, 2),
-            QuantLevel::Promote6
+            kmap_resolve_mode("model.layers.15.mlp.down_proj.weight", 40, false, 2, GgufFormat::Mq6),
+            QuantLevel::Promote(GgufFormat::Mq6)
         );
         assert_eq!(
-            kmap_resolve_mode("model.layers.15.self_attn.v_proj.weight", 40, false, 2),
-            QuantLevel::Promote6
+            kmap_resolve_mode("model.layers.15.self_attn.v_proj.weight", 40, false, 2, GgufFormat::Mq6),
+            QuantLevel::Promote(GgufFormat::Mq6)
         );
         // gate_proj stays base
         assert_eq!(
-            kmap_resolve_mode("model.layers.15.mlp.gate_proj.weight", 40, false, 2),
+            kmap_resolve_mode("model.layers.15.mlp.gate_proj.weight", 40, false, 2, GgufFormat::Mq6),
             QuantLevel::Base
         );
     }
