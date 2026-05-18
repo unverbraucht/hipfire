@@ -3995,10 +3995,21 @@ fn main() {
             // (e.g. "...mlp.experts.gate_up_proj") contains "mlp.experts."
             // so kmap_resolve rule 4 matches it. The kmap HashMap was built
             // from all_tensors which has these parent names as keys.
-            let kmap_promote = matches!(kmap.get(*name), Some(QuantLevel::Promote(_)));
-            let expert_mq6 = (use_mq6g256 || use_mq4_mq6exp || (kmap_promote && use_mq4g256)) && supports_g256;
-            let expert_hfq6 = (use_hfq6 || (kmap_promote && use_hfq4g256)) && supports_g256;
-            let expert_hfq4 = use_hfq4g256 && !kmap_promote && supports_g256;
+            //
+            // When promoted, dispatch on the carried `Promote(<fmt>)` target
+            // (commit fix for combined-review G1 — pre-fix this path ignored
+            // the carried format and always fell through to MQ4G256 for any
+            // promoted expert, breaking `--kmap-promote` on MoE models).
+            //
+            // When not promoted, preserve the existing `use_*` boolean
+            // dispatch — byte-exact for `--kmap-promote`-unset runs.
+            let expert_promote_fmt: Option<GgufFormat> = match kmap.get(*name).copied() {
+                Some(QuantLevel::Promote(fmt)) => Some(fmt),
+                _ => None,
+            };
+            let expert_mq6 = (use_mq6g256 || use_mq4_mq6exp) && supports_g256;
+            let expert_hfq6 = use_hfq6 && supports_g256;
+            let expert_hfq4 = use_hfq4g256 && expert_promote_fmt.is_none() && supports_g256;
 
             // Parallelize across the 256 expert slices via rayon. Each slice
             // dequant→FWHT→quant→pack is a CPU-bound, self-contained job.
@@ -4012,7 +4023,62 @@ fn main() {
                 let slice_off = x * inner_bytes;
                 let slice = &raw_data[slice_off..slice_off + inner_bytes];
                 let f32_slice = to_f32(slice, &dtype);
-                let (quantized, qt, gs) = if expert_mq6 {
+                let (quantized, qt, gs) = if let Some(fmt) = expert_promote_fmt {
+                    // Promoted: dispatch on the carried Promote(<fmt>) target.
+                    // Non-256-aligned promoted tensors fall to HFQ4G128 (same as
+                    // the base catchall below) — kmap promote was never wired
+                    // for sub-256 expert geometry, preserving prior behavior.
+                    if !supports_g256 {
+                        let q = quantize_hfq4g128(&f32_slice);
+                        (q, QuantType::HFQ4G128, 128u32)
+                    } else {
+                        match fmt {
+                            GgufFormat::Mq6 => {
+                                let q = quantize_mq6g256(&f32_slice, &signs1, &signs2);
+                                (q, QuantType::MQ6G256, 256u32)
+                            }
+                            GgufFormat::Hfq6 => {
+                                let q = quantize_hfq6g256(&f32_slice);
+                                (q, QuantType::HFQ6G256, 256u32)
+                            }
+                            GgufFormat::Mq4 => {
+                                let q = quantize_mq4g256(&f32_slice, &signs1, &signs2);
+                                (q, QuantType::MQ4G256, 256u32)
+                            }
+                            GgufFormat::Mq3 => {
+                                let q = quantize_mq3g256(&f32_slice, &signs1, &signs2);
+                                (q, QuantType::MQ3G256, 256u32)
+                            }
+                            GgufFormat::Mq2 => {
+                                let q = quantize_mq2g256(&f32_slice, &signs1, &signs2);
+                                (q, QuantType::MQ2G256, 256u32)
+                            }
+                            GgufFormat::Mq2Lloyd => {
+                                let q = quantize_mq2g256_lloyd(&f32_slice, &signs1, &signs2);
+                                (q, QuantType::MQ2G256Lloyd, 256u32)
+                            }
+                            GgufFormat::Mq3Lloyd => {
+                                let q = quantize_mq3g256_lloyd(&f32_slice, &signs1, &signs2);
+                                (q, QuantType::MQ3G256Lloyd, 256u32)
+                            }
+                            GgufFormat::Hfq4 => {
+                                let q = quantize_hfq4g256(&f32_slice);
+                                (q, QuantType::HFQ4G256, 256u32)
+                            }
+                            GgufFormat::Hfp4 | GgufFormat::Mfp4 => {
+                                // FP4 expert promotion not exercised today;
+                                // expert tensors are 2D in this slice context.
+                                // Fall to MQ4 with a warning rather than panic.
+                                eprintln!(
+                                    "warning: FP4 promote target for MoE expert tensor \
+                                     {parent_owned}.{base_owned} not yet wired; falling back to MQ4G256."
+                                );
+                                let q = quantize_mq4g256(&f32_slice, &signs1, &signs2);
+                                (q, QuantType::MQ4G256, 256u32)
+                            }
+                        }
+                    }
+                } else if expert_mq6 {
                     let q = quantize_mq6g256(&f32_slice, &signs1, &signs2);
                     (q, QuantType::MQ6G256, 256u32)
                 } else if expert_hfq6 {
@@ -4039,7 +4105,13 @@ fn main() {
             }).collect();
             quantized_params += inner_n as u64 * n_experts as u64;
             // Single eprintln to summarize the whole expert sweep.
-            let label = if expert_mq6 { "MQ6G256" } else if expert_hfq6 { "HFQ6G256" } else if expert_hfq4 { "HFQ4G256" } else if supports_g256 { "MQ4G256" } else { "HFQ4G128" };
+            let label = if let Some(fmt) = expert_promote_fmt {
+                if supports_g256 { fmt.label() } else { "HFQ4G128" }
+            } else if expert_mq6 { "MQ6G256" }
+              else if expert_hfq6 { "HFQ6G256" }
+              else if expert_hfq4 { "HFQ4G256" }
+              else if supports_g256 { "MQ4G256" }
+              else { "HFQ4G128" };
             let bytes_per = new_tensors.first().map(|t| t.data.len()).unwrap_or(0);
             eprintln!("  {label:>8}: {parent_owned}{{0..{n_experts}}}.{base_owned}.weight {:?} (×{n_experts} experts || {:.1} KB/expert, parallel)",
                 inner_shape, bytes_per as f64 / 1024.0);
