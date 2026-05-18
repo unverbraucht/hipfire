@@ -3605,9 +3605,30 @@ fn main() {
     // Llama-style model produces correct output (the FWHT cancels in
     // `gemv_mq4g256_with_rotate`) but adds runtime rotation overhead
     // with no quality benefit.
+    //
+    // GGUF + `--lm-head-format` is currently **refused** (configurable-
+    // kmap-pair plan + combined-review finding C1). The safety contract
+    // around `--lm-head-format` requires reading `tie_word_embeddings`
+    // from the source model's config; the GGUF pipeline pulls config
+    // from the GGUF metadata blob, not config.json, and we haven't
+    // wired the tied-embed lookup for that path yet. Refusing here
+    // avoids the silent no-op where the operator's flag goes ignored
+    // through the GGUF pipeline.
     {
         let raw_input = Path::new(input_dir.as_str());
         if is_gguf_input(raw_input) {
+            let lm_head_format_set = args.iter().any(|a| a == "--lm-head-format");
+            if lm_head_format_set {
+                eprintln!(
+                    "error: --lm-head-format is not yet supported with a GGUF input. \
+                     The tied-embedding safety check reads `tie_word_embeddings` from \
+                     `config.json`, which the GGUF pipeline doesn't carry. Use a \
+                     safetensors input (HuggingFace directory layout), or wait for \
+                     GGUF-side lm_head plumbing to land. See docs/plans/\
+                     configurable-kmap-pair.md."
+                );
+                std::process::exit(2);
+            }
             let gguf_format = GgufFormat::from_flag(format).unwrap_or_else(|| {
                 eprintln!(
                     "GGUF input: --format '{format}' not recognized. \
