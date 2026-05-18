@@ -3475,15 +3475,24 @@ fn main() {
     // applies regardless of base. Validated against the promote-pair allowlist
     // when both sides are known GgufFormat values. See
     // docs/plans/configurable-kmap-pair.md Phase 1a.
-    let kmap_promote: Option<GgufFormat> = args.iter().position(|a| a == "--kmap-promote")
-        .and_then(|i| args.get(i + 1))
-        .map(|v| GgufFormat::from_flag(v).unwrap_or_else(|| {
+    let kmap_promote: Option<GgufFormat> = if let Some(i) = args.iter().position(|a| a == "--kmap-promote") {
+        let v = args.get(i + 1).unwrap_or_else(|| {
+            eprintln!(
+                "error: --kmap-promote requires a value (e.g. --kmap-promote mq4). \
+                 Supported: mq2, mq3, mq4, mq6, mq2-lloyd, mq3-lloyd, hfq4, hfq6, mfp4, hfp4."
+            );
+            std::process::exit(2);
+        });
+        Some(GgufFormat::from_flag(v).unwrap_or_else(|| {
             eprintln!(
                 "error: --kmap-promote '{v}' is not a recognized format. \
                  Supported: mq2, mq3, mq4, mq6, mq2-lloyd, mq3-lloyd, hfq4, hfq6, mfp4, hfp4."
             );
             std::process::exit(2);
-        }));
+        }))
+    } else {
+        None
+    };
     if let Some(promote) = kmap_promote {
         if let Some(base) = GgufFormat::from_flag(format) {
             if !is_promote_pair_supported(base, promote) {
@@ -3722,9 +3731,18 @@ fn main() {
     // Deprecated alias: `HIPFIRE_QUANTIZE_LM_HEAD_MQ4_AWQ=1` (CUDA branch's
     // env-var path) is treated as `--lm-head-format mq4` for one release
     // cycle; emits a deprecation warning. Removed in the next release.
-    let lm_head_format_cli: Option<&str> = args.iter().position(|a| a == "--lm-head-format")
-        .and_then(|i| args.get(i + 1))
-        .map(|s| s.as_str());
+    let lm_head_format_cli: Option<&str> = if let Some(i) = args.iter().position(|a| a == "--lm-head-format") {
+        let v = args.get(i + 1).unwrap_or_else(|| {
+            eprintln!(
+                "error: --lm-head-format requires a value (e.g. --lm-head-format mq4). \
+                 Supported: q8, f16, mq4, mq6, mq3, mfp4, hfq4, hfq6."
+            );
+            std::process::exit(2);
+        });
+        Some(v.as_str())
+    } else {
+        None
+    };
     let cuda_env_alias = std::env::var("HIPFIRE_QUANTIZE_LM_HEAD_MQ4_AWQ")
         .ok().as_deref() == Some("1");
     let lm_head_format_arg: Option<&str> = if let Some(v) = lm_head_format_cli {
