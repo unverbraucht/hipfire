@@ -358,21 +358,62 @@ Savings vs Q8 baseline: **~595 MB**. (v1 of this plan claimed
 Whole-`.hfq` projection for 27B post-AWQ-lm_head: **~14.0-14.1 GB**
 (starting from the Q8-head 15.0 GB minus ~595 MB plus 10 KB sidecar).
 
-### 4.1 Imatrix coverage verification — DO FIRST
+### 4.1 Imatrix coverage verification — HARD BLOCK (implemented)
 
-```bash
-strings benchmarks/quality-baselines/refs/qwen3.6-27b-bf16.imatrix.gguf | \
-    grep -E "^(output|lm_head)" | head -5
+**v1 of this plan suggested a `strings | grep` check; that was wrong.**
+GGUF stores tensor names in length-prefixed binary fields, so plain
+substring search collides with `attn_output.weight.in_sum2` (FA output
+projection per layer) and produces a false-pass for `output.weight`.
+
+Empirical audit on 2026-05-18 found **all four local imatrix files
+have ZERO lm_head/output coverage**, despite `grep "output.weight"`
+returning non-zero counts:
+
+| Imatrix | `.in_sum2` entries | lm_head entries | attn_output entries |
+|---|---:|---:|---:|
+| 0.8B | 186 | 0 | 6 |
+| 4B | 248 | 0 | 8 |
+| 9B | 248 | 0 | 8 |
+| 27B | 496 | 0 | 16 |
+
+**The right structural check** is parsing the GGUF tensor name list:
+
+```python
+import struct
+with open(path, 'rb') as f:
+    data = f.read()
+# ... parse header → tensor names ...
+has_output = any(n == "output.weight.in_sum2" for n, _ in names)
 ```
 
-If `output.weight` (or the HF twin) appears, we're good. If only
-`output.norm.weight` (the norm preceding lm_head, not lm_head itself)
-appears, the imatrix needs regen — `llama-imatrix` typically does
-cover lm_head, but the calibration corpus + flag set matters. Out of
-our codebase; we'd run the bench harness's existing imatrix-collect
-recipe with whatever flag enables lm_head coverage.
+Or — preferable — **let the quantizer enforce it at startup**.
+Implemented in `main.rs` (lines ~3920+) alongside the tied-embed and
+UNSAFE-gate aborts: when `HIPFIRE_QUANTIZE_LM_HEAD_MQ4_AWQ=1` is set,
+the quantizer aborts (exit 2) if the loaded imatrix doesn't carry
+`output.weight`. Error message points the operator at
+`imatrix_collect --process-output` for regeneration.
 
-Block the plan on this check passing.
+**Cause of the missing coverage**: `llama-imatrix`'s default skips
+lm_head/output to save calibration time (it's a vocab-scale tensor —
+expensive to accumulate). The hipfire wrapper at
+`crates/hipfire-runtime/examples/imatrix_collect.rs` line 95+ exposes
+`--process-output` to opt in. None of the shipped imatrices in
+`benchmarks/quality-baselines/refs/` were generated with it.
+
+**Fix for the cloud-box A100 run**:
+
+```bash
+cargo run --release --example imatrix_collect -- \
+    --bf16-gguf <model.bf16.gguf> \
+    --corpus benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt \
+    --output <new.imatrix.gguf> \
+    --process-output
+```
+
+Wall: ~30-60 min on A100 80 GB for 9B-class; ~2h for 27B. Cheap vs
+Stage B's 3-4h, and it's a one-time fixed cost — the new imatrix file
+ships back to the repo and replaces the existing one for all future
+runs.
 
 ### 4.2 lm_head Hessian: high-vocab, K=hidden
 

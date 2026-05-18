@@ -3968,9 +3968,48 @@ fn main() {
             );
             std::process::exit(2);
         }
+        // (c) Imatrix MUST cover output.weight (GGUF twin of lm_head.weight).
+        //     llama-imatrix's default skips lm_head; the wrapper at
+        //     `crates/hipfire-runtime/examples/imatrix_collect.rs` requires
+        //     `--process-output` to opt in. Without coverage, the existing
+        //     `apply_awq_prescale` path silently returns identity scales —
+        //     lm_head would end up MQ4-packed with NO AWQ pre-scaling and
+        //     NO awq_scale.weight sidecar, producing an .hfq that LOOKS
+        //     like an opt-in but isn't. Fail loud here so the operator
+        //     regenerates the imatrix with `--process-output` rather than
+        //     silently shipping a broken-by-design quant.
+        //
+        //     Discovered 2026-05-18 — see gptq_lm_head_awq.md §4.1 (which
+        //     v1 marked as a "check"; promoted to hard-block here after
+        //     the 9B smoke produced an AWQ-less lm_head with no warning).
+        let imatrix_has_output = IMATRIX.get()
+            .map(|im| im.contains_key("output.weight"))
+            .unwrap_or(false);
+        if !imatrix_has_output {
+            eprintln!(
+                "error: HIPFIRE_QUANTIZE_LM_HEAD_MQ4_AWQ=1 is set but the loaded imatrix \
+                does not contain an `output.weight` entry — lm_head AWQ pre-scaling \
+                cannot be computed.\n\
+                \n\
+                Cause: the imatrix file was generated without `--process-output`. \
+                Default llama-imatrix behavior skips lm_head/output to save calibration \
+                time; the hipfire wrapper at `crates/hipfire-runtime/examples/imatrix_collect.rs` \
+                exposes `--process-output` to opt in.\n\
+                \n\
+                Fix: regenerate the imatrix on the source model with `--process-output`. \
+                Example (cloud-box A100 recipe):\n\
+                  cargo run --release --example imatrix_collect -- \\\n\
+                    --bf16-gguf <model.gguf> --corpus <slice.txt> \\\n\
+                    --output <new.imatrix.gguf> --process-output\n\
+                \n\
+                Wall: ~30-60 min on A100 80 GB for a 9B-class model."
+            );
+            std::process::exit(2);
+        }
         eprintln!(
-            "lm-head-awq: ENABLED (model is untied, UNSAFE acknowledgment present). \
-            lm_head will flow through the MQ4G256 + AWQ-sidecar path."
+            "lm-head-awq: ENABLED (model is untied, UNSAFE acknowledgment present, \
+            imatrix covers output.weight). lm_head will flow through the MQ4G256 \
+            + AWQ-sidecar path."
         );
     }
 
