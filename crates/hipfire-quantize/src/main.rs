@@ -1843,6 +1843,27 @@ fn default_promote_target(base: GgufFormat) -> GgufFormat {
     }
 }
 
+/// Allowlist for explicit `--kmap-promote` overrides. Runtime mixed-format
+/// dispatch (post-#257) is validated only within same-rotation-family,
+/// upward-in-bit-width pairings. Cross-family (MQ↔HFQ, MQ↔HFP) and
+/// downward-in-bits promotions are rejected at parse time.
+fn is_promote_pair_supported(base: GgufFormat, promote: GgufFormat) -> bool {
+    use GgufFormat::*;
+    if base == promote {
+        return true; // no-op promotion is always safe
+    }
+    match (base, promote) {
+        // MQ-family upward bit-width
+        (Mq2 | Mq2Lloyd, Mq3 | Mq3Lloyd | Mq4 | Mq6) => true,
+        (Mq3 | Mq3Lloyd, Mq4 | Mq6) => true,
+        (Mq4, Mq6) => true,
+        // HFQ-family upward bit-width
+        (Hfq4, Hfq6) => true,
+        // Everything else: explicitly not in the supported matrix
+        _ => false,
+    }
+}
+
 /// Extract layer index from a tensor name.
 /// Handles both safetensors (`layers.{N}.`) and GGUF (`blk.{N}.`) patterns.
 /// Uses unanchored search to handle any prefix (model.layers, model.language_model.layers, etc.).
@@ -2891,7 +2912,15 @@ impl GgufFormat {
 /// (Q4-grade is too lossy for embeddings) and 1D norms stay F16. Tensor
 /// names are translated GGUF → safetensors style so the engine's existing
 /// `load_weights_hfq` can consume the output.
-fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat, no_kmap: bool, kmap_dense: bool, kmap_mode: u8) -> std::io::Result<()> {
+fn run_gguf_pipeline(
+    input: &Path,
+    output: &Path,
+    format: GgufFormat,
+    no_kmap: bool,
+    kmap_dense: bool,
+    kmap_mode: u8,
+    kmap_promote_override: Option<GgufFormat>,
+) -> std::io::Result<()> {
     eprintln!("=== GGUF → {} conversion ===", format.label());
     eprintln!("Input:  {}", input.display());
     eprintln!("Output: {}", output.display());
@@ -2952,7 +2981,7 @@ fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat, no_kmap: b
     // ship-default is the conservative shape per maintainer directive
     // (2026-05-08): never silently change dense quantization. Users who
     // want K-map on dense pass `--kmap-dense` (see flag parsing below).
-    let promote_to = default_promote_target(format);
+    let promote_to = kmap_promote_override.unwrap_or_else(|| default_promote_target(format));
     let kmap: HashMap<String, QuantLevel> = if no_kmap || (!is_moe && !kmap_dense) {
         HashMap::new()
     } else {
@@ -3336,6 +3365,42 @@ fn main() {
         })
         .unwrap_or(1);
 
+    // ── --kmap-promote: explicit promote target (overrides default_promote_target) ──
+    // Default (flag unset): legacy per-base-family target (mq6 for MQ-family,
+    // hfq6 for HFQ, no-op for FP4). With --kmap-promote, the carried target
+    // applies regardless of base. Validated against the promote-pair allowlist
+    // when both sides are known GgufFormat values. See
+    // docs/plans/configurable-kmap-pair.md Phase 1a.
+    let kmap_promote: Option<GgufFormat> = args.iter().position(|a| a == "--kmap-promote")
+        .and_then(|i| args.get(i + 1))
+        .map(|v| GgufFormat::from_flag(v).unwrap_or_else(|| {
+            eprintln!(
+                "error: --kmap-promote '{v}' is not a recognized format. \
+                 Supported: mq2, mq3, mq4, mq6, mq2-lloyd, mq3-lloyd, hfq4, hfq6, mfp4, hfp4."
+            );
+            std::process::exit(2);
+        }));
+    if let Some(promote) = kmap_promote {
+        if let Some(base) = GgufFormat::from_flag(format) {
+            if !is_promote_pair_supported(base, promote) {
+                eprintln!(
+                    "error: --kmap-promote {} not allowed for --format {}. \
+                     Promote target must be same-family upward-in-bits. \
+                     See docs/plans/configurable-kmap-pair.md for the supported pair matrix.",
+                    promote.label(), base.label()
+                );
+                std::process::exit(2);
+            }
+        } else {
+            eprintln!(
+                "warning: --kmap-promote {} ignored — --format '{format}' is not \
+                 a promote-capable base (q8/mixed/q4k/q8hfq have no kmap promotion). \
+                 Drop --kmap-promote or switch to a promote-capable base format.",
+                promote.label()
+            );
+        }
+    }
+
     // ── Sub-4-bit guards (2026-04-30 sweep) ─────────────────────────────
     // MQ2 with the current uniform 4-level codebook collapses at every
     // model size validated locally (0.8B / 4B / 9B Qwen 3.5 → multilingual
@@ -3426,7 +3491,7 @@ fn main() {
                 GgufFormat::Hfq4
             });
             let out = Path::new(output_path);
-            if let Err(e) = run_gguf_pipeline(raw_input, out, gguf_format, no_kmap, kmap_dense, kmap_mode) {
+            if let Err(e) = run_gguf_pipeline(raw_input, out, gguf_format, no_kmap, kmap_dense, kmap_mode, kmap_promote) {
                 eprintln!("GGUF pipeline failed: {e}");
                 std::process::exit(2);
             }
@@ -3533,16 +3598,17 @@ fn main() {
     // the K-map default-on path because the routed-expert promotion is
     // the headline win and the empirical regression there is tighter
     // (+1.7% PPL at 2K, gated below the dense regression threshold).
-    // Promote target carried in `QuantLevel::Promote(<fmt>)`. Default is
-    // `default_promote_target(base)` — same as the pre-`--kmap-promote`
-    // hardcoded behavior. If `format` doesn't parse to a GgufFormat (e.g.
-    // `--format q8` or `--format mixed`), use Mq6 as a placeholder; the
-    // Promote arm's `use_*` boolean dispatch below ignores the carried
-    // format and falls through to its existing Q8 fallback for non-promotable
-    // bases. Byte-exact behavior on this path.
-    let parsed_base = GgufFormat::from_flag(format).unwrap_or(GgufFormat::Mq4);
-    let promote_to = default_promote_target(parsed_base);
-    let kmap: HashMap<String, QuantLevel> = if no_kmap || (!is_moe && !kmap_dense) {
+    // Promote target carried in `QuantLevel::Promote(<fmt>)`.
+    // - If `--kmap-promote` is set explicitly, use that (validated upstream).
+    // - Otherwise fall back to `default_promote_target(base)` — same legacy
+    //   per-base-family behavior.
+    // - If `format` doesn't parse to a GgufFormat (q8/mixed/q4k/q8hfq), kmap
+    //   is disabled entirely below: no promotion is meaningful for those
+    //   bases (byte-exact with the pre-refactor q8-fallback path).
+    let parsed_base_opt = GgufFormat::from_flag(format);
+    let parsed_base = parsed_base_opt.unwrap_or(GgufFormat::Mq4);
+    let promote_to = kmap_promote.unwrap_or_else(|| default_promote_target(parsed_base));
+    let kmap: HashMap<String, QuantLevel> = if no_kmap || (!is_moe && !kmap_dense) || parsed_base_opt.is_none() {
         HashMap::new()
     } else {
         let mut map = HashMap::new();
@@ -3781,37 +3847,60 @@ fn main() {
                     .flat_map(|&v| f32_to_f16(v).to_le_bytes())
                     .collect();
                 (f16_bytes, QuantType::F16, 0u32, "F16")
-            } else if matches!(kmap_level, QuantLevel::Promote(_)) {
-                // K-map says promote. The carried format (in Promote(<fmt>))
-                // is the target, used by the GGUF pipeline's dispatcher.
-                // The safetensors path's dispatcher uses the pre-existing
-                // `use_*` boolean fall-through below; behavior is byte-exact
-                // with the pre-refactor code. The `--kmap-promote` CLI flag
-                // (next commit) will rewrite this arm to read the carried
-                // format directly.
+            } else if let QuantLevel::Promote(promote_fmt) = kmap_level {
+                // K-map says promote. The carried format (from `--kmap-promote`
+                // or `default_promote_target(base)`) drives the dispatch.
+                // Non-256-aligned tensors fall back to Q8.
                 let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
-                if (use_mq4g256 || use_mq4_mq6exp || use_mq3g256 || use_mq2g256
-                    || use_mq2g256_lloyd || use_mq3g256_lloyd) && k_dim % 256 == 0
-                {
+                if k_dim % 256 == 0 {
                     let signs1 = gen_fwht_signs(42, 256);
                     let signs2 = gen_fwht_signs(1042, 256);
-                    let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ6G256, 256u32, "MQ6G256")
-                } else if (use_hfq4g256 || use_hfq3g256 || use_hfq3g128
-                    || use_hfq2g256 || use_hfq2g128) && k_dim % 256 == 0
-                {
-                    let q = quantize_hfq6g256(&f32_data);
-                    (q, QuantType::HFQ6G256, 256u32, "HFQ6G256")
-                } else if use_mq6g256 && k_dim % 256 == 0 {
-                    // Already 6-bit MQ — no-op promotion
-                    let signs1 = gen_fwht_signs(42, 256);
-                    let signs2 = gen_fwht_signs(1042, 256);
-                    let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ6G256, 256u32, "MQ6G256")
-                } else if use_hfq6 && k_dim % 256 == 0 {
-                    // Already 6-bit HFQ — no-op promotion
-                    let q = quantize_hfq6g256(&f32_data);
-                    (q, QuantType::HFQ6G256, 256u32, "HFQ6G256")
+                    match promote_fmt {
+                        GgufFormat::Mq6 => {
+                            let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
+                            (q, QuantType::MQ6G256, 256u32, "MQ6G256")
+                        }
+                        GgufFormat::Hfq6 => {
+                            let q = quantize_hfq6g256(&f32_data);
+                            (q, QuantType::HFQ6G256, 256u32, "HFQ6G256")
+                        }
+                        GgufFormat::Mq4 => {
+                            let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
+                            (q, QuantType::MQ4G256, 256u32, "MQ4G256")
+                        }
+                        GgufFormat::Mq3 => {
+                            let q = quantize_mq3g256(&f32_data, &signs1, &signs2);
+                            (q, QuantType::MQ3G256, 256u32, "MQ3G256")
+                        }
+                        GgufFormat::Mq2 => {
+                            let q = quantize_mq2g256(&f32_data, &signs1, &signs2);
+                            (q, QuantType::MQ2G256, 256u32, "MQ2G256")
+                        }
+                        GgufFormat::Mq2Lloyd => {
+                            let q = quantize_mq2g256_lloyd(&f32_data, &signs1, &signs2);
+                            (q, QuantType::MQ2G256Lloyd, 256u32, "MQ2G256Lloyd")
+                        }
+                        GgufFormat::Mq3Lloyd => {
+                            let q = quantize_mq3g256_lloyd(&f32_data, &signs1, &signs2);
+                            (q, QuantType::MQ3G256Lloyd, 256u32, "MQ3G256Lloyd")
+                        }
+                        GgufFormat::Hfq4 => {
+                            let q = quantize_hfq4g256(&f32_data);
+                            (q, QuantType::HFQ4G256, 256u32, "HFQ4G256")
+                        }
+                        GgufFormat::Hfp4 => {
+                            // No FP6 sibling — Promote-to-HFP4 is the no-op identity.
+                            let m = if meta.shape.len() == 2 { meta.shape[0] } else { 1 };
+                            let q = quantize_hfp4g32_2d(&f32_data, m, k_dim);
+                            (q, QuantType::HFP4G32, 32u32, "HFP4G32")
+                        }
+                        GgufFormat::Mfp4 => {
+                            // No FP6 sibling — Promote-to-MFP4 is the no-op identity.
+                            let m = if meta.shape.len() == 2 { meta.shape[0] } else { 1 };
+                            let q = quantize_mfp4g32_2d(&f32_data, m, k_dim, &signs1, &signs2);
+                            (q, QuantType::MFP4G32, 32u32, "MFP4G32")
+                        }
+                    }
                 } else {
                     // Non-256-aligned fallback: Q8
                     let q = quantize_q8f16(&f32_data);
@@ -4326,6 +4415,100 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_promote_target_mq_family() {
+        assert_eq!(default_promote_target(GgufFormat::Mq2), GgufFormat::Mq6);
+        assert_eq!(default_promote_target(GgufFormat::Mq3), GgufFormat::Mq6);
+        assert_eq!(default_promote_target(GgufFormat::Mq4), GgufFormat::Mq6);
+        assert_eq!(default_promote_target(GgufFormat::Mq6), GgufFormat::Mq6);
+        assert_eq!(default_promote_target(GgufFormat::Mq2Lloyd), GgufFormat::Mq6);
+        assert_eq!(default_promote_target(GgufFormat::Mq3Lloyd), GgufFormat::Mq6);
+    }
+
+    #[test]
+    fn default_promote_target_hfq_family() {
+        assert_eq!(default_promote_target(GgufFormat::Hfq4), GgufFormat::Hfq6);
+        assert_eq!(default_promote_target(GgufFormat::Hfq6), GgufFormat::Hfq6);
+    }
+
+    #[test]
+    fn default_promote_target_fp4_noop() {
+        // No FP6 siblings — promote stays at base
+        assert_eq!(default_promote_target(GgufFormat::Hfp4), GgufFormat::Hfp4);
+        assert_eq!(default_promote_target(GgufFormat::Mfp4), GgufFormat::Mfp4);
+    }
+
+    #[test]
+    fn promote_pair_no_op_always_allowed() {
+        // base == promote is always supported (identity promotion)
+        for fmt in [GgufFormat::Mq2, GgufFormat::Mq3, GgufFormat::Mq4, GgufFormat::Mq6,
+                    GgufFormat::Mq2Lloyd, GgufFormat::Mq3Lloyd,
+                    GgufFormat::Hfq4, GgufFormat::Hfq6,
+                    GgufFormat::Hfp4, GgufFormat::Mfp4] {
+            assert!(is_promote_pair_supported(fmt, fmt), "{:?} → {:?} should be allowed", fmt, fmt);
+        }
+    }
+
+    #[test]
+    fn promote_pair_mq_upward_allowed() {
+        // The primary target: MQ3 base + MQ4 promote alternating
+        assert!(is_promote_pair_supported(GgufFormat::Mq3, GgufFormat::Mq4));
+        assert!(is_promote_pair_supported(GgufFormat::Mq3, GgufFormat::Mq6));
+        assert!(is_promote_pair_supported(GgufFormat::Mq4, GgufFormat::Mq6));
+        // MQ2 base + MQ3 promote (Future expansion section)
+        assert!(is_promote_pair_supported(GgufFormat::Mq2, GgufFormat::Mq3));
+        assert!(is_promote_pair_supported(GgufFormat::Mq2, GgufFormat::Mq4));
+        assert!(is_promote_pair_supported(GgufFormat::Mq2, GgufFormat::Mq6));
+        // Lloyd variants
+        assert!(is_promote_pair_supported(GgufFormat::Mq2Lloyd, GgufFormat::Mq3Lloyd));
+    }
+
+    #[test]
+    fn promote_pair_downward_rejected() {
+        // Promoting downward in bits is not a "promotion" — reject
+        assert!(!is_promote_pair_supported(GgufFormat::Mq6, GgufFormat::Mq3));
+        assert!(!is_promote_pair_supported(GgufFormat::Mq6, GgufFormat::Mq4));
+        assert!(!is_promote_pair_supported(GgufFormat::Mq4, GgufFormat::Mq3));
+        assert!(!is_promote_pair_supported(GgufFormat::Hfq6, GgufFormat::Hfq4));
+    }
+
+    #[test]
+    fn promote_pair_cross_family_rejected() {
+        // MQ ↔ HFQ ↔ FP4: different rotation families, runtime mixed-format
+        // dispatch is only same-family-safe (post-#257). Reject.
+        assert!(!is_promote_pair_supported(GgufFormat::Mq4, GgufFormat::Hfq6));
+        assert!(!is_promote_pair_supported(GgufFormat::Hfq4, GgufFormat::Mq6));
+        assert!(!is_promote_pair_supported(GgufFormat::Mq4, GgufFormat::Hfp4));
+        assert!(!is_promote_pair_supported(GgufFormat::Mfp4, GgufFormat::Mq6));
+    }
+
+    #[test]
+    fn kmap_promote_threading_default_mq6() {
+        // Default promote (no --kmap-promote) keeps MQ4→MQ6 mapping
+        let level = kmap_resolve_mode(
+            "model.layers.0.mlp.down_proj.weight", 40, false, 2, GgufFormat::Mq6,
+        );
+        assert_eq!(level, QuantLevel::Promote(GgufFormat::Mq6));
+    }
+
+    #[test]
+    fn kmap_promote_threading_explicit_mq4() {
+        // --kmap-promote mq4 on an MQ3 base: carries MQ4 in the variant
+        let level = kmap_resolve_mode(
+            "model.layers.0.mlp.down_proj.weight", 40, false, 2, GgufFormat::Mq4,
+        );
+        assert_eq!(level, QuantLevel::Promote(GgufFormat::Mq4));
+    }
+
+    #[test]
+    fn kmap_promote_threading_explicit_mq3() {
+        // --kmap-promote mq3 on an MQ2 base: carries MQ3
+        let level = kmap_resolve_mode(
+            "model.layers.0.mlp.down_proj.weight", 40, false, 2, GgufFormat::Mq3,
+        );
+        assert_eq!(level, QuantLevel::Promote(GgufFormat::Mq3));
+    }
 
     #[test]
     fn parse_layer_idx_safetensors_dense() {
