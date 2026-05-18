@@ -724,47 +724,169 @@ and a sub-`sm_75` card is avoided when possible.
 
 ### 13.2 Bring-up (user side, before this agent attaches)
 
-1. Spin up vast instance; note SSH port + host.
-2. `ssh-add ~/.ssh/id_rsa` in your local shell (vast's `Welcome to
-   vast.ai` banner is normal).
-3. On the instance: `git clone <fork>/hipfire && cd hipfire && git
-   checkout feat/mq-v2-quant-format-cuda` (or whichever branch carries
-   the parameterized pipeline + Stage D Rust support).
-4. Verify Python ≥ 3.12 and rustup present. The "PyTorch 2.x devel"
-   templates work after a torch reinstall (§13.3); skip the "Jupyter"
-   templates — they preinstall conflicting CUDA stacks.
-5. **Pin the working torch wheel** (V100 only — see §13.3):
-   `pip install 'torch==2.7.1+cu126' --index-url https://download.pytorch.org/whl/cu126`
-6. **Purge `fla-core` entirely** if preinstalled: `pip uninstall -y
-   fla-core`. transformers' `qwen3_5` model_type hard-imports fla; once
-   gone, `is_flash_linear_attention_available()` returns False and the
-   PyTorch reference attention path runs (slower but correct on any card).
-7. Paste the instance's ssh command into your local shell + tell this
+Updated 2026-05-18 after the A100 80 GB run uncovered that the canonical
+vast `PyTorch 2.x devel` template ships an **inconsistent torch +
+torchvision pair** AND is missing several runtime Python deps the
+pipeline scripts assume. Specific symptoms hit during the 9B Stage B
+attempt:
+
+- `collect_hessian.py` crashed with `ModuleNotFoundError: No module
+  named 'datasets'` (HF datasets not in the default template)
+- Then `transformers` failed to load `Qwen3_5ForCausalLM` with the
+  cryptic "Are this object's requirements defined correctly?" — root
+  cause was actually `torchvision::nms does not exist`, i.e. a
+  torchvision↔torch ABI mismatch (template ships torch 2.11.0+cu128
+  but torchvision 0.26.0+cu128 against torch 2.6.0+cpu metadata —
+  pip's resolver gets confused)
+
+Recipe that works on **A100 / sm_80+** as of 2026-05-18:
+
+1. Spin up vast instance; note SSH port + host. Pick **400+ GB**
+   `/workspace` (§13.4 — 256 GB was knife-edge on V100 27B run).
+2. `ssh-add ~/.ssh/id_rsa` in your local shell.
+3. On the instance:
+   ```bash
+   cd /workspace
+   git clone <fork>/hipfire && cd hipfire && git checkout feat/mq-v2-quant-format-cuda
+   ```
+4. Verify Python ≥ 3.12 (vast template ships at `/venv/main/bin/python`)
+   and that `rustup` is **NOT** preinstalled — vast `PyTorch devel`
+   template leaves rustup out. Install:
+   ```bash
+   curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+   . /root/.cargo/env
+   ```
+5. **Match torchvision to torch** (mandatory on the vast template —
+   without this, every transformers import that touches `image_utils`
+   raises `RuntimeError: operator torchvision::nms does not exist`):
+   ```bash
+   /venv/main/bin/pip show torch | grep Version   # note major.minor
+   /venv/main/bin/pip install --index-url https://download.pytorch.org/whl/cu128 \
+       torchvision==<matching-version>
+   # for torch 2.11.0+cu128: torchvision==0.26.0
+   ```
+6. **Install missing Python deps** the pipeline expects:
+   ```bash
+   /venv/main/bin/pip install datasets accelerate fla-core
+   ```
+   `datasets` and `accelerate` are HF basics for `collect_hessian.py`'s
+   corpus loader and `device_map="auto"` shard wiring.
+   `fla-core` is required for `transformers.models.qwen3_5` to import
+   at all on recent transformers (≥5.5.x) — the modeling module
+   conditionally imports fla and the lazy-loader raises if it's
+   missing. On sm_80+ fla's Triton kernels compile cleanly and you
+   get the fast path (`is_flash_linear_attention_available() = True`).
+   **Do NOT install `causal-conv1d`** — its wheel build fails on this
+   template and fla doesn't strictly need it for transformer-block
+   inference (only DeltaNet conv1d, which Qwen3.5 uses but the
+   collector doesn't need to be GPU-fast about).
+7. **Install hipfire imatrix-collect dependencies (Python convert script
+   for safetensors → BF16 GGUF):**
+   ```bash
+   /venv/main/bin/pip install -r /workspace/llama.cpp/requirements/requirements-convert_hf_to_gguf.txt
+   ```
+   (only needed if regenerating the BF16 GGUF locally — see §13.3a).
+8. Paste the instance's ssh command into your local shell + tell this
    agent the agent socket path (`echo $SSH_AUTH_SOCK`). Without that
    path none of the SSH-driven steps below work.
 
-### 13.3 V100 / sm_70 specifics (the hassle to avoid)
+**Pre-flight check** the agent should run before any expensive stage:
+
+```bash
+ssh -p <port> root@<host> '/venv/main/bin/python -c "
+import torch, torchvision, fla, transformers
+print(\"torch:\", torch.__version__, torch.cuda.is_available())
+print(\"torchvision:\", torchvision.__version__)
+print(\"fla:\", fla.__version__)
+from transformers.models.qwen3_5 import modeling_qwen3_5
+print(\"qwen3_5 modeling: OK\")
+print(\"is_flash_linear_attention_available:\",
+      modeling_qwen3_5.is_flash_linear_attention_available())
+from datasets import load_dataset
+print(\"datasets: OK\")
+"'
+```
+
+All five lines must print without exception. If any fail, fix
+before running Stage B — the failure modes are silent-until-the-pipeline-tries-it
+otherwise.
+
+### 13.3a Imatrix regeneration (mandatory if lm_head AWQ in scope)
+
+If the run targets `--lm-head-format mq4-awq` (per `gptq_lm_head_awq.md`),
+the existing `benchmarks/quality-baselines/refs/<model>-bf16.imatrix.gguf`
+files **lack `output.weight` coverage** — verified 2026-05-18, all four
+local imatrices (0.8B/4B/9B/27B) have zero lm_head entries. The
+quantizer will hard-abort at startup with `HIPFIRE_QUANTIZE_LM_HEAD_MQ4_AWQ=1`
+(see `gptq_lm_head_awq.md` §4.1).
+
+Regenerate by building llama.cpp on the cloud box and invoking the
+hipfire wrapper with `--process-output`:
+
+```bash
+# 1. Build llama.cpp at the pinned commit (~3 min on 32-core A100 host)
+cd /workspace
+git clone https://github.com/ggml-org/llama.cpp.git
+cd llama.cpp
+git checkout 9dcf83552887bb898b4a98a5761361e504e31fc3   # pin per imatrix_collect.rs
+cmake -B build -DGGML_CUDA=ON -DLLAMA_CURL=OFF \
+    -DCMAKE_CUDA_ARCHITECTURES=80 -DGGML_NATIVE=ON
+cmake --build build --target llama-imatrix -j
+
+# 2. Convert HF safetensors → BF16 GGUF (one-time; ~5-10 min for 9B)
+/venv/main/bin/python /workspace/llama.cpp/convert_hf_to_gguf.py \
+    /workspace/.hf_home/hub/<model-dir> \
+    --outfile /workspace/<model>-BF16.gguf \
+    --outtype bf16
+
+# 3. Imatrix with --process-output (~80 min for 9B; ~3-5h for 27B on A100)
+cd /workspace/hipfire
+cargo run --release --example imatrix_collect -- \
+    --bf16-gguf /workspace/<model>-BF16.gguf \
+    --corpus benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt \
+    --output /workspace/<model>-bf16.imatrix.gguf \
+    --llama-imatrix-bin /workspace/llama.cpp/build/bin/llama-imatrix \
+    --process-output
+```
+
+Verify with the same structural parse from `gptq_lm_head_awq.md` §4.1:
+
+```bash
+/venv/main/bin/python -c "
+import struct; data = open('/workspace/<model>-bf16.imatrix.gguf','rb').read()
+has = data.count(b'output.weight.in_sum2') > 0
+print('output.weight covered:', has); assert has"
+```
+
+Commit the new imatrix back to `benchmarks/quality-baselines/refs/`
+(replaces the existing file) so future runs don't repeat this step.
+
+### 13.3b V100 / sm_70 specifics (historical — sm_75 floor recommended)
+
+These applied to the 2026-05-17 V100 run and should NOT be hit on
+sm_80+ rentals. Documented because someone may still pick V100 for
+cost reasons.
 
 - **Torch wheel:** torch 2.11 (cu13.0) ships sm_75+ only. Symptom:
   `cudaErrorNoKernelImageForDevice` on first `cuda.is_available()`
-  call, otherwise the instance "looks fine." Fix: install
-  `torch==2.7.1+cu126` via the explicit cu126 wheel index. 2.7.x is
-  the last branch packaging sm_70 stably.
+  call. V100 workaround: install `torch==2.7.1+cu126` via the explicit
+  cu126 wheel index.
 - **`fla-core` Triton compile fails on sm_70:** `PassManager::run
-  failed` during JIT of the first attention kernel. fla-core 0.5.0+
-  also requires torch ≥ 2.7. transformers imports fla unconditionally
-  for qwen3_5; purging it bypasses the import.
+  failed` during JIT. V100 workaround: `pip uninstall -y fla-core`
+  so `is_flash_linear_attention_available()` returns False and the
+  PyTorch reference attention path runs (slower but correct).
+  **DO NOT do this on sm_80+** — fla compiles fine there and the
+  fast path is materially faster.
 - **`ptrace_scope` is read-only in vast containers:** py-spy can't
-  attach across user namespaces (`Failed to copy Py_Version symbol /
-  Permission denied`). Diagnose hangs via `/proc/<pid>/stat`,
+  attach across user namespaces. Diagnose hangs via `/proc/<pid>/stat`,
   `/proc/<pid>/task/*/stat`, `/proc/<pid>/io`. Steadily-growing
   `utime+stime` with `wchan=0` and high R-thread count = CPU-bound,
-  not deadlocked.
-- **`/venv/main` lives on a 16 GB overlay**, NOT on `/workspace`.
-  pip-installing torch on top of the existing venv exhausts it fast.
-  Run `pip cache purge` before any heavy install; if you need more,
-  install to a fresh venv under `/workspace/.venv-cuda/` and skip the
-  system venv.
+  not deadlocked. (Applies to all vast templates, not V100-specific.)
+- **`/venv/main` lives on a 16 GB overlay** on V100 templates, NOT
+  on `/workspace`. pip-installing torch on top of the existing venv
+  exhausts it fast. Run `pip cache purge` before any heavy install.
+  (Less of an issue on A100 templates which seem to ship a 48-64 GB
+  overlay.)
 
 ### 13.4 Disk layout for 27B (256 GB `/workspace`)
 
