@@ -115,6 +115,12 @@ def awq_eligible(safetensors_name: str, *, f1_only: bool = False) -> bool:
         "gate_up_proj.weight",
         # MoE router (HF naming) — also `router.weight` for non-HF arches.
         "mlp.gate.weight", "router.weight",
+        # Final logits projection — added 2026-05-18 (gptq_lm_head_awq.md).
+        # Semantically input-side: lm_head's "activation" is the final
+        # hidden state, post-RMSNorm. Only used by quantize when the
+        # untied-embedding guard passes AND --lm-head-format mq4-awq is
+        # set; otherwise lm_head stays at Q8 (default).
+        "lm_head.weight", "output.weight",
     )) or ".in_proj_" in safetensors_name  # linear-attn input substrings
     if f1_only:
         return f1_match

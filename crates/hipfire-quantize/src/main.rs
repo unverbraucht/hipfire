@@ -2162,6 +2162,20 @@ fn kmap_resolve_mode(name: &str, n_layers: usize, is_moe: bool, kmap_mode: u8) -
         {
             return QuantLevel::F16;
         }
+        // 2026-05-18 — gptq_lm_head_awq.md Phase 1. When this env is set
+        // AND the tied-embed check passed at startup AND the
+        // HIPFIRE_LM_HEAD_AWQ_UNSAFE=1 safety gate is also set (until the
+        // runtime-side patch lands — see plan §3.2), let lm_head fall
+        // through to the base format (MQ4G256 path) so the precomputed-
+        // gptq dispatch can apply AWQ pre-scaling + frozen-grids packing.
+        // QuantLevel::Base means "use --format as-is", which on a dense
+        // MQ4 run packs lm_head through the same MQ4G256 + awq_sidecar
+        // path as transformer-block tensors. Default (env unset): Q8.
+        if is_lm_head
+            && std::env::var("HIPFIRE_QUANTIZE_LM_HEAD_MQ4_AWQ").ok().as_deref() == Some("1")
+        {
+            return QuantLevel::Base;
+        }
         // 2026-05-13 — embedding-precision probe for the engine-drift-floor
         // residual audit (Phase 1c follow-up). HIPFIRE_QUANTIZE_EMBED_F16=1
         // stores the embed_tokens table as raw F16 instead of Q8, so the
@@ -2969,7 +2983,16 @@ fn awq_eligible(name: &str) -> bool {
         // correctness. `router.weight` would be a non-HF naming an
         // arch might choose; kept for safety.
         || name.ends_with("mlp.gate.weight")
-        || name.ends_with("router.weight");
+        || name.ends_with("router.weight")
+        // Final logits projection — added 2026-05-18 (gptq_lm_head_awq.md).
+        // Semantically input-side: lm_head's "activation" is the final
+        // hidden state, post-RMSNorm. Only fires through the AWQ branch
+        // when --lm-head-format mq4-awq is set AND the model is untied
+        // (see `is_tied_embedding` check). For tied-embed models, the
+        // standard kmap_resolve path force-promotes lm_head to Q8 and
+        // this match is effectively dead code.
+        || name.ends_with("lm_head.weight")
+        || name == "output.weight";
     if f1_only { return f1_match; }
     let f2_match =
         // ── F2 (2026-05-14): output-side projections ────────────────────
@@ -3894,6 +3917,63 @@ fn main() {
         eprintln!("  warning: num_hidden_layers not found in config.json — edge-layer promotion disabled");
     }
 
+    // ── gptq_lm_head_awq.md Phase 1 — startup safety + tied-embed guard ──
+    // HIPFIRE_QUANTIZE_LM_HEAD_MQ4_AWQ=1 routes lm_head through the
+    // MQ4G256 + AWQ sidecar path instead of the default Q8. Two
+    // independent pre-conditions must hold or we abort:
+    //
+    //   (a) Source model is NOT tied-embedding. tie_word_embeddings=true
+    //       means lm_head shares storage with embed_tokens; AWQ-pre-
+    //       scaling that tensor would corrupt the embedding lookup
+    //       (embed[token_id] = s · row instead of row).
+    //
+    //   (b) HIPFIRE_LM_HEAD_AWQ_UNSAFE=1 is also set. This is a temporary
+    //       safety gate until the runtime-side AWQ-aware lm_head dispatch
+    //       ships. Without the runtime patch, the .hfq's AWQ-pre-scaled
+    //       lm_head bytes get fed to a non-AWQ-aware kernel, producing
+    //       (W·s)·x ≠ W·x — master-doc §6 rule 5 (0.67 → 13.5 KLD on
+    //       0.8B Qwen3.5 when this guard was missing for output-side
+    //       projections). Drop this gate in the same commit that lands
+    //       the runtime AWQ-aware dispatch.
+    //
+    // Both env vars default OFF. The standard quantize behavior (lm_head
+    // at Q8) is unchanged unless someone explicitly opts in.
+    let lm_head_mq4_awq = std::env::var("HIPFIRE_QUANTIZE_LM_HEAD_MQ4_AWQ")
+        .ok().as_deref() == Some("1");
+    if lm_head_mq4_awq {
+        let tied_embed = config.get("tie_word_embeddings")
+            .or_else(|| config.get("text_config").and_then(|tc| tc.get("tie_word_embeddings")))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if tied_embed {
+            eprintln!(
+                "error: HIPFIRE_QUANTIZE_LM_HEAD_MQ4_AWQ=1 is set but the source model has \
+                tie_word_embeddings=true. lm_head shares storage with embed_tokens; AWQ-pre-\
+                scaling would corrupt the embedding lookup. Refusing to produce a broken \
+                .hfq. To force, the model would need to be untied first — out of scope for \
+                this flag. See docs/plans/gptq_lm_head_awq.md §3.4."
+            );
+            std::process::exit(2);
+        }
+        let unsafe_gate = std::env::var("HIPFIRE_LM_HEAD_AWQ_UNSAFE")
+            .ok().as_deref() == Some("1");
+        if !unsafe_gate {
+            eprintln!(
+                "error: HIPFIRE_QUANTIZE_LM_HEAD_MQ4_AWQ=1 requires HIPFIRE_LM_HEAD_AWQ_UNSAFE=1 \
+                until the runtime-side AWQ-aware lm_head dispatch lands. A .hfq produced \
+                without the runtime patch will mis-read AWQ-pre-scaled lm_head as plain MQ4 \
+                — master-doc §6 rule 5 corruption pattern (0.67 → 13.5 KLD blowup measured on \
+                0.8B). See docs/plans/gptq_lm_head_awq.md §3.2; drop this gate in the same \
+                commit that lands runtime support."
+            );
+            std::process::exit(2);
+        }
+        eprintln!(
+            "lm-head-awq: ENABLED (model is untied, UNSAFE acknowledgment present). \
+            lm_head will flow through the MQ4G256 + AWQ-sidecar path."
+        );
+    }
+
     // Read tokenizer if present
     let tokenizer_json = input_dir.join("tokenizer.json");
     let tokenizer_str = if tokenizer_json.exists() {
@@ -4243,6 +4323,24 @@ fn main() {
                 // to MQ4-vs-Q8 KLD gap. Forces lm_head to Q8 storage without
                 // engaging --kmap-dense's edge-FFN Promote6 side-effects.
                 QuantLevel::Q8
+            } else if (name.contains("lm_head") || name.ends_with("output.weight"))
+                && std::env::var("HIPFIRE_QUANTIZE_LM_HEAD_MQ4_AWQ").ok().as_deref() == Some("1")
+            {
+                // 2026-05-18 — gptq_lm_head_awq.md Phase 1. Let lm_head
+                // flow through the precomputed-gptq MQ4G256 / MQ3G256 path
+                // with AWQ pre-scaling + frozen-grids + (optional) GPTQ
+                // OBS propagation. Requires:
+                //   - source model is NOT tied-embedding (checked at startup
+                //     — abort if violated; see `is_tied_embedding` guard)
+                //   - HIPFIRE_LM_HEAD_AWQ_UNSAFE=1 also set (until runtime
+                //     side ships — see plan §3.2). Without that gate the
+                //     binary refuses to produce a .hfq because the runtime
+                //     will mis-read the AWQ-pre-scaled lm_head as plain
+                //     MQ4 (master-doc §6 rule 5 corruption pattern).
+                // QuantLevel::Base = "use --format as-is" → lm_head goes
+                // through the same MQ4G256 + awq_sidecar branch as
+                // transformer-block input projections.
+                QuantLevel::Base
             } else if (name.contains("lm_head") || name.ends_with("output.weight"))
                 && std::env::var("HIPFIRE_QUANTIZE_LM_HEAD_MQ6").ok().as_deref() == Some("1")
             {
