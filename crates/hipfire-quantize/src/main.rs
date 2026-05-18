@@ -3867,11 +3867,25 @@ fn main() {
         );
         let _ = LM_HEAD_FORMAT.set(fmt);
         // Mark AWQ on lm_head as enabled iff --awq is also set AND the chosen
-        // format is one we have AWQ pre-scaling wired for (today: MQ4 only).
+        // format is one the runtime can AWQ-load. `DType::supports_awq_sidecar`
+        // (see fix/lm-head-awq-runtime branch) returns true for MQ4G256 + MQ3G256
+        // today. Wider runtime support → wider matching here.
         // awq_eligible reads this lock to add lm_head/output to the F1 set.
         let awq_set = AWQ_ALPHA.get().copied().map(|a| a > 0.0).unwrap_or(false);
-        if awq_set && fmt == GgufFormat::Mq4 {
-            let _ = LM_HEAD_AWQ_ENABLED.set(true);
+        if awq_set {
+            if matches!(fmt, GgufFormat::Mq4 | GgufFormat::Mq3) {
+                let _ = LM_HEAD_AWQ_ENABLED.set(true);
+            } else {
+                // Format the runtime can't AWQ-load. Warn instead of silently
+                // producing a non-AWQ-scaled lm_head when --awq is set
+                // (combined-review C4 / Gemini §5b).
+                eprintln!(
+                    "warning: AWQ pre-scaling for --lm-head-format {} is not yet wired \
+                     (runtime supports MQ4/MQ3 only via DType::supports_awq_sidecar). \
+                     lm_head will be plain {} without an AWQ sidecar.",
+                    fmt.label(), fmt.label()
+                );
+            }
         }
     }
 
@@ -4219,11 +4233,53 @@ fn main() {
                             (q, QuantType::HFQ6G256, 256u32, "HFQ6G256")
                         }
                         GgufFormat::Mq4 => {
-                            let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
+                            // MQ4 promote target: wire AWQ inline-quantize when
+                            // --awq is set and the tensor is on the F1/F2
+                            // whitelist (q_proj, k_proj, v_proj, gate_proj,
+                            // up_proj, o_proj, down_proj, wo, w_down, etc.).
+                            // Runtime supports MQ4G256 AWQ sidecars
+                            // (DType::supports_awq_sidecar). Without this,
+                            // promoted tensors miss AWQ and the kmap-pair
+                            // model loses quality on the precisely the layers
+                            // kmap was supposed to protect (combined-review G5).
+                            let q = if let (Some(alpha), Some(im_weights))
+                                = (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
+                            {
+                                if awq_eligible(name) {
+                                    let scales = compute_awq_scales(im_weights, alpha);
+                                    awq_sidecar_scales = Some(scales.clone());
+                                    let m_dim = meta.shape[0];
+                                    let mut scaled = f32_data.clone();
+                                    awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
+                                    quantize_mq4g256(&scaled, &signs1, &signs2)
+                                } else {
+                                    quantize_mq4g256(&f32_data, &signs1, &signs2)
+                                }
+                            } else {
+                                quantize_mq4g256(&f32_data, &signs1, &signs2)
+                            };
                             (q, QuantType::MQ4G256, 256u32, "MQ4G256")
                         }
                         GgufFormat::Mq3 => {
-                            let q = quantize_mq3g256(&f32_data, &signs1, &signs2);
+                            // MQ3 promote target: same AWQ wiring as MQ4.
+                            // Runtime supports MQ3G256 AWQ sidecars too
+                            // (DType::supports_awq_sidecar).
+                            let q = if let (Some(alpha), Some(im_weights))
+                                = (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
+                            {
+                                if awq_eligible(name) {
+                                    let scales = compute_awq_scales(im_weights, alpha);
+                                    awq_sidecar_scales = Some(scales.clone());
+                                    let m_dim = meta.shape[0];
+                                    let mut scaled = f32_data.clone();
+                                    awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
+                                    quantize_mq3g256(&scaled, &signs1, &signs2)
+                                } else {
+                                    quantize_mq3g256(&f32_data, &signs1, &signs2)
+                                }
+                            } else {
+                                quantize_mq3g256(&f32_data, &signs1, &signs2)
+                            };
                             (q, QuantType::MQ3G256, 256u32, "MQ3G256")
                         }
                         GgufFormat::Mq2 => {
@@ -4298,7 +4354,26 @@ fn main() {
                             (q, QuantType::MQ6G256, 256u32, "MQ6G256")
                         }
                         GgufFormat::Mq3 => {
-                            let q = quantize_mq3g256(&f32_data, &signs1, &signs2);
+                            // MQ3 + AWQ on lm_head: runtime supports the sidecar via
+                            // DType::supports_awq_sidecar(MQ3G256)=true (per the
+                            // fix/lm-head-awq-runtime branch). Wire the same AWQ
+                            // inline-quantize dance as the MQ4 arm.
+                            let q = if let (Some(alpha), Some(im_weights))
+                                = (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
+                            {
+                                if awq_eligible(name) {
+                                    let scales = compute_awq_scales(im_weights, alpha);
+                                    awq_sidecar_scales = Some(scales.clone());
+                                    let m_dim = meta.shape[0];
+                                    let mut scaled = f32_data.clone();
+                                    awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
+                                    quantize_mq3g256(&scaled, &signs1, &signs2)
+                                } else {
+                                    quantize_mq3g256(&f32_data, &signs1, &signs2)
+                                }
+                            } else {
+                                quantize_mq3g256(&f32_data, &signs1, &signs2)
+                            };
                             (q, QuantType::MQ3G256, 256u32, "MQ3G256")
                         }
                         GgufFormat::Hfq4 => {
