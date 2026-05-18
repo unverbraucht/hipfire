@@ -899,12 +899,12 @@ fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, name: &str, m: usize, k: usize) 
         } else {
             panic!("tensor not found: {name} or {full_name}");
         };
-        // Phase A Stage A — populate awq_scale for MQ4G256 weights when
-        // a sidecar is present. The pread call invalidates the prior
-        // pread_buf borrow, but the weight bytes have already been
-        // uploaded to GPU (owned by `wt.buf`) so the borrow no longer
-        // matters.
-        if matches!(wt.gpu_dtype, DType::MQ4G256 | DType::MQ3G256) {
+        // Phase A Stage A — populate awq_scale when the dtype is on
+        // the AWQ allow-list (centralized at `DType::supports_awq_sidecar`).
+        // The pread call invalidates the prior pread_buf borrow, but
+        // the weight bytes have already been uploaded to GPU (owned by
+        // `wt.buf`) so the borrow no longer matters.
+        if wt.gpu_dtype.supports_awq_sidecar() {
             wt.awq_scale = load_awq_scale_for(hfq, gpu, &full_name, k)
                 .or_else(|| load_awq_scale_for(hfq, gpu, name, k));
         }
@@ -916,7 +916,7 @@ fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, name: &str, m: usize, k: usize) 
             .or_else(|| hfq.tensor_data(name))
             .unwrap_or_else(|| panic!("tensor not found: {name} or {full_name}"));
         let mut wt = load_weight_tensor_raw(gpu, info.quant_type, data, m, k)?;
-        if matches!(wt.gpu_dtype, DType::MQ4G256 | DType::MQ3G256) {
+        if wt.gpu_dtype.supports_awq_sidecar() {
             wt.awq_scale = load_awq_scale_for(hfq, gpu, &full_name, k)
                 .or_else(|| load_awq_scale_for(hfq, gpu, name, k));
         }

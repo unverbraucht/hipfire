@@ -446,6 +446,44 @@ impl DType {
             DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q4F16G64 | DType::Q4F16G32 | DType::Q8HFQ | DType::HFQ4G256 | DType::HFQ4G128 | DType::HFQ3G256 | DType::HFQ3G128 | DType::HFQ2G256 | DType::HFQ2G128 | DType::HFQ6G256 | DType::MQ4G256 | DType::MQ6G256 | DType::MQ8G256 | DType::MQ3G256 | DType::MQ2G256 | DType::MQ2G256Lloyd | DType::MQ3G256Lloyd | DType::HFP4G32 | DType::MFP4G32 | DType::Raw => 1, // byte-level
         }
     }
+
+    /// Whether a `WeightTensor` of this dtype should have the
+    /// `<weight>.awq_scale.weight` F16 sidecar attached at load time.
+    ///
+    /// Centralizes the gate that previously lived inline at every
+    /// loader call site (qwen35.rs `load_weight_tensor`, etc.). The
+    /// motivation is the May 2026 regression where `qwen35.rs:907`
+    /// gated on `matches!(wt.gpu_dtype, DType::MQ4G256)` and silently
+    /// dropped AWQ sidecars for `MQ3G256`-quantized Qwen3.5 weights,
+    /// producing fluent-but-nonsensical token soup for ~5 hours
+    /// before the missing arm was traced. Adding a new AWQ-eligible
+    /// dtype is now a one-line edit here instead of two scattered
+    /// edits per loader.
+    ///
+    /// Current allow-list = the empirical truth of which dtypes ship
+    /// AWQ sidecars from the quantizer AND have an AWQ-aware forward
+    /// path (`rotate_x_mq_for` etc., wired through `awq_scale.is_some()`).
+    ///
+    /// **Forward-path-ready candidates not currently in the allow-list**
+    /// (forward kernels exist but no `.hfq` file in tree ships sidecars
+    /// for them — widen only after the quantizer side is verified to
+    /// emit sidecars and at least one coherence-gate row exercises the
+    /// combination):
+    /// - `MQ6G256`
+    /// - `MQ2G256`, `MQ2G256Lloyd`
+    /// - `MQ3G256Lloyd`
+    /// - `MFP4G32` (forward path has explicit `awq_scale.is_some()`
+    ///   branching at llama.rs:609 but the quantizer comment says
+    ///   "AWQ is gated to MQ4G256 today" — confirm before widening)
+    ///
+    /// `MQ8G256` is explicitly **not** a candidate: it uses its own
+    /// INT8-quantized scratch path (`gemv_mq8g256_with_rotate`,
+    /// `rotate_quantize_x_mq8`) and does not flow through
+    /// `rotate_x_mq_for`, so there is no AWQ-aware kernel to dispatch
+    /// to.
+    pub fn supports_awq_sidecar(self) -> bool {
+        matches!(self, DType::MQ4G256 | DType::MQ3G256)
+    }
 }
 
 /// High-level GPU context. Owns the HIP runtime, compiler, and loaded kernels.
