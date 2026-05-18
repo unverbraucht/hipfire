@@ -1872,13 +1872,26 @@ fn is_promote_pair_supported(base: GgufFormat, promote: GgufFormat) -> bool {
         return true; // no-op promotion is always safe
     }
     match (base, promote) {
-        // MQ-family upward bit-width
-        (Mq2 | Mq2Lloyd, Mq3 | Mq3Lloyd | Mq4 | Mq6) => true,
-        (Mq3 | Mq3Lloyd, Mq4 | Mq6) => true,
+        // Lloyd-to-Lloyd only — Lloyd variants use different codebooks +
+        // different runtime kernel families from standard MQ. Lloyd→non-Lloyd
+        // mixed-format dispatch has no runtime support today; the plan's
+        // "Future expansion" section targets the MQ2-Lloyd + MQ3-Lloyd pair
+        // specifically. Tightened per combined-review finding G2.
+        (Mq2Lloyd, Mq3Lloyd) => true,
+        (Mq2Lloyd | Mq3Lloyd, _) => false,
+        (_, Mq2Lloyd | Mq3Lloyd) => false,
+
+        // MQ-family upward bit-width (non-Lloyd)
+        (Mq2, Mq3 | Mq4 | Mq6) => true,
+        (Mq3, Mq4 | Mq6) => true,
         (Mq4, Mq6) => true,
+
         // HFQ-family upward bit-width
         (Hfq4, Hfq6) => true,
-        // Everything else: explicitly not in the supported matrix
+
+        // Everything else: explicitly not in the supported matrix.
+        // Cross-family (MQ↔HFQ↔FP4) rejected — runtime mixed-format dispatch
+        // (post-#257) is only same-rotation-family-safe.
         _ => false,
     }
 }
@@ -4784,12 +4797,25 @@ mod tests {
         assert!(is_promote_pair_supported(GgufFormat::Mq3, GgufFormat::Mq4));
         assert!(is_promote_pair_supported(GgufFormat::Mq3, GgufFormat::Mq6));
         assert!(is_promote_pair_supported(GgufFormat::Mq4, GgufFormat::Mq6));
-        // MQ2 base + MQ3 promote (Future expansion section)
+        // MQ2 base + MQ3 promote (Future expansion section, non-Lloyd)
         assert!(is_promote_pair_supported(GgufFormat::Mq2, GgufFormat::Mq3));
         assert!(is_promote_pair_supported(GgufFormat::Mq2, GgufFormat::Mq4));
         assert!(is_promote_pair_supported(GgufFormat::Mq2, GgufFormat::Mq6));
-        // Lloyd variants
+    }
+
+    #[test]
+    fn promote_pair_lloyd_only_within_family() {
+        // Lloyd → Lloyd allowed (the Future expansion target).
         assert!(is_promote_pair_supported(GgufFormat::Mq2Lloyd, GgufFormat::Mq3Lloyd));
+        // Lloyd → non-Lloyd rejected — different codebooks, no runtime path.
+        assert!(!is_promote_pair_supported(GgufFormat::Mq2Lloyd, GgufFormat::Mq3));
+        assert!(!is_promote_pair_supported(GgufFormat::Mq2Lloyd, GgufFormat::Mq4));
+        assert!(!is_promote_pair_supported(GgufFormat::Mq2Lloyd, GgufFormat::Mq6));
+        assert!(!is_promote_pair_supported(GgufFormat::Mq3Lloyd, GgufFormat::Mq4));
+        assert!(!is_promote_pair_supported(GgufFormat::Mq3Lloyd, GgufFormat::Mq6));
+        // non-Lloyd → Lloyd also rejected (would need Lloyd codebook fitting at runtime).
+        assert!(!is_promote_pair_supported(GgufFormat::Mq2, GgufFormat::Mq3Lloyd));
+        assert!(!is_promote_pair_supported(GgufFormat::Mq3, GgufFormat::Mq3Lloyd));
     }
 
     #[test]
