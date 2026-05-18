@@ -1377,7 +1377,7 @@ pub fn load_weights(hfq: &mut HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> 
     // Try separate lm_head first (untied embeddings, e.g. 9B), fall back to tied embed_tokens
     let lm_head_info = hfq.tensor_data_vec("lm_head.weight")
         .or_else(|| hfq.tensor_data_vec("model.language_model.lm_head.weight"));
-    let output = if let Some((lm_info, lm_data)) = lm_head_info {
+    let mut output = if let Some((lm_info, lm_data)) = lm_head_info {
         eprintln!("  loading output (separate lm_head, qt={})...", lm_info.quant_type);
         load_weight_tensor_raw(gpu, lm_info.quant_type, &lm_data, config.vocab_size, config.dim)?
     } else {
@@ -1409,6 +1409,21 @@ pub fn load_weights(hfq: &mut HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> 
             WeightTensor { buf, gpu_dtype: DType::F32, m: config.vocab_size, k: config.dim, row_stride: 0, awq_scale: None }
         }
     };
+    // lm_head / tied embed_tokens AWQ sidecar attachment. Today no
+    // quantizer in the tree emits sidecars for these tensors (AWQ
+    // targets per-channel input scaling, which is iffy on
+    // vocab-sized matrices), but the inline `load_weight_tensor_raw`
+    // call above hardcodes `awq_scale: None` and bypasses the
+    // `load_weight_tensor` wrapper — so a future quantizer change
+    // would silently regress here the same way `qwen35.rs:907`
+    // regressed on MQ3 in May 2026. Try each plausible tensor name;
+    // `load_awq_scale_for` returns None when no sidecar exists, so
+    // this is a no-op for current files.
+    if output.gpu_dtype.supports_awq_sidecar() {
+        output.awq_scale = load_awq_scale_for(hfq, gpu, "lm_head.weight", config.dim)
+            .or_else(|| load_awq_scale_for(hfq, gpu, "model.language_model.lm_head.weight", config.dim))
+            .or_else(|| load_awq_scale_for(hfq, gpu, "model.language_model.embed_tokens.weight", config.dim));
+    }
 
     let is_moe = config.num_experts > 0;
     let mut layers = Vec::with_capacity(config.n_layers);
@@ -1606,7 +1621,7 @@ fn load_output_into(
     let lm_head_info = hfq
         .tensor_data("lm_head.weight")
         .or_else(|| hfq.tensor_data("model.language_model.lm_head.weight"));
-    let output = if let Some((lm_info, lm_data)) = lm_head_info {
+    let mut output = if let Some((lm_info, lm_data)) = lm_head_info {
         eprintln!("  loading output (separate lm_head, qt={})...", lm_info.quant_type);
         load_weight_tensor_raw(gpu, lm_info.quant_type, lm_data, config.vocab_size, config.dim)?
     } else {
@@ -1645,6 +1660,18 @@ fn load_output_into(
             WeightTensor { buf, gpu_dtype: DType::F32, m: config.vocab_size, k: config.dim, row_stride: 0, awq_scale: None }
         }
     };
+    // Same lm_head / tied embed_tokens AWQ attachment as the
+    // multimodal load_weights above. Sister fix — both code paths
+    // construct WeightTensor directly with `awq_scale: None` outside
+    // the `load_weight_tensor` wrapper, so they need explicit
+    // helper-gated attachment here. No-op on current files; defends
+    // against a future quantizer change that emits sidecars for the
+    // embedding matrix.
+    if output.gpu_dtype.supports_awq_sidecar() {
+        output.awq_scale = load_awq_scale_for(hfq, gpu, "lm_head.weight", config.dim)
+            .or_else(|| load_awq_scale_for(hfq, gpu, "model.language_model.lm_head.weight", config.dim))
+            .or_else(|| load_awq_scale_for(hfq, gpu, "model.language_model.embed_tokens.weight", config.dim));
+    }
     Ok((output_norm, output))
 }
 
