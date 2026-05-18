@@ -152,19 +152,31 @@ Accepted vocabulary: `q8`, `f16`, `mq4`, `mq6`, `mq3`, `hfq4`, `hfq6`, `mfp4`. *
 
 **Required code changes that arrive in this PR (not "preserve verbatim" — write fresh)**:
 
-(i) **Tied-embedding refusal**. Mirror the contract from CUDA branch commit `4b0693d6`:
+(i) **Tied-embedding refusal**. Implement the **hardened** version from CUDA branch commit `dbcb050` directly (skip the original `unwrap_or(false)` version at `4b0693d6` which silently treated missing config fields as untied):
 
 ```rust
-let tied_embed = config.get("tie_word_embeddings")
-    .or_else(|| config.get("text_config").and_then(|tc| tc.get("tie_word_embeddings")))
-    .and_then(|v| v.as_bool())
-    .unwrap_or(false);
-if tied_embed && !matches!(lm_head_format, GgufFormat::Q8 | GgufFormat::F16) {
-    abort("lm_head AWQ-scaling corrupts shared embed_tokens — refuse.");
+let tied_embed_field = config.get("tie_word_embeddings")
+    .or_else(|| config.get("text_config").and_then(|tc| tc.get("tie_word_embeddings")));
+match tied_embed_field.and_then(|v| v.as_bool()) {
+    Some(true) => abort("lm_head AWQ-scaling corrupts shared embed_tokens — refuse."),
+    Some(false) => { /* proceed */ }
+    None => abort(
+        "tie_word_embeddings field missing from both top-level config and \
+         text_config. Either add the field explicitly after verifying tied vs \
+         untied status, or untie the model first."
+    ),
 }
 ```
 
-Documented limitation (GLM5/Gemini §3): the `unwrap_or(false)` default catches the common case (`tie_word_embeddings: true|false` set in config). Models that omit the field but ARE tied silently default to "untied" and can corrupt. The CUDA branch accepts this risk; we inherit it. A pointer-alias scan beyond the config flag is **future hardening, out of scope here**.
+Verdict matrix per CUDA branch's plan §3.4:
+
+| Config state | Action |
+|---|---|
+| `tie_word_embeddings: true` | abort (would corrupt) |
+| `tie_word_embeddings: false` | proceed |
+| field missing from both top-level + text_config | **abort** (fail-loud, not fail-silent) |
+
+Residual risk (acknowledged on both branches, future work): a model whose config falsely says `tie_word_embeddings: false` but whose safetensors index actually shares storage between `lm_head.weight` and `embed_tokens.weight` would still corrupt. The architecturally correct fallback is a safetensors-structural scan (compare `data_offsets` across the manifest) — out of scope for both branches now, tracked.
 
 (ii) **awq_eligible whitelist extension**. `fn awq_eligible` in master does **not** include `lm_head.weight` / `output.weight` (GLM5 §3, verified at `main.rs::awq_eligible`). Without this fix, `--lm-head-format mq4 --awq` produces an MQ4 lm_head **without** AWQ pre-scaling, which the runtime will read as if it were AWQ-scaled once the CUDA branch's runtime lands — silent corruption. The fix: add `lm_head.weight` and `output.weight` to the F1 suffix set, gated on `--lm-head-format != Q8 && --awq`.
 
@@ -319,7 +331,7 @@ Coherence-gate (`scripts/coherence-gate.sh`) is **not** in this PR's acceptance 
 - **CUDA branch's runtime AWQ-aware lm_head dispatch doesn't ship within the next quarter**: per user, this is the CUDA branch owner's responsibility post-merge. Our Phase 1 produces files that error out at runtime (or are gated by UNSAFE) until that lands. If timeline slips significantly, escalate.
 - **Llama-arch port introduces subtle behavior changes**: although the same-dtype gate is byte-exact-no-op for uniform models, ~120 LOC of dispatch refactor in a less-touched file is non-trivial. Mitigation: run any existing llama smoke test (we have `smoke_llama_prefill_batch.rs`) before/after to confirm no drift.
 - **AWQ α=0.55 untuned for MQ3**: real risk. Phase 0 measures at default α; if KLD looks borderline, add an α∈{0.4, 0.5, 0.55, 0.6, 0.7} sweep on the winning kmap mode at n=20. Out of scope to do unconditionally.
-- **Tied-embedding default-untied behavior**: a model that omits `tie_word_embeddings` from config but is actually tied corrupts silently with `--lm-head-format mq4 --awq`. Documented limitation; matches CUDA branch's contract. Exhaustive pointer-alias check is future hardening.
+- **Tied-embedding via safetensors-structural alias (residual)**: post-CUDA-`dbcb050`, the config-flag check fails loudly when `tie_word_embeddings` is missing from both top-level + `text_config`. The remaining residual risk is a model whose config explicitly says `tie_word_embeddings: false` but whose safetensors index aliases the lm_head and embed_tokens storage anyway. The safetensors-structural scan (compare `data_offsets` across the manifest) is the architecturally correct fallback; out of scope for both branches now, tracked as future hardening.
 - **No new HIP kernel files**, but ~300 LOC of runtime dispatch wiring needs writing + testing. "No kernel work" is technically correct but misleading (GLM5 §15.4 — addressed by the §"Phase 2 perf impact estimate" + §"Phase 2 sequencing" tables).
 
 ## Out of scope (this PR)
