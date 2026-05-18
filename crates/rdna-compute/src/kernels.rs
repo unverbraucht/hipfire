@@ -472,6 +472,18 @@ pub const GEMV_HFQ4G256_MOE_DOWN_INDEXED_BATCHED_SRC: &str =
 pub const GEMV_HFQ4G256_MOE_DOWN_INDEXED_BATCHED_WAVE64_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_indexed_batched_wave64.hip");
 
+/// gfx906 wave64+dp4a batched indexed MoE gate_up/down GEMVs — issue #207
+/// Gap 1 part 2 of 4. Same 2-rows-per-block + grid.z=N topology as the
+/// wave64 batched references; sdot4 inner loop over Q8_1-quantized
+/// activations. Caller pre-quantizes via `ensure_q8_1_mmq_x`:
+///   gate_up: x is [N × K] → Xq layout [K/128 × N]
+///   down:    rot_batch is [N × K_TOP × K] flattened to (N*K_TOP) rows
+///            → Xq layout [K/128 × (N × K_TOP)]
+pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_WAVE64_DP4A_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed_batched_wave64_dp4a.hip");
+pub const GEMV_HFQ4G256_MOE_DOWN_INDEXED_BATCHED_WAVE64_DP4A_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_indexed_batched_wave64_dp4a.hip");
+
 // Batched HFQ4-G256 GEMM with fused residual add. Processes N batch elements
 // per launch with the same 4-accumulator interleave as the single-row GEMV, so
 // output is bitwise identical to calling gemv_hfq4g256_residual N times. Used
