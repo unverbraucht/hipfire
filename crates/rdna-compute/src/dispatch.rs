@@ -481,6 +481,22 @@ impl DType {
     /// `rotate_quantize_x_mq8`) and does not flow through
     /// `rotate_x_mq_for`, so there is no AWQ-aware kernel to dispatch
     /// to.
+    ///
+    /// **Important — this helper governs per-layer linear projection
+    /// loaders ONLY.** It must NOT be applied to `lm_head` or tied
+    /// `embed_tokens` constructors. Their forward dispatch goes
+    /// through `gemm_*_batched_lmhead` kernels which have no AWQ
+    /// inverse (no `x /= s` divide before the matmul), so attaching
+    /// a sidecar would silently produce `(W·s)·x ≠ W·x` — the
+    /// KLD 0.67 → 13.5 corruption class documented at
+    /// `docs/plans/awq_fix_claude.md`. The quantizer's `awq_eligible`
+    /// whitelist (`hipfire-quantize/src/main.rs:3849`) is the single
+    /// source of truth for which tensors should ever ship sidecars,
+    /// and it excludes lm_head / embed_tokens. The loader sites at
+    /// `qwen35.rs::load_weights` / `load_weights_vl`'s `output`
+    /// construction intentionally do not call this helper — keep
+    /// them consistent with the whitelist until an AWQ-aware
+    /// lm_head dispatch path lands.
     pub fn supports_awq_sidecar(self) -> bool {
         matches!(self, DType::MQ4G256 | DType::MQ3G256)
     }
