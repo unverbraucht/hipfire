@@ -619,13 +619,91 @@ implementation if multiple model sizes need lm_head extension.
 **Total realistic: 5-7 days.** v1 of this plan said "3-5 days"; that
 was contingent on Stage B re-run cost being free, which it isn't.
 
+## 6.5 Implementation status — 2026-05-18 end of day
+
+| Component | State | Commit |
+|---|---|---|
+| `collect_hessian.py` extended for lm_head + vision | ✅ shipped | `2e06a64` |
+| Python `awq_eligible` extended for lm_head | ✅ shipped | `4b0693d` (names.py) |
+| Rust `awq_eligible` extended for lm_head | ✅ shipped | `4b0693d` |
+| `kmap_resolve_mode` env gate (`HIPFIRE_QUANTIZE_LM_HEAD_MQ4_AWQ=1`) | ✅ shipped | `4b0693d` |
+| Precomputed-gptq-path env gate (mirrored) | ✅ shipped | `4b0693d` |
+| `HIPFIRE_LM_HEAD_AWQ_UNSAFE=1` safety gate | ✅ shipped | `4b0693d` |
+| Tied-embed detection + abort | ✅ shipped (hardened) | `4b0693d` + `dbcb050` |
+| Imatrix-coverage gate (`--awq` + `--precomputed-gptq-path` modes) | ✅ shipped | `50077a4` + `53e613f` |
+| Python `is_mq4g256_eligible` honors env for lm_head | ✅ shipped (today) | `53e613f` |
+| 4B MQ3+AWQ+GPTQ validation on gfx1151 | ✅ done | KLD 0.197, PPL 11.65 |
+| 9B MQ4+AWQ+GPTQ+lm_head .hfq production | 🔄 in flight | A100 cloud box, ETA 15:13 UTC |
+| 27B equivalent | ⏳ auto-launches after 9B | ~8-12h wall expected |
+| **Runtime AWQ-aware lm_head dispatch** | **🚧 handed off** to gfx1151 agent (`fix/mq3-awq-loader` lineage) | `/tmp/awq_lm_head_handoff.md` |
+
+### Bugs encountered + fixes (2026-05-18)
+
+Two silent-skip bugs discovered during the 9B cloud-box run that
+caused lm_head to be quietly omitted from AWQ processing despite all
+the upstream wiring being correct. Both were fixed in commit `53e613f`.
+
+**Bug 1**: `scripts/gptq_gpu.py::is_mq4g256_eligible` hardcoded
+`lm_head.weight → False`. This predated the env-var work — was
+originally written to match the OLD Rust `kmap_resolve_mode` that
+force-Q8'd lm_head. The fix: honor `HIPFIRE_QUANTIZE_LM_HEAD_MQ4_AWQ=1`,
+return True when set.
+
+**Bug 2**: `crates/hipfire-quantize/src/main.rs` imatrix-coverage gate
+(added in `50077a4` earlier same day) checked `IMATRIX.get()` for
+`output.weight` — correct for direct `--awq --imatrix` mode, but
+silently failed for `--precomputed-gptq-path` mode where no imatrix
+is loaded at quant time. The fix: also check `PRECOMPUTED_GPTQ` for
+the manifest's `lm_head.*.awq_scale` entry. Pass if either source has
+the data.
+
+**Pattern of both bugs**: the eligibility chain has multiple
+independent gates (Python filter → AWQ whitelist → imatrix lookup →
+Rust dispatch → manifest emission). Adding lm_head meant touching
+ALL of them; missing one resulted in a quant that LOOKED like a
+successful opt-in but silently dropped lm_head from AWQ. The lesson is
+**any future format gate addition must enumerate every step in the
+chain explicitly**, not just the obvious surface area.
+
+### Empirical observations from the 9B run
+
+When lm_head finally fired through the full pipeline:
+
+```
+[ 1/259] cuda:0  K=4096 M=248320  mse=3.46e-06 damp=2.72e-02 clamps=20419 t=177.06s
+         lm_head.weight
+```
+
+Three things worth noting:
+- **`damp=2.72e-02`** vs typical transformer-block tensor damp
+  (5e-5 to 5e-3) — confirms §4.2 risk note that lm_head Hessian is
+  more ill-conditioned. Adaptive damping handled it; risk #1 didn't
+  materialize as a Cholesky failure.
+- **`mse=3.46e-06`** — within the same order of magnitude as
+  transformer-block tensors (1-7 × 1e-6). lm_head doesn't appear to
+  be a quant-error outlier.
+- **`clamps=20419`** out of M=248320 rows × n_blocks_per_row = ~16
+  → ~0.5% of total quant grid endpoints hit. Below the §5.3
+  "10× median" outlier threshold; lm_head looks tame.
+- **`t=177s`** is the dominant single-tensor cost in Stage C (next-
+  worst K=12288 down_proj at ~32s). M-scaling: the Cholesky is K×K
+  (no M dependence) but the OBS propagation writes back M × K values
+  per column step → linear in M. Vocab-M (248320) makes lm_head ~80×
+  slower per tensor than transformer-block K=4096 M=4096.
+
+These observations move risk #1 ("Hessian near-singular") from
+"unknown" to "absorbed by adaptive damping at 9B". 27B will be the
+next data point.
+
 ## 7. Risks
 
 1. **Hessian for lm_head is near-singular** (high-M, low-K relative
-   to vocab). Damping may need to be larger than the 0.01 default.
-   Mitigation: track damp values per-tensor in Stage C; if lm_head
-   needs damp >> 0.1, the Hessian is too ill-conditioned and we
-   should fall to Path B (MQ6 lm_head).
+   to vocab). ~~Damping may need to be larger than the 0.01 default.~~
+   **9B empirical (2026-05-18)**: adaptive damping kicked in to
+   `damp=2.72e-02` (~5-30× transformer-block tensors) but Cholesky
+   succeeded. mse landed at 3.46e-06, in range. **Risk lowered.**
+   Mitigation still applies: track damp per-tensor; if 27B's lm_head
+   needs damp >> 0.1, consider Plan B (MQ6 lm_head).
 
 2. **AWQ M-side asymmetry**: AWQ paper's evidence is on M ≈ hidden,
    not M ≈ vocab. At vocab-M, a few high-magnitude rows (rare tokens?)
