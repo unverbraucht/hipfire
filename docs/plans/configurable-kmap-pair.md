@@ -441,7 +441,24 @@ Our work lands first; their branch merges ours and implements the runtime-side A
 | GPTQ manifest format (`--precomputed-gptq-path`) | unchanged | extended for new formats | canonical |
 
 When their lm_head runtime PR lands:
-1. The `HIPFIRE_LM_HEAD_AWQ_UNSAFE` requirement drops; their PR includes the gate removal.
+1. The `HIPFIRE_LM_HEAD_AWQ_UNSAFE` requirement drops; this happens in a **follow-up PR** after the runtime side merges, not in the runtime PR itself (verified against PR #292's description — the runtime PR explicitly does not touch the gate since the gate doesn't exist on master yet).
 2. The default of `--lm-head-format` can flip from `q8` to `mq4` if their n=512 NLL paired-t shows a strict win (per their `gptq_lm_head_awq.md` §1.2 acceptance).
 
 When their vision Phase 3 runtime PR lands, `--vision-format` ships in the same PR.
+
+### Runtime coordination — concrete PR pointers (2026-05-18)
+
+The CUDA-branch's runtime-side AWQ-aware lm_head work has materialized as a two-PR stack against `master`, independent of `feat/mq-v2-quant-format-cuda`:
+
+| PR | Branch | Role |
+|---|---|---|
+| #290 | `fix/mq3-awq-loader` | Loader: parse + attach `awq_scale` sidecars for MQ3G256, centralize the gate. |
+| #292 | `fix/lm-head-awq-runtime` | Dispatch: wires AWQ-aware rotation into the 8 lm_head sites in `speculative.rs` + DFlash. Stacks on #290. |
+
+Merge order:
+1. **#290 lands first** (or rebases on master after #292 follow-ups).
+2. **#292 lands next** (acceptance-blocked on a `qwen3.5-9b.mq4-awq-gptq-f2-lmhead-a100.hfq` artifact from the CUDA pipeline; PR is in draft).
+3. **Our PR (`feat/configurable-kmap-pair`)** lands — introduces `HIPFIRE_LM_HEAD_AWQ_UNSAFE` for forward compatibility.
+4. **Follow-up PR drops the `HIPFIRE_LM_HEAD_AWQ_UNSAFE` gate** once the loader (#290) + dispatch (#292) are both on master. This PR is small (delete the env-var check in `main.rs`); it can be cut as soon as the merge order above completes.
+
+This sequence is robust to our PR landing before, after, or interleaved with #290/#292 — the gate is opt-in by default, so a `.hfq` produced with the gate set is loadable by old daemons (refuses with a clear error) and by new daemons (works because the runtime now consumes the sidecar). The gate-drop follow-up only flips the default, it doesn't change file format.
