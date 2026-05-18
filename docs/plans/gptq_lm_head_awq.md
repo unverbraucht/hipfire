@@ -296,48 +296,77 @@ Defer until Phases 1+2 ship and Phase 1 validates positively.
 Some models tie `lm_head` to `embed_tokens` (the same physical tensor
 serves both). **Confirmed mid-Qwen-3.5 family variance**:
 
-| Model | Tied? |
-|---|:---:|
-| Qwen3.5-0.8B | unknown — check |
-| Qwen3.5-4B | **YES** (verified via Stage D output — only one `[vocab, hidden]` tensor; total params 4.2B not 4.85B) |
-| Qwen3.5-9B | unknown — check |
-| Qwen3.6-27B | NO (separate tensor, verified via Q8-head quant) |
+| Model | Tied? | How detected |
+|---|:---:|---|
+| Qwen3.5-0.8B | YES | `tie_word_embeddings: true` in config.json |
+| Qwen3.5-4B | **YES** | `tie_word_embeddings: true`; also empirically — only one `[vocab, hidden]` tensor in Stage D output; total params 4.2B not 4.85B |
+| Qwen3.5-9B | NO | `tie_word_embeddings: false` |
+| Qwen3.6-27B | NO | separate `lm_head` tensor in safetensors |
 
 For a tied-embed model, AWQ-pre-scaling `lm_head` would ALSO scale
 the embedding lookup: `embed[token_id]` would return `s · row` instead
 of `row`. This corrupts every transformer-block input.
 
-**Quantizer-side detection** (cheap, deterministic):
+#### Current implementation (config.json based, hardened 2026-05-18)
+
+`main.rs:3941+` checks `tie_word_embeddings` in **either** the top-level
+config or nested `text_config` (multimodal Qwen 3.5/3.6 nest the
+transformer config under `text_config`). The original implementation
+used `unwrap_or(false)` which silently defaulted ABSENT field to
+untied — that's a residual silent-corrupt failure mode for models
+that genuinely are tied but ship without the field set. Reviewer
+flagged this 2026-05-18; current implementation now treats
+**missing field as ambiguous and aborts** with a clear error
+instructing the operator to verify and add the field explicitly.
+
+Verdict per (config state × env state):
+
+| `tie_word_embeddings` | `HIPFIRE_QUANTIZE_LM_HEAD_MQ4_AWQ` | Behavior |
+|---|---|---|
+| `true` | `=1` | abort with "tied embed" error (correct refusal) |
+| `false` | `=1` | proceed (correct — explicitly untied) |
+| absent | `=1` | abort with "missing field" error (NEW: was silent-pass before fix) |
+| anything | unset | proceed — Q8 default route handles tied + untied correctly |
+
+#### Residual risk: structural detection as future-work
+
+The config.json check is necessary but not strictly sufficient — a
+tied model could in principle ship with the wrong field, or HF
+checkpoint conversions could lose the field. The structurally correct
+detection is comparing safetensors index `data_offsets` — if
+`lm_head.weight` and `embed_tokens.weight` map to the same byte range
+in the same shard file, they're tied. If `lm_head.weight` is missing
+from the index entirely, the model is using shared embedding (tied).
 
 ```rust
-// Before applying AWQ to lm_head, check the safetensors index for
-// duplicate tensor entries pointing to the same data range.
-fn is_tied_embedding(safetensors_index: &SafetensorsIndex) -> bool {
-    let lm_head = safetensors_index.find_tensor("lm_head.weight")
-        .or_else(|| safetensors_index.find_tensor("output.weight"));
-    let embed = safetensors_index.find_tensor("embed_tokens.weight")
-        .or_else(|| safetensors_index.find_tensor("model.embed_tokens.weight"));
+// Future-work: safetensors structural check, parallel to config.json
+fn is_tied_embedding_structural(model_dir: &Path) -> Option<bool> {
+    let index = read_safetensors_index(model_dir)?;
+    let lm_head = index.find("lm_head.weight")
+        .or_else(|| index.find("output.weight"));
+    let embed = index.find("embed_tokens.weight")
+        .or_else(|| index.find("model.embed_tokens.weight"));
     match (lm_head, embed) {
-        (Some(lh), Some(emb)) => lh.data_offset == emb.data_offset,
-        (None, Some(_)) => true,   // lm_head missing → must be tied
-        _ => false,
+        (Some(lh), Some(emb)) => Some(
+            lh.shard_file == emb.shard_file
+            && lh.data_offsets == emb.data_offsets
+        ),
+        (None, Some(_)) => Some(true),     // lm_head not a distinct entry → tied
+        _ => None,                          // model has no embeddings? — abort
     }
 }
 ```
 
-If detected, **abort** with a clear error when
-`HIPFIRE_QUANTIZE_LM_HEAD_MQ4_AWQ=1`:
+**Action item if this risk materializes**: extend the startup guard
+to require *both* checks agree, or fall back to structural if config
+is missing. Until then, the hardened config.json check + explicit
+abort-on-missing-field plugs the realistic failure modes for the
+mainline Qwen / Llama / Mistral lineages.
 
-```
-error: model has tied embeddings (lm_head shares storage with embed_tokens).
-       AWQ-pre-scaling lm_head would corrupt the embedding lookup. Refusing
-       to proceed. To force, you'd need to untie first (separate physical
-       tensor) — out of scope for this flag.
-```
-
-Also fall through gracefully when the env is NOT set — the existing Q8
-default already handles tied-embed correctly (embed_tokens is Q8 by
-its own rule, lm_head inherits as the same tensor).
+When the env is NOT set, the existing Q8 default already handles
+tied-embed correctly (embed_tokens is Q8 by its own rule, lm_head
+inherits as the same tensor). The detection only fires when the
+operator explicitly opts in.
 
 ## 4. Math + sharp edges
 

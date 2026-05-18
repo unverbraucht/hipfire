@@ -3941,10 +3941,37 @@ fn main() {
     let lm_head_mq4_awq = std::env::var("HIPFIRE_QUANTIZE_LM_HEAD_MQ4_AWQ")
         .ok().as_deref() == Some("1");
     if lm_head_mq4_awq {
-        let tied_embed = config.get("tie_word_embeddings")
+        // Probe BOTH top-level and `text_config` (multimodal Qwen 3.6/3.5
+        // nests transformer config under text_config). Return Option<bool>
+        // so we can distinguish "field absent" (which is the silent-corrupt
+        // failure mode reviewers flagged 2026-05-18) from "field present
+        // and false".
+        let tied_embed_opt = config.get("tie_word_embeddings")
             .or_else(|| config.get("text_config").and_then(|tc| tc.get("tie_word_embeddings")))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+            .and_then(|v| v.as_bool());
+        let tied_embed = match tied_embed_opt {
+            Some(b) => b,
+            None => {
+                // Field missing entirely. Modern HF models from Qwen / Llama /
+                // Mistral set this explicitly, but community-released or
+                // experimental checkpoints sometimes omit it — and if such a
+                // model IS tied, `unwrap_or(false)` would silently corrupt
+                // the embedding lookup via AWQ pre-scaling. Refuse to guess.
+                // Operator can untie the model and set the field explicitly,
+                // or verify it's untied and set the env to false.
+                eprintln!(
+                    "error: HIPFIRE_QUANTIZE_LM_HEAD_MQ4_AWQ=1 is set but the source \
+                    model's config.json does NOT contain a `tie_word_embeddings` field \
+                    (checked top-level and `text_config`). Cannot safely determine whether \
+                    AWQ-pre-scaling lm_head would corrupt the embedding lookup. Verify the \
+                    model's tying status and either (a) add `tie_word_embeddings: false` to \
+                    config.json if you've confirmed it's untied, or (b) untie the model \
+                    first if it shares storage between lm_head and embed_tokens. See \
+                    docs/plans/gptq_lm_head_awq.md §3.4. Refusing to guess."
+                );
+                std::process::exit(2);
+            }
+        };
         if tied_embed {
             eprintln!(
                 "error: HIPFIRE_QUANTIZE_LM_HEAD_MQ4_AWQ=1 is set but the source model has \
