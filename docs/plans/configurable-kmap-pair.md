@@ -419,23 +419,29 @@ Companion PR; not standalone.
 
 ## Coordination with `feat/mq-v2-quant-format-cuda`
 
-Our work lands first; their branch merges ours and implements the runtime-side AWQ-aware lm_head + vision dispatch. Touch-points:
+**Ownership is explicitly partitioned** (confirmed with CUDA-branch agent 2026-05-18):
+- **We own the CLI surface** (`--kmap-promote`, `--lm-head-format`) — no work in flight from the CUDA side on these flags.
+- **They own the AWQ-aware runtime kernels** (lm_head dispatch — their Phase 2 with gfx1151 investigation underway; vision-tower kernels — their Phase 3).
+
+Our work lands first; their branch merges ours and implements the runtime-side AWQ-aware lm_head + vision dispatch.
 
 | Surface | This PR | CUDA branch (post-merge) | Final state |
 |---|---|---|---|
+| `--kmap-promote <fmt>` CLI | added | inherited | canonical |
 | `--lm-head-format <fmt>` CLI | added | inherited | canonical |
 | `HIPFIRE_QUANTIZE_LM_HEAD_MQ4_AWQ` env var | deprecated-alias-with-warning | removed | gone |
-| Tied-embed refusal check | written fresh | reused | canonical |
+| Tied-embed refusal check (hardened per `dbcb050`) | written fresh | reused | canonical |
 | `awq_eligible` lm_head extension | written fresh | reused | canonical |
-| `HIPFIRE_LM_HEAD_AWQ_UNSAFE` gate | introduced | removed when runtime lands | gone after runtime PR |
+| `HIPFIRE_LM_HEAD_AWQ_UNSAFE` gate | introduced | removed when runtime lands | gone after their lm_head PR |
+| AWQ-aware lm_head runtime kernels | **out of scope** | their Phase 2 (gfx1151 investigation in flight) | canonical |
 | `--vision-format` CLI | **not added** (phased out) | added by them with runtime | canonical |
 | `HIPFIRE_VISION_AWQ_UNSAFE` gate | **not introduced** here | introduced + removed in same PR | n/a from our side |
 | Vision hessian-collector | reuse their suffix list (mirror `gptq_gpu_pkg/names.py` in Rust when we add `--vision-format`) | unchanged | canonical |
+| AWQ-aware vision runtime kernels | **out of scope** | their Phase 3 | canonical |
 | GPTQ manifest format (`--precomputed-gptq-path`) | unchanged | extended for new formats | canonical |
 
-When CUDA's Phase 3 runtime PR lands:
+When their lm_head runtime PR lands:
 1. The `HIPFIRE_LM_HEAD_AWQ_UNSAFE` requirement drops; their PR includes the gate removal.
-2. The default of `--lm-head-format` can flip from `q8` to `mq4` if their n=512 NLL paired-t shows a strict win (per their §1.2 acceptance).
-3. `--vision-format` ships in the same PR.
+2. The default of `--lm-head-format` can flip from `q8` to `mq4` if their n=512 NLL paired-t shows a strict win (per their `gptq_lm_head_awq.md` §1.2 acceptance).
 
-Notify the CUDA-branch owner once Phase 1 is in flight so we don't duplicate gate-naming.
+When their vision Phase 3 runtime PR lands, `--vision-format` ships in the same PR.
