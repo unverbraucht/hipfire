@@ -32,39 +32,56 @@ Three independent gaps in the current quantizer CLI:
 
 The 4B-MQ3+AWQ+GPTQ result demonstrates MQ3-base + AWQ is empirically viable. Cross-family mixed-format dispatch (`HFQ4+HFQ6 ↔ MQ4+MQ6`) was validated by the user post-#257 (works but at high bpw). The mechanism #257 added (`qkv_same_dtype` + `batched_gemm_single_weight`) is the same mechanism this plan extends: adding MQ3 to that helper's match arms is the only runtime change for the primary target.
 
-## Phase 0 — research (mandatory; results gate the recommendation)
+## Phase 0 — research (results gate the recommendation)
 
-Smaller than the previous MQ2-Lloyd-led sweep because MQ3+MQ4 doesn't need kernel work — only runtime dispatch wiring. Tighter Pareto gate.
+**Phase 0 splits into two parts.** Most of the anchor measurements the original plan asked for are **already done** in the `data/kld-measurements` branch (`docs/plans/kld-measurements-master.md`). Phase 0a is the gap-fill + reproducibility smoke that can run immediately; Phase 0b is the MQ3+MQ4 kmap sweep, which is **blocked on Phase 1 CLI** (the sweep produces alternating quants via `--kmap-promote`, which doesn't exist until Phase 1 lands). The original sequencing ("Phase 0 mandatory before Phase 1") was internally contradictory — the CLI is the prerequisite for the sweep.
 
-Deliverables:
-1. **Reproducibility check (anchor)**: re-run `eval_hipfire` at q8 KV n=20 on `qwen3.5-9b.mq4-kmd2-q8conv1d`. Confirms post-#257 baseline (`KLD=0.155438, NLL=2.220, PPL=9.207`) reproduces before sweeping. Drift > 0 here means the gfx1151 environment changed and Phase 0 is unreliable until investigated.
-2. **MQ3-uniform-AWQ at 9B + 27B**: `qwen3.5-{9b,27b}.mq3 --awq`, eval at q8 KV n=20. Sets the floor.
-3. **MQ4-uniform-AWQ at 9B + 27B**: `qwen3.5-{9b,27b}.mq4 --awq`, eval at q8 KV n=20. Sets the ceiling.
-4. **kmap-mode sweep at 27B**: three quants `--format mq3 --kmap-promote mq4 --awq --kmap-dense --kmap-mode {0,1,2}`. Eval at q8 KV n=20. Selection criterion: **lowest mean KLD with `NLL paired-t < -3` vs MQ3-uniform-AWQ** (statistically significant improvement; per master-doc §6 rule 9 paired-t is the primary NLL test). Ties broken by lowest p99 KLD. Record seeds: AWQ calibration uses the calibration set fixed in `main.rs::AWQ_ALPHA` (default α=0.55); no other randomness.
-5. **27B n=512 finale** on the winning mode. The gating number.
+References (KLD master doc):
+- 9B kldref: `/data/hipfire/qwen3.5-9b-bf16.kldref.bin`
+- 27B kldref: `/data/hipfire-refs/qwen3.6-27b-bf16.kldref.bin` (sha256 `8af83b38…`, 2.48 GB, HF mirror at `hipfire-models/qwen-kldref`)
+- 27B model family is **Qwen3.6-27B**, not Qwen3.5-27B (the latter ships only as `tclf90/Qwen3.5-27B-AWQ` pre-quantized; the BF16 source is Qwen3.6 at `/data/cache/huggingface/hub/models--Qwen--Qwen3.6-27B/snapshots/...`).
 
-**Pareto hard gate** for "recommend MQ3+MQ4 as a config":
-- Mean KLD on the winning mode at n=512 ≤ uniform-MQ4-AWQ KLD + 0.05 (within 0.05 of the more-expensive uniform variant), **AND**
-- Bpw saving ≥ 0.4 bpw vs uniform MQ4.
+### Phase 0a — gap-fill + smoke (runs immediately)
 
-Outcomes:
-| n=512 KLD vs uniform MQ4 | Bpw saving | Action |
+| Anchor | Existing measurement (data branch) | Status |
+|---|---|---|
+| 9B kmd2 baseline (kmd2 alone) | §1.1g — KLD 0.1613 @ n=512 gfx1151 kv-q8 | ✅ matches our #257's 0.155438 within drift; re-run as smoke (~5 min) |
+| 9B MQ3-uniform-AWQ-GPTQ (floor) | §1.4 — `mq3-awq-gptq-kvq8-c256` = **0.1967** @ n=256 gfx1151 | ✅ cite, no new work |
+| 9B MQ4-uniform-AWQ-GPTQ (ceiling) | §1.1j — `mq4-awq-gptq-f2-q8head` = **0.1727** @ n=256 gfx1100 | ✅ cite |
+| 27B MQ4-uniform-AWQ-GPTQ (ceiling) | §3.2 — `mq4-awq-gptq-f2-q8head-v100` = **0.1257** @ n=256 gfx1100 | ✅ cite. CUDA pipeline's incoming 27B uniform-MQ4 reproduces this on gfx1151 (per-arch confirmation). |
+| **27B MQ3-uniform-AWQ-GPTQ (floor)** | **not measured anywhere** | ❌ **gap-fill**: CUDA pipeline has this enqueued after MQ4 |
+| Per-arch reproducibility on gfx1151 | most anchors are gfx1100; cohort §1.4 is gfx1151 | partial — eval the incoming 27B quants on gfx1151 |
+
+**Phase 0a deliverables**:
+1. **kmd2 reproducibility smoke**: re-run `eval_hipfire` at q8 KV n=20 on `qwen3.5-9b.mq4-kmd2-q8conv1d`. Confirms post-#257 baseline reproduces on current master. Drift > 0 means the env shifted; investigate before any sweep.
+2. **27B MQ4-uniform-AWQ-GPTQ on gfx1151** (when CUDA pipeline delivers): eval at n=20 first, n=512 second. Confirms §3.2's 0.1257 reproduces on bench arch; the n=512 number becomes the canonical 27B MQ4 ceiling for our gate.
+3. **27B MQ3-uniform-AWQ-GPTQ on gfx1151** (when CUDA pipeline delivers, enqueued after MQ4): eval at n=20. Fills the missing 27B floor anchor.
+
+GPU time: ~5 min (smoke) + ~12 min + ~5 hours (27B MQ4 n=20 + n=512) + ~12 min (27B MQ3 n=20). The dominant cost is the 27B n=512 final — single overnight batch.
+
+### Phase 0b — kmap-mode sweep (blocked on Phase 1 CLI)
+
+When Phase 1 ships `--kmap-promote`:
+4. **Sweep**: three quants `--format mq3 --kmap-promote mq4 --awq --kmap-dense --kmap-mode {0,1,2}`. AWQ at default α=0.55. GPTQ if the CUDA pipeline's `--precomputed-gptq-path` is available. Eval each at q8 KV n=20 on gfx1151.
+5. **Selection criterion**: lowest mean KLD with `NLL paired-t < -3` vs the Phase 0a 27B-MQ3-uniform baseline (statistically significant improvement; per master-doc §6 rule 9 paired-t is the primary NLL test). Ties broken by lowest p99 KLD. AWQ calibration is deterministic against a fixed input set (`AWQ_ALPHA` env var); no random-seed control needed.
+6. **27B n=512 finale** on the winner. The gating number.
+
+GPU time: ~3 hours quantize (3 × 27B at ~30 min) + ~30 min n=20 evals + ~5 hours n=512 finale ≈ ~9 hours.
+
+### Pareto hard gate (applies to Phase 0c finale)
+
+| n=512 KLD on winning mode vs **27B MQ4 ceiling** (`0.1257` or its re-confirmed gfx1151 value) | Bpw saving vs uniform MQ4 | Action |
 |---|---|---|
 | within +0.05 | ≥ 0.4 | **Recommended default config.** Ship CLI; flip docs to MQ3+MQ4-AWQ. |
 | within +0.05 | < 0.4 | Ship CLI; document but don't recommend (uniform MQ4 dominates). |
 | > +0.05 | ≥ 0.4 | Ship CLI as opt-in research config; don't ship as default. |
 | > +0.05 | < 0.4 | Ship CLI as plumbing only; explicitly warn against the pair. |
 
-**Total Phase 0 GPU time on gfx1151**: dominated by quantize + n=512 final, not eval iterations. Honest breakdown:
-- 9B n=20 evals: 3 × ~5 min ≈ 15 min
-- 27B n=20 evals: 3 + 3 = 6 × ~12 min ≈ 72 min
-- 27B quantize: 6 quants × ~30 min ≈ 3 hours
-- 27B n=512 final: ~5 hours (scaled from 9B's 104 min)
-- **~9 hours total**, single overnight batch.
+Output: `docs/perf-checkpoints/<date>-mq3-mq4-awq-kmap-sweep.md` with the per-mode numbers + Pareto-gate decision.
 
-GPTQ track: if `feat/mq-v2-quant-format-cuda`'s GPTQ pipeline is runtime-validated at 27B by Phase 0 time, repeat (2-5) with GPTQ. **Phase 0's gate stays AWQ-only**; GPTQ is a strict improvement layered on top, recorded but not blocking.
+### Parallelism note
 
-Output: `docs/perf-checkpoints/<date>-mq3-mq4-awq-kmap-sweep.md` with the numbers + the Pareto-gate decision.
+Phase 0a (gap-fill) and Phase 1 (CLI) can run in parallel — they touch disjoint surfaces (eval scripts vs `main.rs` CLI). When Phase 1 lands AND Phase 0a delivers the 27B floor, Phase 0b/0c become unblocked.
 
 ## Phase 1 — quantizer CLI (ships standalone)
 
