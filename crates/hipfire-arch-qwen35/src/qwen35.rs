@@ -1423,6 +1423,8 @@ pub fn load_weights(hfq: &mut HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> 
         output.awq_scale = load_awq_scale_for(hfq, gpu, "lm_head.weight", config.dim)
             .or_else(|| load_awq_scale_for(hfq, gpu, "model.language_model.lm_head.weight", config.dim))
             .or_else(|| load_awq_scale_for(hfq, gpu, "model.language_model.embed_tokens.weight", config.dim));
+        eprintln!("  lm_head AWQ sidecar: {}",
+            if output.awq_scale.is_some() { "attached" } else { "absent (no-op)" });
     }
 
     let is_moe = config.num_experts > 0;
@@ -1668,6 +1670,8 @@ fn load_output_into(
         output.awq_scale = load_awq_scale_for(hfq, gpu, "lm_head.weight", config.dim)
             .or_else(|| load_awq_scale_for(hfq, gpu, "model.language_model.lm_head.weight", config.dim))
             .or_else(|| load_awq_scale_for(hfq, gpu, "model.language_model.embed_tokens.weight", config.dim));
+        eprintln!("  lm_head AWQ sidecar: {}",
+            if output.awq_scale.is_some() { "attached" } else { "absent (no-op)" });
     }
     Ok((output_norm, output))
 }
