@@ -34,6 +34,7 @@ from .algo import (
     compute_frozen_block_grids,
     fwht_similarity_per_256_h,
     quantize_mq4_with_grid,
+    refit_block_grids_unweighted,
     symmetrize_in_place,
     weight_mode_actorder,
 )
@@ -73,6 +74,7 @@ def gptq_one_tensor(
     *,
     initial_damp_ratio: float = 0.01,
     max_damp_multiplier: float = 1.0,
+    refit_iters: int = 1,
     name: str = "<unnamed>",
 ) -> PipelineResult:
     """One MQ4G256 tensor through the GPTQ pipeline.
@@ -139,7 +141,13 @@ def gptq_one_tensor(
     # We no longer need it after Cholesky.
     del h_target, h_diag
 
-    # 7. Column-sequential GPTQ.
+    # 7. Column-sequential GPTQ, optionally wrapped in an outer refit loop.
+    #
+    # On `refit_iters > 1`, after each column-sequential pass we re-fit the
+    # per-256-block (scale, min_val) via unweighted LS against `w_orig` (see
+    # `refit_block_grids_unweighted`), then re-run the column-sequential
+    # pass with the new grids. Stepping-stone toward Kaden's Hessian-weighted
+    # `refit_affine_full_h` (winning recipe at KLD 0.1257 on 9B).
     #
     # Two state buffers per Rust:
     #   - `w_residual`: running residual, mutated by OBS propagation,
@@ -147,65 +155,69 @@ def gptq_one_tensor(
     #   - `w_out`: output buffer, gets the quantized-then-dequantized
     #     value for each processed column.
     # We keep both as [M, K] FP64, mutating slices.
-    w_residual = w_rot.clone()
-    w_out = w_rot.clone()  # carries quantized values; un-processed cols
-                            # stay at their FWHT-rotated initial value
-                            # until their step. After the loop, all cols
-                            # are quantized.
-
-    # Frozen-grid lookup tensors: per the flat block-index convention,
-    # `grid_block_idx[row, col] = (row*K + col) // 256` reshapes to
-    # `[M, K]` but is most cheaply computed per column inside the loop.
-    # Pre-compute the `n_blocks_per_row = K/256` constant and use it.
     assert k % 256 == 0, f"K={k} must be divisible by 256 for MQ4G256"
     n_blocks_per_row = k // 256
 
     clamps_below = 0
     clamps_above = 0
+    w_out = w_rot.clone()  # initialized; first pass overwrites every column
 
-    for step in range(k):
-        j_orig = int(perm[step].item())
-        u_ss = u[step, step].item()
-        if u_ss <= 0.0:
-            # Defensive: should not happen post-cholesky_ex success
-            # but mirrors Rust's continue.
-            continue
+    for refit_iter in range(max(1, refit_iters)):
+        if refit_iter > 0:
+            # Update frozen_grids using last-pass quantized output. The new
+            # grid may produce different OBS error propagation, hence the
+            # re-run of the column-sequential loop below.
+            frozen_grids = refit_block_grids_unweighted(w_rot, w_out, frozen_grids)
 
-        # Block index for column j_orig across all M rows is
-        # row * n_blocks_per_row + (j_orig // 256). Pre-compute once.
-        col_block_in_row = j_orig // 256
-        # Per-row block index → vectorize via arange:
-        row_idx = torch.arange(m, device=device)
-        block_idx_col = row_idx * n_blocks_per_row + col_block_in_row
-        block_grid = frozen_grids[block_idx_col]   # [M, 2]
-        scale_col = block_grid[:, 0]               # [M]
-        min_col = block_grid[:, 1]                 # [M]
+        # Reset state for this pass.
+        w_residual = w_rot.clone()
+        w_out = w_rot.clone()
+        clamps_below = 0
+        clamps_above = 0
 
-        # Phase A: quantize column j_orig from residual; compute err.
-        w_col_residual = w_residual[:, j_orig]
-        q = quantize_mq4_with_grid(w_col_residual, scale_col, min_col)
-        # Clamp diagnostic — count pre-clamp grid indices outside [0, 15].
-        safe_scale = torch.where(scale_col != 0, scale_col, torch.ones_like(scale_col))
-        q_raw = torch.floor((w_col_residual - min_col) / safe_scale + 0.5)
-        clamps_below += int((q_raw < 0).sum().item())
-        clamps_above += int((q_raw > 15).sum().item())
+        for step in range(k):
+            j_orig = int(perm[step].item())
+            u_ss = u[step, step].item()
+            if u_ss <= 0.0:
+                # Defensive: should not happen post-cholesky_ex success
+                # but mirrors Rust's continue.
+                continue
 
-        w_out[:, j_orig] = q
-        err_col = (w_col_residual - q) / u_ss     # [M]
+            # Block index for column j_orig across all M rows is
+            # row * n_blocks_per_row + (j_orig // 256). Pre-compute once.
+            col_block_in_row = j_orig // 256
+            # Per-row block index → vectorize via arange:
+            row_idx = torch.arange(m, device=device)
+            block_idx_col = row_idx * n_blocks_per_row + col_block_in_row
+            block_grid = frozen_grids[block_idx_col]   # [M, 2]
+            scale_col = block_grid[:, 0]               # [M]
+            min_col = block_grid[:, 1]                 # [M]
 
-        # Phase B: OBS propagation. Update `w_residual[:, kk_orig]` for
-        # all `next_step` > step. The propagation rows are `perm[step+1:]`
-        # in PROCESSING order; the corresponding U entries are
-        # `u[step, step+1:]` (a [K-step-1] row). Apply:
-        #   w_residual[:, kk_orig] -= err_col[:, None] * u_sn
-        # vectorized over both rows AND remaining columns.
-        if step + 1 < k:
-            next_perm = perm[step + 1:]                # [K - step - 1]
-            u_row = u[step, step + 1:]                  # [K - step - 1]
-            # outer product err_col [M, 1] * u_row [1, K-step-1]
-            update = err_col.unsqueeze(1) * u_row.unsqueeze(0)
-            # scatter-subtract into w_residual at columns `next_perm`
-            w_residual[:, next_perm] -= update
+            # Phase A: quantize column j_orig from residual; compute err.
+            w_col_residual = w_residual[:, j_orig]
+            q = quantize_mq4_with_grid(w_col_residual, scale_col, min_col)
+            # Clamp diagnostic — count pre-clamp grid indices outside [0, 15].
+            safe_scale = torch.where(scale_col != 0, scale_col, torch.ones_like(scale_col))
+            q_raw = torch.floor((w_col_residual - min_col) / safe_scale + 0.5)
+            clamps_below += int((q_raw < 0).sum().item())
+            clamps_above += int((q_raw > 15).sum().item())
+
+            w_out[:, j_orig] = q
+            err_col = (w_col_residual - q) / u_ss     # [M]
+
+            # Phase B: OBS propagation. Update `w_residual[:, kk_orig]` for
+            # all `next_step` > step. The propagation rows are `perm[step+1:]`
+            # in PROCESSING order; the corresponding U entries are
+            # `u[step, step+1:]` (a [K-step-1] row). Apply:
+            #   w_residual[:, kk_orig] -= err_col[:, None] * u_sn
+            # vectorized over both rows AND remaining columns.
+            if step + 1 < k:
+                next_perm = perm[step + 1:]                # [K - step - 1]
+                u_row = u[step, step + 1:]                  # [K - step - 1]
+                # outer product err_col [M, 1] * u_row [1, K-step-1]
+                update = err_col.unsqueeze(1) * u_row.unsqueeze(0)
+                # scatter-subtract into w_residual at columns `next_perm`
+                w_residual[:, next_perm] -= update
 
     # 8. Diagnostics: MSE(post-GPTQ dequantized, original FWHT-rotated W).
     #    Tracks how aggressively GPTQ moved each tensor's quantized

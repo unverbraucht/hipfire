@@ -328,6 +328,7 @@ def quantize_model(
     alpha: float,
     initial_damp_ratio: float,
     max_damp_multiplier: float,
+    refit_iters: int,
     devices: list[str],
     limit: int | None,
     skip_to: int,
@@ -469,6 +470,7 @@ def quantize_model(
                     signs1_per_device[device], signs2_per_device[device],
                     initial_damp_ratio=initial_damp_ratio,
                     max_damp_multiplier=max_damp_multiplier,
+                    refit_iters=refit_iters,
                     name=name,
                 )
                 del h_gpu
@@ -588,6 +590,7 @@ def quantize_model(
                 "n_bits": n_bits,
                 "gptq_initial_damp_ratio": initial_damp_ratio,
                 "gptq_max_damp_multiplier": max_damp_multiplier,
+                "gptq_refit_iters": refit_iters,
                 "devices": devices,
                 "n_tensors_processed_so_far": len(weights_out),
                 "wall_seconds_so_far": time.perf_counter() - t_start,
@@ -628,6 +631,7 @@ def quantize_model(
         "lm_head_format": lm_head_format,
         "gptq_initial_damp_ratio": initial_damp_ratio,
         "gptq_max_damp_multiplier": max_damp_multiplier,
+        "gptq_refit_iters": refit_iters,
         "devices": devices,
         "n_tensors_total": len(weights_out),
         "n_tensors_gptq": sum(1 for s in stats if s.has_hessian and s.error is None),
@@ -666,6 +670,13 @@ def main(argv: list[str] | None = None) -> int:
                   help="initial damp / mean(diag(H)) (Rust default 0.01)")
     p.add_argument("--max-damp-multiplier", type=float, default=1.0,
                   help="damp cap / mean(diag(H)) (Rust default 1.0)")
+    p.add_argument("--gptq-refit-iters", type=int, default=1,
+                  help="Outer iteration count for the column-sequential GPTQ pass. "
+                       "On iter > 1, refit per-256-block (scale, min_val) via "
+                       "unweighted LS against the prior pass's quantized output, "
+                       "then re-run the column-sequential loop with the new grid. "
+                       "Mirrors Kaden's --gptq-refit-iters (winning recipe used 2). "
+                       "Default 1 (single pass).")
     p.add_argument("--output", type=Path, required=True,
                   help="manifest output directory")
     p.add_argument("--devices", nargs="+", default=["cuda:0", "cuda:1"],
@@ -731,6 +742,7 @@ def main(argv: list[str] | None = None) -> int:
         alpha=args.alpha,
         initial_damp_ratio=args.initial_damp_ratio,
         max_damp_multiplier=args.max_damp_multiplier,
+        refit_iters=args.gptq_refit_iters,
         devices=args.devices,
         limit=args.limit,
         skip_to=args.skip_to,

@@ -305,6 +305,60 @@ def compute_frozen_block_grids(weights_flat: torch.Tensor) -> torch.Tensor:
     return torch.stack([scales, min_vals], dim=1)
 
 
+def refit_block_grids_unweighted(
+    w_orig: torch.Tensor,        # [M, K] FP64; FWHT-rotated input weights
+    w_dequant: torch.Tensor,     # [M, K] FP64; dequantized output of a prior GPTQ pass
+    current_grids: torch.Tensor, # [n_blocks, 2] FP64; (scale, min_val) used for w_dequant
+) -> torch.Tensor:
+    """Per-256-block 2-parameter LS refit of (scale, min_val).
+
+    Stepping-stone toward Kaden's `refit_affine_full_h` (winning recipe in
+    `iterative-awq-gptq` branch, KLD 0.1257 on 9B). Their version uses the
+    full Hessian to weight the LS; this version is unweighted. If unweighted
+    refit shows a measurable per-tensor MSE win on a small sample, the
+    Hessian-weighted variant is the natural next step.
+
+    Algorithm: from the previous pass's `w_dequant` and the grid that
+    produced it, recover the integer indices `i_k ∈ {0..15}` per element.
+    Then for each 256-element block, solve
+
+        min_{s, m} Σ_k (w_orig_k − s · i_k − m)^2
+
+    in closed form (2-D LS). Returns the refitted `[n_blocks, 2]` grid.
+
+    Blocks with constant `i_k` (LS denominator = 0) keep the old scale and
+    refit only `min_val`.
+    """
+    n_blocks = current_grids.shape[0]
+    assert w_orig.numel() == n_blocks * 256
+    assert w_dequant.numel() == n_blocks * 256
+
+    w_orig_blocks = w_orig.contiguous().view(n_blocks, 256)
+    w_dq_blocks = w_dequant.contiguous().view(n_blocks, 256)
+
+    scale = current_grids[:, 0].unsqueeze(1)    # [n_blocks, 1]
+    min_val = current_grids[:, 1].unsqueeze(1)
+    safe_scale = torch.where(scale != 0, scale, torch.ones_like(scale))
+
+    # Recover integer indices implied by w_dequant under current_grids.
+    idx = torch.round((w_dq_blocks - min_val) / safe_scale).clamp(0.0, 15.0)
+
+    n = 256.0
+    sum_i = idx.sum(dim=1)
+    sum_w = w_orig_blocks.sum(dim=1)
+    sum_iw = (idx * w_orig_blocks).sum(dim=1)
+    sum_ii = (idx * idx).sum(dim=1)
+
+    denom = sum_ii - sum_i * sum_i / n
+    numer = sum_iw - sum_i * sum_w / n
+    has_signal = denom.abs() > 1e-12
+    safe_denom = torch.where(has_signal, denom, torch.ones_like(denom))
+    new_scale = torch.where(has_signal, numer / safe_denom, current_grids[:, 0])
+    new_min = (sum_w - new_scale * sum_i) / n
+
+    return torch.stack([new_scale, new_min], dim=1)
+
+
 def quantize_mq4_with_grid(
     w: torch.Tensor,
     scale: torch.Tensor,
