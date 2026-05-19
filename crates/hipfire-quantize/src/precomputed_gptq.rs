@@ -185,7 +185,21 @@ pub struct ManifestMeta {
     pub awq_f1_only: bool,
     pub gptq_initial_damp_ratio: f64,
     pub gptq_max_damp_multiplier: f64,
+    /// Quantization bit width (3 or 4). Selects between MQ3G256 and MQ4G256
+    /// for the precomputed-path quant-pack step. Defaults to 4 for legacy
+    /// manifests written before the `--bits` flag landed (2c453fbc).
+    #[serde(default = "default_n_bits")]
+    pub n_bits: u8,
+    /// Optional `--lm-head-format` setting recorded by `gptq_gpu.py` when
+    /// the manifest covers lm_head.weight / output.weight (e.g. "mq4-awq",
+    /// "mq3-awq"). Used only for provenance / runbook traceability — the
+    /// Rust quantizer's own `--lm-head-format` CLI flag is authoritative
+    /// at pack time.
+    #[serde(default)]
+    pub lm_head_format: Option<String>,
 }
+
+fn default_n_bits() -> u8 { 4 }
 
 /// Loaded manifest with all three safetensors files + parsed JSON meta.
 pub struct PrecomputedGptq {

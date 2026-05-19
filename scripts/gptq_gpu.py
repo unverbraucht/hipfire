@@ -72,13 +72,23 @@ from gptq_gpu_pkg.pipeline import gptq_one_tensor  # noqa: E402
 
 # ─── Eligibility ──────────────────────────────────────────────────────────
 
-def is_mq4g256_eligible(name: str, shape: tuple[int, ...]) -> bool:
+def is_mq4g256_eligible(
+    name: str,
+    shape: tuple[int, ...],
+    *,
+    include_lm_head: bool = False,
+) -> bool:
     """Mirror of Rust's MQ4G256 routing for a "Base" tensor (no K-map
     override). True when this tensor would end up packed as MQ4G256 in
     a normal `--format mq4` Rust run.
 
-    Excludes embed/lm_head/norms/conv1d/A_log/dt_bias and any tensor
-    whose last-dim K is not divisible by 256.
+    Excludes embed_tokens/norms/conv1d/A_log/dt_bias/router and any
+    tensor whose last-dim K is not divisible by 256.
+
+    `include_lm_head=True` (gated by caller on `--lm-head-format` +
+    verified untied embeddings) lets lm_head.weight / output.weight
+    through. Default False matches Rust's behaviour when
+    `--lm-head-format` is unset (lm_head force-quantized to Q8).
     """
     if len(shape) != 2:
         return False
@@ -86,8 +96,8 @@ def is_mq4g256_eligible(name: str, shape: tuple[int, ...]) -> bool:
         return False
     if "embed_tokens" in name:
         return False
-    if name.endswith("lm_head.weight"):
-        return False
+    if name.endswith("lm_head.weight") or name.endswith("output.weight"):
+        return include_lm_head
     if "conv1d" in name:
         return False
     if name.endswith("A_log") or name.endswith("dt_bias"):
@@ -326,6 +336,7 @@ def quantize_model(
     resume: bool,
     checkpoint_interval: int,
     watchdog_timeout_sec: int,
+    lm_head_format: str | None,
     verbose: bool,
 ) -> None:
     t_start = time.perf_counter()
@@ -368,13 +379,16 @@ def quantize_model(
         _start_watchdog(watchdog_timeout_sec, last_progress)
 
     # Determine eligibility per tensor; build the processing list.
+    include_lm_head = lm_head_format is not None
     eligible_names: list[str] = []
     for n, shape in sorted(shape_map.items()):
-        if is_mq4g256_eligible(n, shape):
+        if is_mq4g256_eligible(n, shape, include_lm_head=include_lm_head):
             eligible_names.append(n)
     if verbose:
         print(f"[plan] {len(eligible_names)} MQ4G256-eligible tensors "
-              f"(out of {len(shape_map)} total)")
+              f"(out of {len(shape_map)} total)"
+              + (f" — lm_head included via --lm-head-format {lm_head_format}"
+                 if include_lm_head else ""))
 
     if skip_to:
         eligible_names = eligible_names[skip_to:]
@@ -420,7 +434,11 @@ def quantize_model(
             st.has_hessian = has_h
 
             # AWQ
-            this_awq_eligible = awq_eligible(name, f1_only=awq_f1_only)
+            this_awq_eligible = awq_eligible(
+                name,
+                f1_only=awq_f1_only,
+                include_lm_head=include_lm_head,
+            )
             st.awq_eligible = this_awq_eligible
             if this_awq_eligible and imatrix is not None:
                 in_sum2 = imatrix_weights_for(imatrix, name)
@@ -606,6 +624,7 @@ def quantize_model(
         "imatrix_path": str(imatrix_path) if imatrix_path else None,
         "alpha": alpha,
         "awq_f1_only": awq_f1_only,
+        "lm_head_format": lm_head_format,
         "gptq_initial_damp_ratio": initial_damp_ratio,
         "gptq_max_damp_multiplier": max_damp_multiplier,
         "devices": devices,
@@ -681,8 +700,27 @@ def main(argv: list[str] | None = None) -> int:
                        "2026-05-17 on sm_120) cannot be cancelled from within Python; "
                        "external kill via SIGKILL is the only recovery and pairs with "
                        "--resume on the next launch. Set 0 to disable.")
+    p.add_argument("--lm-head-format", default=None,
+                  choices=["mq3-awq", "mq4-awq"],
+                  help="When set, include lm_head.weight / output.weight in the "
+                       "quantized set (GPTQ-packed at --bits and AWQ-pre-scaled). "
+                       "Mirrors Rust's `--lm-head-format` CLI on master. Must agree "
+                       "with --bits (mq4-awq → --bits 4; mq3-awq → --bits 3). The "
+                       "caller is responsible for confirming the model has untied "
+                       "embeddings (config.json: tie_word_embeddings=false) before "
+                       "setting this — corrupts logits on tied-embed models. "
+                       "Default: unset (lm_head stays Q8, matching Rust's default).")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(argv)
+
+    if args.lm_head_format is not None:
+        expected_bits = 4 if args.lm_head_format == "mq4-awq" else 3
+        if args.bits != expected_bits:
+            p.error(
+                f"--lm-head-format {args.lm_head_format} requires --bits {expected_bits} "
+                f"(got --bits {args.bits}). The precomputed-gptq manifest packs all "
+                f"eligible tensors at one bit-width; mixing requires the Rust quantizer."
+            )
 
     quantize_model(
         input_dir=args.input,
@@ -700,6 +738,7 @@ def main(argv: list[str] | None = None) -> int:
         resume=args.resume,
         checkpoint_interval=args.checkpoint_interval,
         watchdog_timeout_sec=args.watchdog_timeout_sec,
+        lm_head_format=args.lm_head_format,
         verbose=args.verbose,
     )
     return 0

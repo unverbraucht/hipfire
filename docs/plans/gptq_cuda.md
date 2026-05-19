@@ -813,12 +813,14 @@ otherwise.
 
 ### 13.3a Imatrix regeneration (mandatory if lm_head AWQ in scope)
 
-If the run targets `--lm-head-format mq4-awq` (per `gptq_lm_head_awq.md`),
-the existing `benchmarks/quality-baselines/refs/<model>-bf16.imatrix.gguf`
-files **lack `output.weight` coverage** — verified 2026-05-18, all four
-local imatrices (0.8B/4B/9B/27B) have zero lm_head entries. The
-quantizer will hard-abort at startup with `HIPFIRE_QUANTIZE_LM_HEAD_MQ4_AWQ=1`
-(see `gptq_lm_head_awq.md` §4.1).
+If the run targets `--lm-head-format mq{3,4}-awq` (per
+`gptq_lm_head_awq.md`), the existing
+`benchmarks/quality-baselines/refs/<model>-bf16.imatrix.gguf` files
+must include `output.weight` coverage. The post-2026-05-19 imatrices
+(committed alongside this doc) already do; older sidecars or any new
+model added later may not. The quantizer hard-aborts at startup when
+`--lm-head-format` selects an AWQ-bearing format but the imatrix lacks
+the output entry — regenerate per the recipe below.
 
 Regenerate by building llama.cpp on the cloud box and invoking the
 hipfire wrapper with `--process-output`:

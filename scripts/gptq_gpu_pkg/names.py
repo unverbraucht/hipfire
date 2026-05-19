@@ -91,7 +91,12 @@ def to_ggml_name(safetensors_name: str) -> str | None:
     return f"blk.{layer_idx}.{translation}.weight"
 
 
-def awq_eligible(safetensors_name: str, *, f1_only: bool = False) -> bool:
+def awq_eligible(
+    safetensors_name: str,
+    *,
+    f1_only: bool = False,
+    include_lm_head: bool = False,
+) -> bool:
     """Mirror of `main.rs::awq_eligible`.
 
     F1 set: input-side projections (q_proj, k_proj, v_proj, qkv_proj,
@@ -103,6 +108,12 @@ def awq_eligible(safetensors_name: str, *, f1_only: bool = False) -> bool:
 
     Pass `f1_only=True` to exclude the F2 additions — for A/B
     comparison parity with `HIPFIRE_AWQ_F1_ONLY=1` Rust runs.
+
+    Pass `include_lm_head=True` (gated by caller on
+    `--lm-head-format mq{3,4}-awq` + verified untied embeddings) to
+    treat lm_head.weight / output.weight as F1-AWQ-eligible. The
+    runtime's `DType::supports_awq_sidecar` allow-list decides whether
+    the runtime kernel will actually consume the sidecar.
     """
     f1_match = any(safetensors_name.endswith(s) for s in (
         # Full-attention input projections (HF + fused variants).
@@ -116,6 +127,11 @@ def awq_eligible(safetensors_name: str, *, f1_only: bool = False) -> bool:
         # MoE router (HF naming) — also `router.weight` for non-HF arches.
         "mlp.gate.weight", "router.weight",
     )) or ".in_proj_" in safetensors_name  # linear-attn input substrings
+    if include_lm_head and (
+        safetensors_name.endswith("lm_head.weight")
+        or safetensors_name.endswith("output.weight")
+    ):
+        f1_match = True
     if f1_only:
         return f1_match
     f2_match = any(safetensors_name.endswith(s) for s in (
