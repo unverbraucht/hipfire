@@ -1,5 +1,19 @@
 # Configurable kmap pair + per-tensor lm_head quant — `--kmap-promote`, `--lm-head-format`
 
+## Status (2026-05-19)
+
+| Component | Status | Where |
+|---|---|---|
+| Phase 1 — CLI surface (`--kmap-mode`, `--kmap-promote`, `--lm-head-format`, `--awq*`, `HIPFIRE_LM_HEAD_AWQ_UNSAFE` gate, deprecated env alias) | **shipped on master** | PR #296 mega integration |
+| Phase 2 — runtime same-dtype gates + Llama-arch port | **shipped on master** | PR #296 |
+| Phase 3a — `cargo test -p hipfire-quantize kmap` unit tests (Promote/Override variants, tied-embed refusal, UNSAFE-gate sequencing, awq_eligible lm_head paths, env-alias deprecation warning) | **outstanding** | local Rust work, ~half day |
+| Phase 3b — poison test `crates/hipfire-runtime/examples/test_mixed_format_dispatch.rs` (FA QKV mixed MQ3+MQ4 + synthetic DN/FFN same-dtype gates) | **outstanding** | local Rust work, ~1 day |
+| Phase 3c — decode-coherence smoke `crates/hipfire-runtime/examples/smoke_mq3_mq4.rs` | **outstanding (blocked on winning quant)** | needs Phase 0b winner first |
+| Phase 0b — 27B kmap sweep (`--kmap-mode {0,1,2}` × `--format mq3 --kmap-promote mq4 --awq`) | **outstanding** | ~9 GPU-hours on A100/V100 cloud box; 27B Hessian + imatrix preserved on the A100 box |
+| Phase 0c — n=512 finale on Phase 0b winner | **outstanding** | ~5 hours GPU |
+| Pareto gate decision | **outstanding** | requires Phase 0c numbers |
+| `docs/perf-checkpoints/<date>-mq3-mq4-awq-kmap-sweep.md` | **outstanding** | depends on Phase 0b/c |
+
 **Branch:** `feat/configurable-kmap-pair`.
 **Primary target:** MQ3+MQ4 alternating dense quant with AWQ. The 4B-MQ3+AWQ+GPTQ result (mean KLD 0.197, p99 9.7, PPL 11.65) survived where uniform sub-4-bit PTQ usually collapses; the hypothesis is that at 9B/27B the same recipe + kmap promotion of a few precision-sensitive tensors to MQ4 produces a meaningfully cheaper Pareto point than uniform MQ4 with comparable quality.
 **Companion configurability:** independent `lm_head` format selection (currently force-Q8 in `kmap_resolve_mode` rule 2).
