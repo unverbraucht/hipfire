@@ -624,6 +624,7 @@ def quantize_model(
         "imatrix_path": str(imatrix_path) if imatrix_path else None,
         "alpha": alpha,
         "awq_f1_only": awq_f1_only,
+        "n_bits": n_bits,
         "lm_head_format": lm_head_format,
         "gptq_initial_damp_ratio": initial_damp_ratio,
         "gptq_max_damp_multiplier": max_damp_multiplier,
