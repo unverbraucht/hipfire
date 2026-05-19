@@ -428,13 +428,14 @@ coherent across all prompts.
 for safety, but the auto-selector is now safe-by-design (falls back
 to dot2 at small N).
 
-### Phase 3 — full MMQ family (qkv + gate_up + residual) ✅ **SHIPPED 2026-05-19**
+### Phase 3 — full MMQ family (qkv + qkvza + gate_up + residual) ✅ **SHIPPED 2026-05-19**
 
-Extended the residual MMQ tile-size family to the two fused
+Extended the residual MMQ tile-size family to all three fused
 preambles. Each new family follows the same body+wrapper pattern:
 
-- `gemm_qkv_hfq3g256_mmq_body.cuh`  + 3 tile wrappers (x8/x16/x32)
-- `gemm_gate_up_hfq3g256_mmq_body.cuh` + 3 tile wrappers
+- `gemm_qkv_hfq3g256_mmq_body.cuh`     + 3 tile wrappers (x8/x16/x32) — FA preamble
+- `gemm_qkvza_hfq3g256_mmq_body.cuh`   + 3 tile wrappers — LA preamble (commit 4f1abbf7)
+- `gemm_gate_up_hfq3g256_mmq_body.cuh` + 3 tile wrappers — FFN preamble
 
 VGPR scaling (HFQ3 qkv): 69/87/115 for x8/x16/x32, 0 spills. Same
 for gate_up (with 1 extra SGPR for the 2-way routing branch).
