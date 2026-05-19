@@ -13,6 +13,7 @@
 | Phase 0c — n=512 finale on Phase 0b winner | **outstanding** | ~5 hours GPU |
 | Pareto gate decision | **outstanding** | requires Phase 0c numbers |
 | `docs/perf-checkpoints/<date>-mq3-mq4-awq-kmap-sweep.md` | **outstanding** | depends on Phase 0b/c |
+| **Phase 0d — 4B small-model proxy on gfx1100** | **next** | local-hardware-feasible, ~2 hours total wall; smoke + α-sensitivity + kmap-mode sweep before committing 27B cloud GPU |
 
 **Branch:** `feat/configurable-kmap-pair`.
 **Primary target:** MQ3+MQ4 alternating dense quant with AWQ. The 4B-MQ3+AWQ+GPTQ result (mean KLD 0.197, p99 9.7, PPL 11.65) survived where uniform sub-4-bit PTQ usually collapses; the hypothesis is that at 9B/27B the same recipe + kmap promotion of a few precision-sensitive tensors to MQ4 produces a meaningfully cheaper Pareto point than uniform MQ4 with comparable quality.
@@ -93,9 +94,93 @@ GPU time: ~3 hours quantize (3 × 27B at ~30 min) + ~30 min n=20 evals + ~5 hour
 
 Output: `docs/perf-checkpoints/<date>-mq3-mq4-awq-kmap-sweep.md` with the per-mode numbers + Pareto-gate decision.
 
+### Phase 0d — 4B small-model proxy on gfx1100 (**runs next**, added 2026-05-19)
+
+Phase 0b/c require ~14 GPU-hours of cloud A100 time (3× 27B quants + n=512 finale) for one Pareto-gate decision. Phase 0d does the same logical sweep on **4B on the local gfx1100 box** at a fraction of that cost (~2h total wall) to:
+
+1. **De-risk the dispatch path before spending cloud GPU.** Confirms `--kmap-mode {0,1,2}` × `--format mq3 --kmap-promote mq4 --awq` produces loadable, coherent .hfq files. If it doesn't, we'd rather catch it at 4B-scale than burn ~5 hours on a 27B Stage C that then fails to assemble.
+2. **Get an α-sensitivity smoke at 4B** to inform Phase 0b/c α-choice on 27B. Kaden's α-sweep (`docs/investigations/2026-05-18-awq-gptq-sub-0.10-kld/results.md`) characterized 9B at α=0.5 minimum, U-shape. We currently use α=0.55 for both 4B/9B/27B uniformly — but the 9B-vs-27B lm_head asymmetry (`docs/investigations/2026-05-19-lm-head-awq-9b-27b-asymmetry/`) flags model-size-dependent α-optimum as the leading hypothesis (H1). A cheap 4B α-bracket (0.4, 0.55, 0.7) at α=0.55-kmap-mode-best shows whether 4B's U-curve matches 9B's, which informs whether to bracket 27B around 0.55 or shift further.
+3. **Generate the Phase 3c smoke-test artifact** (`smoke_mq3_mq4.rs` decode coherence) on the cheapest model — 4B winner.
+
+#### Inputs (on NFS-shared `/data/hipfire-refs/`, accessible from gfx1100):
+
+- `qwen3.5-4b-bf16.hessian.bin` (17.8 GB; multi-pass Hessian collected on gfx1100 via `run_4b_gptq.sh` 2026-05-14)
+- `qwen3.5-4b-bf16.kldref.bin` (2.48 GB)
+- **Imatrix**: NOT yet on disk for 4B with `--process-output` coverage — needs regeneration before any `--lm-head-format mq4-awq` run. Cost ~25 min wall on gfx1100 via `cargo run --release --example imatrix_collect -- --bf16-gguf <4B-BF16.gguf> --process-output --output benchmarks/quality-baselines/refs/qwen3.5-4b-bf16.imatrix.gguf --corpus benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt`. The current `mq3-sweep` artifacts (`~/.hipfire/quantized/mq3-sweep/*.hfq`) were built without lm_head AWQ so they don't need the new imatrix; the 0d sweep below DOES.
+
+#### Recipe — 4B kmap sweep (4 quants):
+
+```bash
+# Stage C (Python GPTQ pipeline) — run from feat/gptq-gpu-pipeline branch
+for MODE in baseline 0 1 2; do
+  if [ "$MODE" = "baseline" ]; then
+    # Uniform MQ3 + AWQ + GPTQ + lm_head MQ4-AWQ — the "no kmap promotion" reference
+    LMHF="mq4-awq"; PROMOTE=""; KMODE=""
+  else
+    # Alternating MQ3 base + MQ4 promote, mode N
+    LMHF="mq4-awq"; PROMOTE="--kmap-promote mq4 --kmap-dense"; KMODE="--kmap-mode $MODE"
+  fi
+  python scripts/gptq_gpu.py \
+      --input <Qwen3.5-4B-HF-snapshot> \
+      --hessian /data/hipfire-refs/qwen3.5-4b-bf16.hessian.bin \
+      --imatrix benchmarks/quality-baselines/refs/qwen3.5-4b-bf16.imatrix.gguf \
+      --alpha 0.55 --bits 3 --lm-head-format mq4-awq \
+      --output /data/hipfire/precomputed-gptq/qwen3.5-4b-mq3-kmap-$MODE \
+      --devices cuda:0 -v   # or hip:0 on gfx1100
+done
+
+# Stage D — Rust quantize-pack, applies kmap-mode rules
+for MODE in baseline 0 1 2; do
+  EXTRA=""; [ "$MODE" != "baseline" ] && EXTRA="--kmap-promote mq4 --kmap-dense --kmap-mode $MODE"
+  HIPFIRE_LM_HEAD_AWQ_UNSAFE=1 \
+    ./target/release/hipfire-quantize \
+      --input <Qwen3.5-4B-HF-snapshot> \
+      --output /data/hipfire/qwen3.5-4b.mq3-kmap-$MODE.hfq \
+      --format mq3 $EXTRA --lm-head-format mq4-awq \
+      --precomputed-gptq-path /data/hipfire/precomputed-gptq/qwen3.5-4b-mq3-kmap-$MODE
+done
+
+# Eval — each .hfq at q8 KV n=20 prefill on gfx1100, recording into a table
+for MODE in baseline 0 1 2; do
+  cargo run --release --example eval_hipfire -- \
+      --model /data/hipfire/qwen3.5-4b.mq3-kmap-$MODE.hfq \
+      --kldref /data/hipfire-refs/qwen3.5-4b-bf16.kldref.bin \
+      --max-chunks 20 --kv-mode asym3 \
+      --output benchmarks/quality-baselines/results/4b-kmap-sweep/$MODE.kldseq
+done
+```
+
+#### Recipe — α-sensitivity smoke (3 quants at best kmap mode):
+
+After the kmap sweep picks a winner (call it mode `W`), re-quantize at `α ∈ {0.40, 0.70}` (we already have `α=0.55` from the kmap sweep) at mode `W`. Three points bracket the U-curve. Eval at q8 KV n=20.
+
+#### Expected wall times on gfx1100 (RX 7900 XTX class):
+
+| Step | Per quant | Total (4 quants + 2 α points) |
+|---|---:|---:|
+| 4B imatrix regen (one-time) | ~25 min | 25 min |
+| Stage C (GPTQ Python) | ~8 min | ~48 min |
+| Stage D (Rust pack) | ~30 s | ~3 min |
+| Eval n=20 | ~5 min | ~30 min |
+| Eval n=512 (winner only) | ~30 min | ~30 min |
+| **Total** | — | **~2h 15m** |
+
+#### Phase 0d acceptance criteria
+
+1. All 4 kmap-mode quants produce coherent decode (greedy 100 tokens, unique-token-ratio > 0.15 — same threshold as `coherence-gate-dflash.sh`).
+2. KLD ranking is statistically separable (CIs non-overlapping between modes, OR paired-t NLL < -2 vs baseline).
+3. α-sensitivity bracket either shows the U-curve minimum at α≈0.55 (consistent with 9B) OR shifted, in which case 27B α-sweep gets a non-default starting point.
+4. A `docs/perf-checkpoints/<date>-4b-kmap-proxy.md` row tracker is committed.
+
+#### Escalation gates
+
+- **4B mode winner shows ≥ 5% mean KLD improvement vs baseline-uniform-MQ3 with CI separation**: proceed to Phase 0b 27B sweep with that mode + α as the seed (skip the wider 27B α-bracket).
+- **4B is statistically a wash across modes**: there's no kmap-mode advantage at 4B-scale. Either (a) the asymmetry between body-size and lm_head-fraction (per the asymmetry investigation) means 4B is too small to surface it, or (b) the alternating recipe doesn't help at our hessian budget. Decide whether to invest in 27B-only Phase 0b or pivot. Either decision is now informed and cheap.
+- **4B α-curve shifted significantly from 9B's α=0.5 optimum**: bracket 27B around the new minimum, not around 0.55.
+
 ### Parallelism note
 
-Phase 0a (gap-fill) and Phase 1 (CLI) can run in parallel — they touch disjoint surfaces (eval scripts vs `main.rs` CLI). When Phase 1 lands AND Phase 0a delivers the 27B floor, Phase 0b/0c become unblocked.
+Phase 0a (gap-fill) and Phase 1 (CLI) can run in parallel — they touch disjoint surfaces (eval scripts vs `main.rs` CLI). When Phase 1 lands AND Phase 0a delivers the 27B floor, Phase 0b/0c become unblocked. Phase 0d runs entirely on gfx1100 with no cloud dependency — it can complete before Phase 0b's A100 sweep even starts.
 
 ## Phase 1 — quantizer CLI (ships standalone)
 
