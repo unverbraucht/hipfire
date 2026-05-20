@@ -275,14 +275,19 @@ def compute_damped_inv_cholesky_upper(
 
 # ─── Frozen per-256-block grids ──────────────────────────────────────────
 
-def compute_frozen_block_grids(weights_flat: torch.Tensor) -> torch.Tensor:
-    """Per-256-element block (scale, min_val) pairs.
+def compute_frozen_block_grids(weights_flat: torch.Tensor, n_bits: int = 4) -> torch.Tensor:
+    """Per-256-element block (scale, min_val) pairs for n-bit quantization.
 
     Input is the row-major flat `M*K`-length FP64 weight buffer (POST-
     FWHT and POST-AWQ-scale, per the pipeline). Output is shape
     `[n_blocks, 2]` where `n_blocks = M*K/256` and `[:, 0] = scale`,
-    `[:, 1] = min_val`. `scale = (max - min) / 15`; `scale = 1.0` when
-    `range == 0` (constant block, all-15 codeword is the dequant=min_val).
+    `[:, 1] = min_val`. `scale = (max - min) / max_idx` where
+    `max_idx = 2^n_bits - 1` (15 for 4-bit, 7 for 3-bit). When `range == 0`
+    (constant block) `scale = 1.0`; the dequant = min_val for every index.
+
+    `n_bits` is per-tensor; mixed-bit Stage C (e.g. MQ3 body + MQ4 lm_head
+    via `--lm-head-format mq4-awq` with `--bits 3`) calls this with
+    different `n_bits` for the lm_head tensor than for body tensors.
 
     Frozen pre-loop: matches `gptq.rs::compute_frozen_block_grids`. The
     layout is per-flat-block, NOT per-row-then-block — so block index
@@ -290,6 +295,8 @@ def compute_frozen_block_grids(weights_flat: torch.Tensor) -> torch.Tensor:
     asserts this exact convention in `block_idx_for`. The grid array
     stays in this (un-permuted) layout through the whole GPTQ loop.
     """
+    assert n_bits in (3, 4), f"unsupported n_bits {n_bits} (only 3 or 4)"
+    max_idx = float((1 << n_bits) - 1)  # 15 for MQ4, 7 for MQ3
     n = weights_flat.shape[0]
     assert n % 256 == 0, f"weight buffer length {n} must be divisible by 256"
     n_blocks = n // 256
@@ -299,7 +306,7 @@ def compute_frozen_block_grids(weights_flat: torch.Tensor) -> torch.Tensor:
     ranges = max_vals - min_vals
     scales = torch.where(
         ranges > 0,
-        ranges / 15.0,
+        ranges / max_idx,
         torch.ones_like(ranges),
     )
     return torch.stack([scales, min_vals], dim=1)
@@ -309,6 +316,7 @@ def refit_block_grids_unweighted(
     w_orig: torch.Tensor,        # [M, K] FP64; FWHT-rotated input weights
     w_dequant: torch.Tensor,     # [M, K] FP64; dequantized output of a prior GPTQ pass
     current_grids: torch.Tensor, # [n_blocks, 2] FP64; (scale, min_val) used for w_dequant
+    n_bits: int = 4,             # 4 for MQ4G256, 3 for MQ3G256
 ) -> torch.Tensor:
     """Per-256-block 2-parameter LS refit of (scale, min_val).
 
@@ -329,6 +337,8 @@ def refit_block_grids_unweighted(
     Blocks with constant `i_k` (LS denominator = 0) keep the old scale and
     refit only `min_val`.
     """
+    assert n_bits in (3, 4), f"unsupported n_bits {n_bits}"
+    max_idx = float((1 << n_bits) - 1)  # 15 for MQ4, 7 for MQ3
     n_blocks = current_grids.shape[0]
     assert w_orig.numel() == n_blocks * 256
     assert w_dequant.numel() == n_blocks * 256
@@ -341,7 +351,7 @@ def refit_block_grids_unweighted(
     safe_scale = torch.where(scale != 0, scale, torch.ones_like(scale))
 
     # Recover integer indices implied by w_dequant under current_grids.
-    idx = torch.round((w_dq_blocks - min_val) / safe_scale).clamp(0.0, 15.0)
+    idx = torch.round((w_dq_blocks - min_val) / safe_scale).clamp(0.0, max_idx)
 
     n = 256.0
     sum_i = idx.sum(dim=1)
@@ -359,21 +369,33 @@ def refit_block_grids_unweighted(
     return torch.stack([new_scale, new_min], dim=1)
 
 
+def quantize_with_grid(
+    w: torch.Tensor,
+    scale: torch.Tensor,
+    min_val: torch.Tensor,
+    n_bits: int = 4,
+) -> torch.Tensor:
+    """Per-element n-bit quantize+dequant using a frozen grid.
+
+    `q = clamp(round((w - min) / scale), 0, 2^n_bits - 1)`,
+    `dequant = q * scale + min`. Element-wise; `w`, `scale`, `min_val`
+    broadcast against each other. Matches `gptq.rs::quantize_mq4_element`
+    (4-bit) / `quantize_mq3_element` (3-bit) + Rust's `+ 0.5).floor()`
+    round-half-up convention.
+    """
+    max_idx = float((1 << n_bits) - 1)
+    safe_scale = torch.where(scale != 0, scale, torch.ones_like(scale))
+    q = torch.floor((w - min_val) / safe_scale + 0.5).clamp(0.0, max_idx)
+    return torch.where(scale != 0, q * scale + min_val, min_val)
+
+
 def quantize_mq4_with_grid(
     w: torch.Tensor,
     scale: torch.Tensor,
     min_val: torch.Tensor,
 ) -> torch.Tensor:
-    """Per-element MQ4 quantize+dequant using a frozen grid.
-
-    `q = clamp(round((w - min) / scale), 0, 15)`,
-    `dequant = q * scale + min`. Element-wise; `w`, `scale`, `min_val`
-    broadcast against each other. Matches `gptq.rs::quantize_mq4_element`
-    + Rust's `+ 0.5).floor()` round-half-up convention.
-    """
-    safe_scale = torch.where(scale != 0, scale, torch.ones_like(scale))
-    q = torch.floor((w - min_val) / safe_scale + 0.5).clamp(0.0, 15.0)
-    return torch.where(scale != 0, q * scale + min_val, min_val)
+    """Backward-compat alias for n_bits=4."""
+    return quantize_with_grid(w, scale, min_val, n_bits=4)
 
 
 # ─── WEIGHT-mode actorder ─────────────────────────────────────────────────

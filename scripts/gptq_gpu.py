@@ -162,6 +162,7 @@ class TensorStats:
     eligible: bool
     has_hessian: bool
     awq_eligible: bool
+    n_bits: int = 4
     effective_damp: float | None = None
     mse_vs_original: float | None = None
     clamps_below: int = 0
@@ -190,6 +191,112 @@ def write_manifest(
     save_file(frozen_grids, str(output_dir / "frozen_grids.safetensors"))
     with open(output_dir / "manifest.json", "w") as f:
         json.dump(metadata, f, indent=2, sort_keys=True, default=str)
+
+
+# ─── Streaming safetensors writer (low-RAM final-manifest path) ─────────────
+#
+# `safetensors.torch.save_file` accumulates all tensors into a single Python
+# dict, then serializes the whole thing at once — peak RAM is ~2× the file
+# size (dict + serialization buffer). On a 31 GB box, the 9B-class final
+# manifest (~11 GB weights + ~1 GB passthrough embeds/norms) OOMs at the
+# `save_file` call. This streaming writer computes the header from
+# shapes/dtypes alone, then writes tensor bytes one at a time, popping
+# in-memory tensors from the dict as we go and loading passthrough tensors
+# lazily from the source safetensors. Peak RAM during write ≈ one tensor.
+
+_TORCH_TO_ST_DTYPE = {
+    torch.float64: "F64",
+    torch.float32: "F32",
+    torch.float16: "F16",
+    torch.bfloat16: "BF16",
+    torch.int8:    "I8",
+    torch.uint8:   "U8",
+    torch.int16:   "I16",
+    torch.int32:   "I32",
+    torch.int64:   "I64",
+    torch.bool:    "BOOL",
+}
+_ST_DTYPE_BYTES = {
+    "F64": 8, "F32": 4, "F16": 2, "BF16": 2,
+    "I8": 1, "U8": 1, "I16": 2, "I32": 4, "I64": 8, "BOOL": 1,
+}
+
+
+def stream_save_weights(
+    output_path: Path,
+    *,
+    names_in_order: list[str],
+    weights_out: dict[str, torch.Tensor],
+    file_map: dict[str, Path],
+) -> None:
+    """Stream-write a safetensors file containing weights from two sources:
+      (a) `weights_out[name]` — in-memory GPTQ'd tensors (BF16, CPU)
+      (b) passthrough — lazy-loaded from `file_map[name]` via `load_tensor`
+
+    Peak RAM is bounded by one tensor at a time, plus whatever `weights_out`
+    still holds. We pop entries from `weights_out` as written so the dict
+    shrinks during the write — by the end `weights_out` is empty.
+    """
+    import struct
+
+    # Phase 1 — collect (name, dtype_str, shape, source) for every tensor.
+    # For passthroughs, peek the source safetensors header to read dtype/shape
+    # without loading the tensor body.
+    specs: list[tuple[str, str, tuple[int, ...], str]] = []
+    seen_files: dict[Path, "safe_open"] = {}
+    try:
+        for name in names_in_order:
+            if name in weights_out:
+                t = weights_out[name]
+                specs.append((name, _TORCH_TO_ST_DTYPE[t.dtype], tuple(t.shape), "mem"))
+            else:
+                fp = file_map[name]
+                if fp not in seen_files:
+                    seen_files[fp] = safe_open(fp, framework="pt").__enter__()
+                sl = seen_files[fp].get_slice(name)
+                specs.append((name, sl.get_dtype(), tuple(sl.get_shape()), "file"))
+    finally:
+        for fp, st in seen_files.items():
+            try:
+                st.__exit__(None, None, None)
+            except Exception:
+                pass
+
+    # Phase 2 — compute byte offsets and header JSON.
+    header: dict = {}
+    offset = 0
+    for name, dtype_str, shape, _ in specs:
+        n = _ST_DTYPE_BYTES[dtype_str]
+        for d in shape:
+            n *= d
+        header[name] = {
+            "dtype": dtype_str,
+            "shape": list(shape),
+            "data_offsets": [offset, offset + n],
+        }
+        offset += n
+    header_json = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    # Pad header to 8-byte alignment (safetensors recommends; some readers require).
+    pad = (8 - (len(header_json) % 8)) % 8
+    header_json += b" " * pad
+
+    # Phase 3 — stream write.
+    with open(output_path, "wb") as out:
+        out.write(struct.pack("<Q", len(header_json)))
+        out.write(header_json)
+        for name, dtype_str, _, source in specs:
+            if source == "mem":
+                t = weights_out.pop(name)  # remove from dict to free
+            else:
+                t = load_tensor(file_map[name], name)
+            t = t.contiguous()
+            # BF16 has no native numpy dtype; view as uint16 to extract bytes.
+            if t.dtype == torch.bfloat16:
+                buf = t.view(torch.uint16).numpy().tobytes()
+            else:
+                buf = t.numpy().tobytes()
+            out.write(buf)
+            del t, buf
 
 
 # ─── Source-file md5 for manifest provenance ──────────────────────────────
@@ -302,16 +409,30 @@ def _checkpoint_partial(
     output_dir.mkdir(parents=True, exist_ok=True)
     metadata = {**metadata, "partial": True}
 
-    plans = [
-        ("weights.safetensors", weights_bf16),
+    # weights.safetensors: stream-write to avoid the OOM that save_file hits
+    # when `weights_bf16` exceeds ~7 GB (which it does for 9B+ models past
+    # ~200 GPTQ'd tensors). NOTE: pops entries from weights_bf16 as it
+    # writes, so we make a shallow copy keyed by name to preserve the caller's
+    # dict for continued processing.
+    weights_for_write = dict(weights_bf16)
+    tmp_w = output_dir / "weights.safetensors.tmp"
+    stream_save_weights(
+        tmp_w,
+        names_in_order=sorted(weights_for_write.keys()),
+        weights_out=weights_for_write,
+        file_map={},  # no passthroughs at checkpoint time
+    )
+    os.replace(tmp_w, output_dir / "weights.safetensors")
+
+    # awq_scales and frozen_grids are small (≪ 1 GB); save_file is fine.
+    for fname, payload in [
         ("awq_scales.safetensors", awq_scales),
         ("frozen_grids.safetensors", frozen_grids),
-    ]
-    for fname, payload in plans:
+    ]:
         tmp = output_dir / (fname + ".tmp")
-        final = output_dir / fname
         save_file(payload, str(tmp))
-        os.replace(tmp, final)
+        os.replace(tmp, output_dir / fname)
+
     # manifest.json — atomic via .tmp + rename too
     tmp_json = output_dir / "manifest.json.tmp"
     with open(tmp_json, "w") as f:
@@ -419,6 +540,20 @@ def quantize_model(
         st = TensorStats(name=name, shape=shape, eligible=True,
                         has_hessian=False, awq_eligible=False, device=device)
 
+        # Per-tensor n_bits selection. Mixed-bits Stage C: when the operator
+        # requests `--bits 3 --lm-head-format mq4-awq`, the body packs at MQ3
+        # but lm_head/output packs at MQ4 (with AWQ pre-scale). Rust Stage D
+        # dispatches via --format mq3 + --lm-head-format mq4-awq, matching
+        # the per-tensor format we encode in the frozen_grids here.
+        is_lm_head = name.endswith("lm_head.weight") or name.endswith("output.weight")
+        if is_lm_head and lm_head_format == "mq4-awq":
+            this_bits = 4
+        elif is_lm_head and lm_head_format == "mq3-awq":
+            this_bits = 3
+        else:
+            this_bits = n_bits
+        st.n_bits = this_bits
+
         try:
             w_cpu = load_tensor(file_map[name], name)  # BF16, [M, K]
             assert w_cpu.dtype == torch.bfloat16, f"{name} expected BF16, got {w_cpu.dtype}"
@@ -471,6 +606,7 @@ def quantize_model(
                     initial_damp_ratio=initial_damp_ratio,
                     max_damp_multiplier=max_damp_multiplier,
                     refit_iters=refit_iters,
+                    n_bits=this_bits,
                     name=name,
                 )
                 del h_gpu
@@ -493,7 +629,7 @@ def quantize_model(
                 from gptq_gpu_pkg.algo import (
                     apply_fwht_per_256_to_weights,
                     compute_frozen_block_grids,
-                    quantize_mq4_with_grid,
+                    quantize_with_grid,
                 )
                 w_rot = w_gpu.to(torch.float64).contiguous()
                 apply_fwht_per_256_to_weights(
@@ -501,7 +637,7 @@ def quantize_model(
                     signs1_per_device[device],
                     signs2_per_device[device],
                 )
-                grids = compute_frozen_block_grids(w_rot.view(-1))
+                grids = compute_frozen_block_grids(w_rot.view(-1), n_bits=this_bits)
                 # Per-element RTN dequant — produces a w_out that is
                 # already on the grid, exactly what GPTQ's column loop
                 # would do without OBS propagation.
@@ -511,7 +647,7 @@ def quantize_model(
                 bidx = row_idx * n_blocks_per_row + col_idx // 256
                 scales = grids[bidx, 0]
                 mins = grids[bidx, 1]
-                w_out_f64 = quantize_mq4_with_grid(w_rot, scales, mins)
+                w_out_f64 = quantize_with_grid(w_rot, scales, mins, n_bits=this_bits)
                 st.mse_vs_original = ((w_out_f64 - w_rot) ** 2).mean().item()
                 weights_out[name] = w_out_f64.to(torch.bfloat16).cpu()
                 frozen_grids_out[f"{name}.grids"] = grids.to(torch.float16).cpu()
@@ -549,7 +685,7 @@ def quantize_model(
             signs1_cpu = gen_fwht_signs(42, 256)
             signs2_cpu = gen_fwht_signs(1042, 256)
             apply_fwht_per_256_to_weights(w_rot, signs1_cpu, signs2_cpu)
-            grids = compute_frozen_block_grids(w_rot.view(-1))
+            grids = compute_frozen_block_grids(w_rot.view(-1), n_bits=this_bits)
             weights_out[name] = w_rot.to(torch.bfloat16)
             frozen_grids_out[f"{name}.grids"] = grids.to(torch.float16)
 
@@ -611,15 +747,31 @@ def quantize_model(
             # can take 10-20s on /data NFS, shouldn't count as a stall.
             last_progress["ts"] = time.time()
 
-    # ── Passthrough non-eligible tensors (embed, lm_head, norms, …) ──
+    # ── Stream-write weights.safetensors ─────────────────────────────────
+    # `stream_save_weights` writes GPTQ'd tensors (in `weights_out`) and
+    # passthrough non-eligible tensors (norms, embeds, etc.) into a single
+    # safetensors file without ever materialising them all in a single
+    # in-memory dict. Pops entries from `weights_out` as it goes so peak
+    # RAM during save ≈ one tensor. Replaces the prior write_manifest path
+    # that OOM'd on 9B-class models on 31 GB boxes.
     if verbose:
-        print(f"[passthrough] copying {len(shape_map) - len(eligible_names)} non-eligible tensors")
-    for n in sorted(shape_map):
-        if n in weights_out:
-            continue
-        weights_out[n] = load_tensor(file_map[n], n)
+        n_passthrough = len(shape_map) - len(eligible_names)
+        print(f"[stream-save] writing weights.safetensors "
+              f"({len(eligible_names)} GPTQ + {n_passthrough} passthrough)")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stream_save_weights(
+        output_dir / "weights.safetensors",
+        names_in_order=sorted(shape_map),
+        weights_out=weights_out,
+        file_map=file_map,
+    )
+    # weights_out is now empty; the GPTQ'd tensors have been written + freed.
 
-    # ── Manifest ──
+    # awq_scales and frozen_grids are small (≪ 1 GB each); regular save_file.
+    save_file(awq_scales_out, str(output_dir / "awq_scales.safetensors"))
+    save_file(frozen_grids_out, str(output_dir / "frozen_grids.safetensors"))
+
+    # ── Manifest JSON ────────────────────────────────────────────────────
     manifest = {
         "schema_version": 1,
         "source_model_dir": str(input_dir),
@@ -633,21 +785,15 @@ def quantize_model(
         "gptq_max_damp_multiplier": max_damp_multiplier,
         "gptq_refit_iters": refit_iters,
         "devices": devices,
-        "n_tensors_total": len(weights_out),
+        "n_tensors_total": len(shape_map),
         "n_tensors_gptq": sum(1 for s in stats if s.has_hessian and s.error is None),
         "n_tensors_rtn_fallback": sum(1 for s in stats if not s.has_hessian or s.error is not None),
         "n_tensors_awq": len(awq_scales_out),
         "wall_seconds": time.perf_counter() - t_start,
         "tensors": [s.__dict__ for s in stats],
     }
-
-    write_manifest(
-        output_dir,
-        weights_bf16=weights_out,
-        awq_scales=awq_scales_out,
-        frozen_grids=frozen_grids_out,
-        metadata=manifest,
-    )
+    with open(output_dir / "manifest.json", "w") as f:
+        json.dump(manifest, f, indent=2, sort_keys=True, default=str)
     if verbose:
         print(f"[done] manifest written to {output_dir}")
         print(f"[done] total wall: {manifest['wall_seconds']:.1f}s "
@@ -725,14 +871,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(argv)
 
-    if args.lm_head_format is not None:
-        expected_bits = 4 if args.lm_head_format == "mq4-awq" else 3
-        if args.bits != expected_bits:
-            p.error(
-                f"--lm-head-format {args.lm_head_format} requires --bits {expected_bits} "
-                f"(got --bits {args.bits}). The precomputed-gptq manifest packs all "
-                f"eligible tensors at one bit-width; mixing requires the Rust quantizer."
-            )
+    # Mixed-bits Stage C is now supported: when --lm-head-format != --bits's
+    # implied format, lm_head/output is processed at the lm_head_format's
+    # bit width while body tensors use --bits. Per-tensor n_bits flows through
+    # compute_frozen_block_grids + quantize_with_grid + refit_block_grids
+    # via the `this_bits` variable in quantize_model's per-tensor loop. The
+    # downstream Rust Stage D dispatches matchingly via --format mq3 +
+    # --lm-head-format mq4-awq.
 
     quantize_model(
         input_dir=args.input,

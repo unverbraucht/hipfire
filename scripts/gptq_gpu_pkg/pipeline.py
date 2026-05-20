@@ -33,7 +33,7 @@ from .algo import (
     compute_damped_inv_cholesky_upper,
     compute_frozen_block_grids,
     fwht_similarity_per_256_h,
-    quantize_mq4_with_grid,
+    quantize_with_grid,
     refit_block_grids_unweighted,
     symmetrize_in_place,
     weight_mode_actorder,
@@ -75,6 +75,7 @@ def gptq_one_tensor(
     initial_damp_ratio: float = 0.01,
     max_damp_multiplier: float = 1.0,
     refit_iters: int = 1,
+    n_bits: int = 4,
     name: str = "<unnamed>",
 ) -> PipelineResult:
     """One MQ4G256 tensor through the GPTQ pipeline.
@@ -124,8 +125,13 @@ def gptq_one_tensor(
 
     # 5. Frozen per-256-block grids — computed from POST-rotated W, frozen
     #    through the loop. Row-major flat block index: `(row*K + col)/256`.
+    # `n_bits` selects the quantization codebook size (15 for MQ4, 7 for MQ3);
+    # mixed-bits Stage C calls this with n_bits=4 for lm_head and n_bits=3
+    # for MQ3 body tensors.
+    assert n_bits in (3, 4), f"unsupported n_bits {n_bits}"
+    max_idx_f = float((1 << n_bits) - 1)
     w_flat = w_rot.view(-1)
-    frozen_grids = compute_frozen_block_grids(w_flat)
+    frozen_grids = compute_frozen_block_grids(w_flat, n_bits=n_bits)
 
     # 6. WEIGHT-mode actorder + Cholesky-direct upper factor of H_inv
     h_diag = h_target.diagonal()
@@ -167,7 +173,9 @@ def gptq_one_tensor(
             # Update frozen_grids using last-pass quantized output. The new
             # grid may produce different OBS error propagation, hence the
             # re-run of the column-sequential loop below.
-            frozen_grids = refit_block_grids_unweighted(w_rot, w_out, frozen_grids)
+            frozen_grids = refit_block_grids_unweighted(
+                w_rot, w_out, frozen_grids, n_bits=n_bits,
+            )
 
         # Reset state for this pass.
         w_residual = w_rot.clone()
@@ -195,12 +203,12 @@ def gptq_one_tensor(
 
             # Phase A: quantize column j_orig from residual; compute err.
             w_col_residual = w_residual[:, j_orig]
-            q = quantize_mq4_with_grid(w_col_residual, scale_col, min_col)
-            # Clamp diagnostic — count pre-clamp grid indices outside [0, 15].
+            q = quantize_with_grid(w_col_residual, scale_col, min_col, n_bits=n_bits)
+            # Clamp diagnostic — count pre-clamp grid indices outside [0, max_idx].
             safe_scale = torch.where(scale_col != 0, scale_col, torch.ones_like(scale_col))
             q_raw = torch.floor((w_col_residual - min_col) / safe_scale + 0.5)
             clamps_below += int((q_raw < 0).sum().item())
-            clamps_above += int((q_raw > 15).sum().item())
+            clamps_above += int((q_raw > max_idx_f).sum().item())
 
             w_out[:, j_orig] = q
             err_col = (w_col_residual - q) / u_ss     # [M]
