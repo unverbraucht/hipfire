@@ -4809,14 +4809,32 @@ fn main() {
                     // manifest. See `docs/plans/gptq_cuda.md` §1.2.
                     if let Some(m) = PRECOMPUTED_GPTQ.get() {
                         if let Some(grids) = m.frozen_grids(name) {
-                            // Promote weights to FP64 for `pack_mq4g256_from_rotated_f64`
-                            // (the Rust packer expects FP64; the manifest is
-                            // BF16, which we upcast lossily via to_f32 above —
-                            // BF16 ulp at typical post-rotated magnitudes is
-                            // ~3e-4, well below scale/2 ~ 8e-3, so re-quant
-                            // doesn't shift the int4 code).
+                            // Promote weights to FP64 for the rotated-pack
+                            // packer (FP64 expected; the manifest is BF16,
+                            // upcast lossily via to_f32 above — BF16 ulp at
+                            // typical post-rotated magnitudes is ~3e-4, well
+                            // below scale/2 ~ 8e-3, so re-quant doesn't shift
+                            // the integer code).
                             let weights_f64: Vec<f64> = f32_data.iter().map(|&v| v as f64).collect();
-                            let q = gptq::pack_mq4g256_from_rotated_f64(&weights_f64, &grids);
+                            // Mixed-bits dispatch: read the per-tensor n_bits
+                            // from the manifest (falls back to top-level
+                            // m.meta.n_bits when the tensor entry is absent).
+                            // 3 → MQ3G256, anything else → MQ4G256. This is
+                            // what lets a Stage C run with
+                            // `--bits 3 --lm-head-format mq4-awq` produce a
+                            // Stage D `.hfq` that's 3-bit body + 4-bit
+                            // lm_head, instead of silently coercing the body
+                            // to 4-bit storage (the original bug — body codes
+                            // lived in [0..7] but were stored in 4-bit slots,
+                            // wasting ~2.85 GB on a 27B build).
+                            let tensor_bits = m.n_bits_for(name);
+                            let (q, qt, label) = if tensor_bits == 3 {
+                                (gptq::pack_mq3g256_from_rotated_f64(&weights_f64, &grids),
+                                 QuantType::MQ3G256, "MQ3G256")
+                            } else {
+                                (gptq::pack_mq4g256_from_rotated_f64(&weights_f64, &grids),
+                                 QuantType::MQ4G256, "MQ4G256")
+                            };
                             // AWQ sidecar — F16 bytes go straight through.
                             // The runtime emit-sidecar block looks for
                             // `awq_sidecar_scales` as Vec<f32>; convert from
@@ -4833,7 +4851,7 @@ fn main() {
                                     awq_sidecar_scales = Some(scales_f32);
                                 }
                             }
-                            (q, QuantType::MQ4G256, 256u32, "MQ4G256")
+                            (q, qt, 256u32, label)
                         } else {
                             // Manifest doesn't have grids for this tensor —
                             // would be a manifest gap. Fail loud so the

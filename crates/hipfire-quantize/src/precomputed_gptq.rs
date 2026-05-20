@@ -170,6 +170,22 @@ impl StFile {
     }
 }
 
+/// Per-tensor entry inside the manifest's `tensors` list. The Python
+/// orchestrator records many fields per tensor (mse, clamps, wall_s,
+/// etc.); we only deserialize `name` and `n_bits` here — used to
+/// dispatch the right packer in mixed-bits Stage D (e.g. MQ3 body +
+/// MQ4 lm_head). All other fields are ignored via serde's default
+/// "ignore unknown" behavior.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TensorMeta {
+    pub name: String,
+    /// Bit width recorded by gptq_gpu.py for THIS tensor. May differ
+    /// from the manifest's top-level `n_bits` when mixed-bits Stage C
+    /// was used (e.g. n_bits=3 body + lm_head_format=mq4-awq).
+    #[serde(default)]
+    pub n_bits: Option<u8>,
+}
+
 /// Minimal manifest.json schema — schema_version + the tuning knobs we
 /// echo into the `.hfq` provenance. We do not deserialize the per-tensor
 /// stats array (it can be hundreds of records) — kept as opaque JSON if
@@ -197,6 +213,13 @@ pub struct ManifestMeta {
     /// at pack time.
     #[serde(default)]
     pub lm_head_format: Option<String>,
+    /// Per-tensor entries. Each carries an optional `n_bits` override —
+    /// when present, the Stage D packer dispatches MQ3 vs MQ4 per-tensor
+    /// instead of using the global `n_bits`. Allows mixed-bits Stage C
+    /// (e.g. 3-bit body + 4-bit lm_head) to round-trip to Stage D
+    /// without forcing a single global bit width.
+    #[serde(default)]
+    pub tensors: Vec<TensorMeta>,
 }
 
 fn default_n_bits() -> u8 { 4 }
@@ -276,6 +299,23 @@ impl PrecomputedGptq {
             }
         }
         if missing.is_empty() { Ok(()) } else { Err(missing) }
+    }
+
+    /// Returns the per-tensor `n_bits` from the manifest's `tensors`
+    /// list (3 or 4), falling back to the top-level `meta.n_bits` if
+    /// the tensor isn't found (e.g. legacy manifests without per-tensor
+    /// records). The Stage D packer uses this to dispatch MQ3 vs MQ4
+    /// per-tensor for mixed-bits builds.
+    pub fn n_bits_for(&self, name: &str) -> u8 {
+        for t in &self.meta.tensors {
+            if t.name == name {
+                if let Some(n) = t.n_bits {
+                    return n;
+                }
+                break;
+            }
+        }
+        self.meta.n_bits
     }
 
     /// Returns the BF16 bytes for a tensor name, or None if the
