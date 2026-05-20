@@ -96,6 +96,12 @@ def is_mq4g256_eligible(
         return False
     if "embed_tokens" in name:
         return False
+    # Vision tower stays F16 — hipfire-arch-qwen35-vl currently dispatches
+    # `gpu.gemm_f16(...)` only; an MQ-packed visual.* tensor would produce
+    # an unloadable .hfq at runtime (configurable-kmap-pair.md §1c).
+    # Drops out via the stream_save_weights passthrough path (F16 from source).
+    if ".visual." in name or name.startswith("visual."):
+        return False
     if name.endswith("lm_head.weight") or name.endswith("output.weight"):
         return include_lm_head
     if "conv1d" in name:
