@@ -77,6 +77,32 @@ offsets; `sub_offset(interm*h)` landed fc3 mid-fc1. Fix: `sub_offset(interm*h*2)
 as `_Float16*` regardless of dtype. Lesson: `sub_offset` on a `Raw` tensor is
 byte-addressed — multiply element indices by the real element size.
 
+## 2026-05-27 — vision profiling: where the remaining 39.8s goes + the knobs
+
+rocprofv2 kernel-trace (timing+occupancy) + `gfx-kernel-metadata` skill (static
+`.hsaco`, exposes spills the profiler can't). gfx1100 = 1024 VGPR/SIMD, 16 max
+waves/SIMD, 64 KB LDS/CU. (No `rocprofv2` in /opt/rocm-7.13 — only rocprofv3,
+counters still dead — so 7.2.3 rocprofv2 is the best available; memory counters
+dead everywhere, but timing + the static occupancy/spill data are enough.)
+
+Vision now splits ~evenly between two kernels:
+
+| kernel | total | VGPR | spill | LDS | verdict |
+|---|---|---|---|---|---|
+| `gemm_f16_wmma_mb4` | 20.9s | 72 | **0** | 0 | clean; NOT occupancy-bound (14 waves/SIMD possible) → **memory/reuse-bound** |
+| `attention_dflash_..._v3_f32` | 18.8s | **256** | **926** | 49 KB dyn | **catastrophic register spill** + LDS caps to 1 wg/CU (~12% occ) |
+
+**The single best vision knob: the attention kernel's 926-VGPR spill.** The
+M=64×N=128 f16-K/V WMMA tile over-provisions registers → 926 spills to scratch
+(VRAM round-trip per spill) — the real reason it's 449 ms/call (×42 = 18.8s),
+beyond just low occupancy. Lever: cut register pressure (smaller query tile M,
+or stage accumulator/state in LDS). The §14.1–14.4 plans (V-load focused) don't
+target the spill directly; the spill is the bigger lever.
+
+**mb4 GEMM (20.9s)** is spill-free with occupancy headroom → memory-bound; its
+lever is more operand reuse (2D M+N register blocking or LDS staging), not
+occupancy. NB=8 alone wouldn't help (not VGPR-capped).
+
 ## Root causes (both are the same problem: no real tiled GEMM on RDNA3)
 
 **Prefill = 99% Q8 GEMM.** Per-category timing (`HIPFIRE_PREFILL_TIMING=1`):
