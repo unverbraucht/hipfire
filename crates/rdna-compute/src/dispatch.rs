@@ -27792,6 +27792,32 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         unsafe { self.hip.launch_kernel(func, [grid_m, grid_n, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
     }
 
+    pub fn gemm_f16_wmma_mb8(
+        &mut self, w: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
+        m: usize, k: usize, n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("gemm_f16_wmma_mb8", kernels::GEMM_F16_WMMA_MB8_SRC, "gemm_f16_wmma_mb8")?;
+        let func = &self.functions["gemm_f16_wmma_mb8"];
+        let mut wp = w.buf.as_ptr();
+        let mut xp = x.buf.as_ptr();
+        let mut yp = y.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut ni = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut wp as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+        ];
+        let grid_m = ((m + 15) / 16) as u32;
+        let grid_n = ((n + 127) / 128) as u32;  // NB=8 → 128 N-cols per block
+        unsafe { self.hip.launch_kernel(func, [grid_m, grid_n, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
     /// Tiled F16 GEMM — 4-way ILP unrolled, no shared memory (high occupancy).
     /// Grid=[M, N], Block=[32], LDS=0.
     pub fn gemm_f16_tiled(

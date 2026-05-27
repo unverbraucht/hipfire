@@ -735,7 +735,7 @@ pub(crate) fn linear_f16(
     // Non-WMMA archs keep the naive gemm + explicit transpose. (K%16!=0 is
     // bounds-padded to 0, so K=588 from patch_embed is safe.)
     if gpu.arch_caps.has_wmma_w32() {
-        gpu.gemm_f16_wmma_mb4(w, x, &y, out_dim, in_dim, n)?;
+        gpu.gemm_f16_wmma_mb8(w, x, &y, out_dim, in_dim, n)?;
     } else {
         let yt = gpu.alloc_tensor(&[out_dim * n], DType::F32)?;
         gpu.gemm_f16(w, x, &yt, out_dim, in_dim, n)?;
@@ -766,7 +766,7 @@ pub(crate) fn linear_f16_no_bias(
     // requirement (load-bearing for downstream rmsnorm_f32 batch inference).
     let y = gpu.alloc_tensor(&[n, out_dim], DType::F32)?;
     if gpu.arch_caps.has_wmma_w32() {
-        gpu.gemm_f16_wmma_mb4(w, x, &y, out_dim, in_dim, n)?;
+        gpu.gemm_f16_wmma_mb8(w, x, &y, out_dim, in_dim, n)?;
     } else {
         let yt = gpu.alloc_tensor(&[out_dim * n], DType::F32)?;
         gpu.gemm_f16(w, x, &yt, out_dim, in_dim, n)?;
@@ -1209,8 +1209,11 @@ pub fn vision_forward(
             let fc3_w = lw.fc13_proj.sub_offset(half_bytes, half_bytes);
             let gate_nm = gpu.alloc_tensor(&[n_patches, interm], DType::F32)?;
             let up_nm = gpu.alloc_tensor(&[n_patches, interm], DType::F32)?;
-            gpu.gemm_f16_wmma_mb4(&fc1_w, &xn2, &gate_nm, interm, h, n_patches)?;
-            gpu.gemm_f16_wmma_mb4(&fc3_w, &xn2, &up_nm, interm, h, n_patches)?;
+            // Use MB8 (8-way register blocking) for fc13: 11% faster than MB4
+            // at the M=4224, K=1536, N=19520 shape. Each block computes one
+            // 16×128 output panel, reusing the weight tile across 8 subtiles.
+            gpu.gemm_f16_wmma_mb8(&fc1_w, &xn2, &gate_nm, interm, h, n_patches)?;
+            gpu.gemm_f16_wmma_mb8(&fc3_w, &xn2, &up_nm, interm, h, n_patches)?;
             gpu.silu_mul_f32(&gate_nm, &up_nm, &act_nm)?;
             gpu.free_tensor(gate_nm)?;
             gpu.free_tensor(up_nm)?;
