@@ -77,6 +77,22 @@ offsets; `sub_offset(interm*h)` landed fc3 mid-fc1. Fix: `sub_offset(interm*h*2)
 as `_Float16*` regardless of dtype. Lesson: `sub_offset` on a `Raw` tensor is
 byte-addressed — multiply element indices by the real element size.
 
+## 2026-05-27 — vision attention de-spill: 926 spills → 0, vision 39.8s → 32.2s
+
+The 926-VGPR spill was caused by **full `#pragma unroll` of the two inner 8-way
+d-chunk WMMA loops** (phase-A QK and phase-C SV) — the compiler kept 8 live
+`b_reg` (half16_t) copies + the [8] accumulator arrays, blowing past the 256 cap.
+Dropping the unroll factor to **4** (`#pragma unroll 4`) reuses fewer `b_reg`:
+VGPR 256+926spill → **214, 0 spill**. unroll 1 also de-spills (VGPR 166) but
+loses ILP (vision 36.4s); unroll 4 keeps ILP and is the sweet spot (**32.2s**).
+VGPR headroom up to ~256 is free here because LDS (49 KB) already caps occupancy
+to 1 wg/CU. (Also folded out the redundant `o_acc_per_dc[8]` — but that was a
+no-op; the compiler already fused it into O_frags, spill count was unchanged by
+it.) F1=1.000, 13/13. **Vision now 32.2s** (attention ~18.8s → ~12s).
+
+Still occupancy-capped by the 49 KB dynamic LDS (V_lds 32 KB + S_lds 16 KB) →
+1 workgroup/CU. Reducing LDS ≤ 32 KB → 2 wg/CU is the next attention lever.
+
 ## 2026-05-27 — vision profiling: where the remaining 39.8s goes + the knobs
 
 rocprofv2 kernel-trace (timing+occupancy) + `gfx-kernel-metadata` skill (static

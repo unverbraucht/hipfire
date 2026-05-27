@@ -130,7 +130,7 @@ __global__ void attention_dflash_wmma_m64_n128_f16kv_v3_f32(
                 ? (k + my_k * kv_stride + kv_head * head_dim)
                 : nullptr;
 
-            #pragma unroll
+            #pragma unroll 4
             for (int dc = 0; dc < d_chunks; ++dc) {
                 int d0 = dc * 16;
                 half16_t a_reg = Q_frags[dc];
@@ -236,15 +236,13 @@ __global__ void attention_dflash_wmma_m64_n128_f16kv_v3_f32(
             }
         }
 
-        // Step 2: SV accumulation. For each c, load softmax(S) row
-        // chunk ONCE and reuse across all 8 d-chunks.
-        // o_acc_per_dc[dc] accumulates SV contributions across c.
-        float8_t o_acc_per_dc[8];
-        #pragma unroll
-        for (int dc = 0; dc < d_chunks; ++dc) {
-            o_acc_per_dc[dc] = (float8_t){0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-        }
-
+        // Step 2: SV accumulation directly into O_frags (already alpha-folded
+        // above). For each c, load the softmax(S) row chunk ONCE (v3's read
+        // reduction) and run 8 SV WMMAs, accumulating into O_frags[dc] — WMMA's
+        // C operand IS the running output, so no separate o_acc_per_dc[8] is
+        // needed. Dropping that 8×float8_t array cuts 64 VGPR/lane, which
+        // eliminated the v3 kernel's 926-VGPR spill (it sat just over the 256
+        // cap). Result is identical: O_frags = alpha*O_frags + sum_c (S_c @ V_c).
         #pragma unroll
         for (int c = 0; c < n_chunks; ++c) {
             int s_col_base = c * 16;
@@ -257,8 +255,8 @@ __global__ void attention_dflash_wmma_m64_n128_f16kv_v3_f32(
                 for (int j = 0; j < 16; ++j) a_reg_sm[j] = sm_row[j];
             }
 
-            // 8 SV WMMAs against this a_reg_sm, one per d-chunk.
-            #pragma unroll
+            // 8 SV WMMAs against this a_reg_sm, one per d-chunk, into O_frags.
+            #pragma unroll 4
             for (int dc = 0; dc < d_chunks; ++dc) {
                 int d0 = dc * 16;
 
@@ -269,17 +267,8 @@ __global__ void attention_dflash_wmma_m64_n128_f16kv_v3_f32(
                     b_reg[j] = V_lds[(s_col_base + j) * head_dim + my_d];
                 }
 
-                o_acc_per_dc[dc] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
-                    a_reg_sm, b_reg, o_acc_per_dc[dc]);
-            }
-        }
-
-        // Step 3: accumulate o_acc_per_dc into O_frags.
-        #pragma unroll
-        for (int dc = 0; dc < d_chunks; ++dc) {
-            #pragma unroll
-            for (int j = 0; j < 8; ++j) {
-                O_frags[dc][j] += o_acc_per_dc[dc][j];
+                O_frags[dc] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
+                    a_reg_sm, b_reg, O_frags[dc]);
             }
         }
 
