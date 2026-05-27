@@ -195,6 +195,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     assert_eq!(visual_idx, n_visual_tokens, "spliced {visual_idx}/{n_visual_tokens} visual tokens");
+    // Drain the prefill GPU work before reading the timer: the batched prefill
+    // path enqueues async and returns almost instantly, so without this sync the
+    // prefill timer measures only host submission (~0.1s) and the real compute
+    // surfaces later at the first decode argmax — making prefill look ~100× too
+    // fast and decode ~30× too slow.
+    gpu.hip.device_synchronize()?;
     eprintln!("[prefill] mode={}", args.prefill);
     let prefill_s = t.elapsed().as_secs_f32();
     eprintln!("[prefill] done in {:.1}s ({:.1} tok/s)",
@@ -205,6 +211,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let t = Instant::now();
     let mut output_ids: Vec<u32> = Vec::with_capacity(args.max_tokens);
     let mut next = gpu.argmax_f32(&text_state.logits, text_cfg.vocab_size)?;
+    eprintln!("[generate] first-argmax (drains pending prefill GPU work) took {:.1}s",
+        t.elapsed().as_secs_f32());
+    let t_loop = Instant::now();
     let eos_set: Vec<u32> = if text_cfg.eos_token_ids.is_empty() {
         vec![text_cfg.eos_token_id]
     } else {
@@ -252,8 +261,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let gen_s = t.elapsed().as_secs_f32();
+    let loop_s = t_loop.elapsed().as_secs_f32();
     eprintln!("[generate] {} tokens in {:.1}s ({:.1} tok/s)",
         output_ids.len(), gen_s, output_ids.len() as f32 / gen_s);
+    eprintln!("[generate] decode-loop only: {} tokens in {:.1}s ({:.1} tok/s)",
+        output_ids.len(), loop_s, output_ids.len() as f32 / loop_s);
 
     // 9. Decode + emit to stdout (the grading script consumes this).
     let decoded = tokenizer.decode(&output_ids);
