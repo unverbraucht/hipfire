@@ -77,6 +77,20 @@ offsets; `sub_offset(interm*h)` landed fc3 mid-fc1. Fix: `sub_offset(interm*h*2)
 as `_Float16*` regardless of dtype. Lesson: `sub_offset` on a `Raw` tensor is
 byte-addressed — multiply element indices by the real element size.
 
+## 2026-05-27 — NEGATIVE: dropping attention V_lds (49KB→17KB) is a no-op
+
+Hypothesis: the 49 KB dynamic LDS (V_lds 32 KB + S_lds 16 KB) caps the attention
+to 1 workgroup/CU, so dropping V_lds (read V from DRAM in phase C) → 17 KB →
+3 wg/CU should hide latency via occupancy. Tested (kernel + dispatch shared_mem
+both updated): vision **32.8s vs 32.2s — neutral** (within noise), and it
+reintroduced 13 VGPR spills. **Reverted.**
+
+Lesson: the vision attention is **latency-bound, not occupancy-bound** — the
+LDS-staged V was *itself* the latency-hiding mechanism (on-chip SRAM, faster
+than L2), so trading it for occupancy is a wash at best. The 3× wave headroom
+didn't recover the exposed L2/DRAM V-read latency. LDS reduction is not a lever
+for this kernel; V staging stays.
+
 ## 2026-05-27 — vision attention de-spill: 926 spills → 0, vision 39.8s → 32.2s
 
 The 926-VGPR spill was caused by **full `#pragma unroll` of the two inner 8-way
