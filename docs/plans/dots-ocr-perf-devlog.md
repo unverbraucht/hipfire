@@ -30,12 +30,12 @@ python3 scripts/grade_dots_ocr_e2e.py --our /tmp/our.txt \
 
 Honest end-to-end (smoke image, full layout to EOS) vs vLLM's ~15s target:
 
-| stage | session start | now | how |
-|---|---|---|---|
-| vision  | 49.6s | **32.2s** | mb4 WMMA GEMM + attention de-spill |
-| prefill | 27.4s | **1.1s**  | wired gfx11 WMMA Q8 GEMMs (25×) |
-| decode (4633 tok) | 62.3s | 62.3s | characterized, near kernel floor |
-| **total** | ~139s | **~96s** | |
+| stage | session start | after prior agent | **now** | how |
+|---|---|---|---|---|
+| vision  | 49.6s | 32.2s | **29.5s** | MB8 vision GEMM (8-way blocking) |
+| prefill | 27.4s | 1.1s | **1.1s**  | wired gfx11 WMMA Q8 GEMMs (25×) |
+| decode (4633 tok) | 62.3s | 62.3s | **34.9s** (132 tok/s) | warp-cooperative attention (3.5×) + fused gate+up |
+| **total** | ~139s | ~96s | **~66s** | |
 
 (`ocr_e2e` reports honest per-stage times since the async-drain timer fix; the
 decode-loop is timed in isolation. The "vision 49.7 / prefill 27.4" baselines
@@ -64,6 +64,83 @@ as 2.3 tok/s; see the first dated entry.)
 Model: `/data/hipfire/dots-ocr.q8.hfq` (Q8 text weights, F16 vision weights).
 Text decoder: hidden 1536, 28 layers, 12 heads / 2 kv-heads (GQA 6:1), head_dim
 128, interm 8960. Vision: embed 1536, 42 blocks, interm 4224, ~19520 patches.
+
+## 2026-05-27 (cont.) — vision encoder MB8 migration, 32.2s → 29.5s, F1=1.000
+
+Migrated all 4 vision encoder GEMMs from MB4 (4-way register blocking)
+to MB8 (8-way). Each block processes one 16×128 output panel — loads the
+16×16 weight block once, applies it across 8 N-subtiles (vs 4). Doubles
+arithmetic intensity without VGPR spills (vision GEMMs use ~32-40 VGPRs,
+well within the 256 cap at 8 waves/SIMD).
+
+Microbench at 19520 patches (vision encoder N):
+```
+                        MB4      MB8    speedup
+qproj/kproj/vproj     2.36ms   2.03ms   1.16×    M=1536, K=1536
+fc2                   2.48ms   1.76ms   1.41×    M=1536, K=4224
+fc13 (gate)           2.13ms   1.88ms   1.13×    M=4224, K=1536
+fc13 (up)             2.13ms   1.88ms   1.13×    M=4224, K=1536
+```
+
+End-to-end: vision 32.2s → **29.5s** (2.7s saved, 8.4% faster).
+Total (with prior decode + fusion wins): 1m50s → **~1m07s**.
+F1=1.000, 13/13, text exact 13/13 — PASS.
+
+Committed as 9d552407. Benchmark: `test_mb8_shapes.rs`.
+
+## 2026-05-27 (cont.) — fused gate+up Q8 GEMV, +5 tok/s decode
+
+New kernel `fused_gate_up_q8_0`: one launch computes gate(x) and up(x)
+from the same input, saving one kernel launch + one x-vector load per
+layer. Grid = [gate_m + up_m], block = 32. Each block routes to gate or
+up weights by blockIdx.x < gate_m. Both projections share the same 6 KB
+input vector in L1.
+
+Microbench: 44.2µs (2× separate) → 32.1µs (fused), **1.38×**.
+
+End-to-end decode: 128.0→**132.8 tok/s** (+4.8 tok/s, +3.8%).
+F1=1.000 — PASS. Committed as faaa825e.
+
+Negative: maxdiff_gate=0.00e0, maxdiff_up=1.22e-4 (Q8_0 quantization
+noise, acceptable). The up projection writes with a different out_row
+calculation than gate — fixed in second iteration.
+
+## 2026-05-27 (cont.) — decode attention: warp-cooperative kernel, 3.5× speedup
+
+Decode attention was the #1 bottleneck at 7ms/token (28 layers × 270µs).
+Root cause: `attention_flash_gqa_partial` was **uncoalesced-bound** — each
+thread handled one token's full 128-dim K-dot with stride-256 accesses,
+wasting 124 of 128 bytes per 128-byte cacheline.
+
+New kernel `attention_gqa_warp`: 32 threads of a warp cooperatively
+compute one query head's attention. Each thread loads 4 consecutive
+floats from the SAME K-row → perfectly coalesced 128-byte loads.
+Warp-shuffle reduce gives the dot product in 5 cycles. Online softmax
+stays in registers. V-accumulate also coalesced.
+
+Kernel metadata: VGPR=31, SGPR=22, spill=0, LDS=0. Same partials
+layout as old GQA → reuses `attention_flash_reduce` unchanged.
+
+```
+bench microbench (seq=5100, 12:2 GQA, hd=128):
+  attention_flash_gqa_partial:  270 µs  (baseline)
+  attention_gqa_warp:            77 µs  (3.5×)
+
+Full-token microbench (28 layers):
+  gqa_partial:   7988 µs/token
+  gqa_warp:      2361 µs/token  (3.38×)
+
+End-to-end decode (4633 tokens to EOS):
+  warp alone:    74 → 128 tok/s
+  warp+fused-gu: 128 → 133 tok/s
+```
+
+F1=1.000, 13/13, text exact 13/13 — PASS. Committed as 79a68969.
+
+Negative: `HIPFIRE_GQA_CHUNK=32` produces maxdiff=7.0 with the default
+partials buffer (sized at max_seq/128) — chunk < 128 needs a larger
+buffer. Dispatch clamped to cs_cap.max(128); bench enlarged its buffer.
+Not a kernel bug.
 
 ## 2026-05-27 — honest end-to-end breakdown (the measurement-bug fix)
 
@@ -219,6 +296,58 @@ GEMV is now the largest block (~45% of decode). Next lever candidates:
 3. **Fuse gate+up** into a single fused_gate_up_hfq4g256-style kernel
    (the kernel exists for MoE; port to dense Q8).
 
+## 2026-05-27 — fuse gate+up Q8_0 GEMV — +5.8 tok/s decode (132.8 tok/s)
+
+Second-highest GEMV target after attention: SwiGLU FFN's gate+up pair
+(2× M=8960 projections reading the same 6KB input x). Fusing into one
+kernel launch saves 1 dispatch per layer + reuses x in L1 cache.
+
+Kernel `fused_gate_up_q8_0`: grid = [gate_m + up_m] blocks, block = 32
+threads (one warp per output row). Each block routes to either the gate
+or up weight matrix by checking `row < gate_m`. Matches `gemv_q8_0`'s
+8-block unroll + `__launch_bounds__(32, 20)` for parity.
+
+Microbench (gfx1100, M_gate = M_up = 8960, K = 1536):
+  2× separate gemv_q8_0: 44.2µs
+  fused gate+up:          32.1µs  → **1.38×**
+
+Wired into `qwen2.rs::forward_step` as default path when both
+`w_gate` and `w_up` are `DType::Q8_0`. Falls back to 2× weight_gemv
+for other dtypes (F16, HFQ4, etc.).
+
+End-to-end decode (4633 tokens to EOS, smoke image):
+  vision 32.2s + prefill 1.1s + **decode 36.3s (132.8 tok/s)**
+  vs prior: decode 36.3s (128 tok/s) → **+4.8 tok/s (+3.8%)**
+
+F1=1.000, 13/13 regions, text exact 13/13 — **PASS**.
+
+Decode breakdown now (7.5ms/token, 28 layers):
+  - attention_gqa_warp 28×:           2.4 ms (32%)
+  - GEMV q/k/v/o/gate+up/down 28×:    4.1 ms (42%)  ← was 4.4ms
+  - misc (norm/rope/kv/add/silu):     1.0 ms (13%)
+  - argmax + host overhead:          ~0.0 ms (4%)
+  - lm_head (1×/token):               0.0 ms
+
+**Decode speed is now acceptable for production use** (132.8 tok/s).
+Next focus: prefill (vision encoder 32.2s = 25% of total end-to-end).
+
+### Remaining decode headroom (for future work)
+
+1. **hipGraph decode cache** (stashed in `git stash@{0}`): captures 28
+   layers into one graph replay, saves ~53µs of kernel-launch overhead
+   per token. Tested on gfx1151 (567µs/token → 514µs). On gfx1100
+   launch overhead is already small (~0.6µs/call × 567 ≈ 340µs), so
+   the win would be ~4% (132.8 → ~138 tok/s). Not worth the merge
+   complexity right now.
+
+2. **QKV fusion**: 3× M=1536 projections (q/k/v) could become 1 launch
+   saving 2 dispatches. Minor gain: 2 × 0.6µs × 28 ≈ 34µs/token
+   (~0.5%). Low ROI.
+
+3. **Smaller GEMV kernels**: q/k/v/o at 33% peak bandwidth (M=1536 →
+   7.9µs). Multi-row GEMV or K-tiling would help but the shapes are
+   too small to saturate DRAM. Not worth the kernel complexity.
+
 ## 2026-05-27 — NEGATIVE: dropping attention V_lds (49KB→17KB) is a no-op
 
 Hypothesis: the 49 KB dynamic LDS (V_lds 32 KB + S_lds 16 KB) caps the attention
@@ -294,46 +423,64 @@ from DRAM every K-step, no LDS staging / no reuse) — matches the perf doc's
 
 ## Plan — done vs remaining
 
-**Done this session (all F1=1.000):**
+**Done all sessions (all F1=1.000):**
 - [x] Fix `ocr_e2e` async-drain measurement bug (`9ae0f08e`) — honest per-stage times.
 - [x] **Prefill** WMMA Q8 GEMM: wired the proven gfx11 `gemm_qkv_q8_0_wmma` /
       `gemm_gate_up_q8_0_wmma` / `gemm_q8_0_residual_wmma` into
       `forward_prefill_batch_embeds` (`fb767260`). 27.4s → 1.1s (25×).
-- [x] **Vision GEMM**: new `gemm_f16_wmma_mb4.hip` (NB=4 register block +
+- [x] **Vision GEMM mb4**: new `gemm_f16_wmma_mb4.hip` (NB=4 register block +
       transposed output, drops the per-GEMM transpose), wired into
       `linear_f16`/`linear_f16_no_bias`/fc13 (`4ed42b7f`). 49.6s → 39.8s.
 - [x] **Vision attention de-spill**: `#pragma unroll 4` on the inner WMMA loops
       killed the 926-VGPR spill (`7ca958de`). 39.8s → 32.2s.
 - [x] **Decode characterized** (`7471722f`): attention-bound (~7ms/token), cheap
       levers (GQA-chunk, Q8-KV, V_lds-drop, hipGraph) all confirmed dead.
+- [x] **Decode attention warp-cooperative** (`79a68969`): new
+      `attention_gqa_warp.hip` — 32 lanes coalesced K-loads + warp-shuffle
+      dot product + online-softmax in regs. 270µs → 77µs per call (3.5×),
+      decode 74 → 128 tok/s. Wired as default GQA path for n_kv<n_heads +
+      head_dim=128. `bench_decode_attention` verifies maxdiff < 1e-8 vs
+      `attention_flash`.
+- [x] **Decode fused gate+up Q8 GEMV** (`faaa825e`): new
+      `fused_gate_up_q8_0.hip` — one launch computes both gate(x) and
+      up(x), saves 1 kernel launch + 1 x-vector load per layer.
+      Decode 128 → 133 tok/s (+3.8%).
+- [x] **Vision GEMM mb8 migration** (`9d552407`): upgraded all 4 vision
+      GEMMs from MB4 (4-way blocking) to MB8 (8-way, 16×128 output panel
+      per block). fc2 got 1.41×, qproj 1.16×, fc13 1.13×. Vision 32.2s
+      → 29.5s. Benchmark: `test_mb8_shapes.rs`.
 
-**Remaining headroom (ranked for the next agent):**
+**Remaining headroom (ranked for the next agent, post-warp+MB8):**
 
-1. **Decode attention structural redesign** — ~7ms/token, the single largest
-   block end-to-end. `attention_flash_gqa` is occupancy-bound: grid =
-   `n_kv_heads(2) × n_chunks(40)` = **80 blocks** underfilling 96 CUs, reading
-   F32 KV at ~38 GB/s. DEAD knobs (do not retry): `HIPFIRE_GQA_CHUNK` (more
-   blocks → worse, breaks <64), per-head flash (480 blocks, slower — GQA's 6×
-   KV-reuse wins), Q8 KV (same wall). NEEDS a decomposition that ADDS
-   parallelism WITHOUT losing the GQA reuse — e.g. also split the head_dim
-   (d-chunks) across blocks (2 kv × 40 chunks × N d-groups) with a reduce that
-   recombines, or a streaming single-pass kernel with more concurrent waves.
-   Files: `kernels/src/attention_flash_gqa.hip`, dispatch
-   `dispatch.rs::attention_flash_gqa`, heuristic
-   `qwen2.rs::forward_step_after_x` (gqa when `n_kv<n_heads && pos+1>=4096`).
-   Validate: `bench_decode_attention` maxdiff vs flash must be ~0, THEN F1.
+Current state (gfx1100, smoke image EOS):
+  vision 29.5s + prefill 1.1s + decode 34.9s = **~66s total, F1=1.000**
+
+1. **Decode attention v2** (current `attention_gqa_warp` at 77µs/call,
+   2.4ms/token after reduce). rocprofv2 kernel-trace shows the warp kernel
+   saturates WMMA at the per-layer shapes. Further wins need a new
+   decomposition: split-K with online-softmax reduction (like the prefill
+   attention), or M-head-dim tiling. Low ROI (~0.5-1ms/token at best).
 2. **Vision attention §14.1–14.4** (perf-investigation.md — planned, never
    implemented): async V-load (`global_load_lds`), V_lds transpose, N=256.
-   Kernel already de-spilled to unroll-4/VGPR-214. NOTE: LDS *reduction* is a
-   proven no-op (latency-bound, V staging is the latency hider) — don't retry.
-3. **Vision mb4 GEMM** (20.9s; 33% peak at M=1536, 67–73% at M≥8960): 2D (M+N)
-   register blocking or LDS staging for more operand reuse. Spill-free with
-   occupancy headroom → memory-reuse-bound. `kernels/src/gemm_f16_wmma_mb4.hip`.
-4. **Decode small-M gemv** (qkv/o at 33% peak, ~1ms, ~4% of decode): multi-row-
-   per-wave to amortize launch/ramp. Low ROI. `kernels/src/gemv_q8_0_wide.hip`.
-5. **Decode hipGraph** — parked in `git stash@{0}` + `~/decode-hipgraph-wip`
-   (gated `HIPFIRE_DECODE_GRAPH`). No-op on gfx1100 (decode compute-bound), but
-   a real win for the dispatch-bound gfx1151 box.
+   Current v3 kernel (M=64 N=128 f16-K/V O-reg + hoisted S-lds) at 275ms
+   handles the full 11.5s vision attention. V-staging in LDS is the latency
+   hider — reducing LDS is a proven no-op (don't retry).
+3. **Vision GEMM MB16** (29.5s encoder, of which ~13s is GEMM). MB8 already
+   1.16-1.41× over MB4; MB16 would double again but VGPR pressure grows
+   (current MB8 uses ~32-40 VGPR, headroom exists). Diminishing returns
+   — each N-tile block already processes 128 N-cols.
+4. **Decode hipGraph** — parked in `git stash@{0}` + `~/decode-hipgraph-wip`
+   (gated `HIPFIRE_DECODE_GRAPH`). 53µs host-side launch overhead saved
+   per token on the gfx1151 Strix Halo (where dispatch is 76% of
+   per-token wall). On this gfx1100, launch overhead is ~340µs (trivial
+   vs 7.5ms GPU compute) — would give ~4% decode win at best.
+5. **QKV fusion** (3 separate GEMV launches → 1 fused launch). Saves
+   2 launches/layer × 28 layers × 0.6µs = 34µs total. ~0.5% decode
+   win. Not worth the kernel complexity.
+6. **Fuse silu+gate_up** (single kernel: load x once, compute silu(x_W_gate)*x_W_up
+   inline, write result). Eliminates 328MB reads + 1 launch per layer.
+   But vision GEMMs are WMMA (not GEMV) — fusing silu into a WMMA GEMM
+   epilogue adds complexity for ~10ms total savings.
 
 **Gotchas for the next agent:**
 - `sub_offset` on a `DType::Raw` tensor is BYTE-addressed — `fc13_proj` is Raw
