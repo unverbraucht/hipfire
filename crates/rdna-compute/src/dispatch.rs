@@ -27647,6 +27647,38 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         unsafe { self.hip.launch_kernel(func, [grid_m, grid_n, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
     }
 
+    /// Register-blocked (NB=4 over N) WMMA F16 GEMM that writes Y TRANSPOSED
+    /// as `[N, M]` row-major. Each block computes a 16×64 output panel, loading
+    /// each W M-tile once per K-step and reusing it across 4 N-subtiles — 4×
+    /// less redundant weight DRAM traffic than `gemm_f16_wmma` (DRAM-bound at
+    /// the vision shapes). The transposed output lets the caller drop its
+    /// `transpose_f32` fixup. gfx1100+ (RDNA3 wave32 WMMA).
+    pub fn gemm_f16_wmma_mb4(
+        &mut self, w: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
+        m: usize, k: usize, n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("gemm_f16_wmma_mb4", kernels::GEMM_F16_WMMA_MB4_SRC, "gemm_f16_wmma_mb4")?;
+        let func = &self.functions["gemm_f16_wmma_mb4"];
+        let mut wp = w.buf.as_ptr();
+        let mut xp = x.buf.as_ptr();
+        let mut yp = y.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut ni = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut wp as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+        ];
+        let grid_m = ((m + 15) / 16) as u32;
+        let grid_n = ((n + 63) / 64) as u32;  // NB=4 → 64 N-cols per block
+        unsafe { self.hip.launch_kernel(func, [grid_m, grid_n, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
     /// Tiled F16 GEMM — 4-way ILP unrolled, no shared memory (high occupancy).
     /// Grid=[M, N], Block=[32], LDS=0.
     pub fn gemm_f16_tiled(

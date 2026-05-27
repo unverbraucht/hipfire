@@ -722,33 +722,26 @@ pub(crate) fn linear_f16(
     // exactly what `gemm_f16_wmma` writes ("Y[M, N]" with M=out_dim,
     // N=n stored row-major). 2-D shape would imply batch semantics
     // that don't apply to transposed-GEMM output.
-    let yt = gpu.alloc_tensor(&[out_dim * n], DType::F32)?;
-    // gfx1100+ (RDNA3 / RDNA3.5) — use the WMMA-accelerated variant.
-    // The naive `gemm_f16` launches grid `[M, N]` which for the dots.ocr
-    // smoke image (M=1536, N=19520) hits ~30M blocks; the WMMA variant
-    // tiles M and N in 16s, dropping the grid to ~117k blocks (and
-    // 2-3× faster on the math itself). The WMMA kernel handles
-    // K % 16 != 0 with bounds-checked padding to 0.0, so K=588
-    // (= 3 * 14 * 14 from `patch_embed`) is safe.
-    //
-    // Note: the upstream `gemm_f16_wmma.hip` shipped with a known
-    // correctness bug (each lane writing 256 elements into a 16-element
-    // half16_t vector → NaN output on dots.ocr's specific shapes). The
-    // 2c-5b investigation traced and fixed it — see the kernel file's
-    // header for the lane-cooperative WMMA layout details.
-    if gpu.arch_caps.has_wmma_w32() {
-        gpu.gemm_f16_wmma(w, x, &yt, out_dim, in_dim, n)?;
-    } else {
-        gpu.gemm_f16(w, x, &yt, out_dim, in_dim, n)?;
-    }
     // Output as 2-D `[n, out_dim]`. The 2-D shape is load-bearing for
     // downstream `rmsnorm_f32`, which infers `batch = shape[0]` and
     // `n = shape.last()`. With a 1-D shape, rmsnorm interprets the
     // whole buffer as ONE row of length `n * out_dim` and reads the
     // norm-weight (length out_dim) out of bounds → sticky HIP fault.
     let y = gpu.alloc_tensor(&[n, out_dim], DType::F32)?;
-    gpu.transpose_f32(&yt, &y, out_dim, n)?;
-    gpu.free_tensor(yt)?;
+    // gfx1100+ (RDNA3 / RDNA3.5): the register-blocked mb4 WMMA GEMM writes
+    // `[n, out_dim]` directly (transposed output) AND reuses each weight tile
+    // across 4 N-subtiles, so it both kills the redundant weight DRAM traffic
+    // of the naive `gemm_f16_wmma` and folds away the separate transpose_f32.
+    // Non-WMMA archs keep the naive gemm + explicit transpose. (K%16!=0 is
+    // bounds-padded to 0, so K=588 from patch_embed is safe.)
+    if gpu.arch_caps.has_wmma_w32() {
+        gpu.gemm_f16_wmma_mb4(w, x, &y, out_dim, in_dim, n)?;
+    } else {
+        let yt = gpu.alloc_tensor(&[out_dim * n], DType::F32)?;
+        gpu.gemm_f16(w, x, &yt, out_dim, in_dim, n)?;
+        gpu.transpose_f32(&yt, &y, out_dim, n)?;
+        gpu.free_tensor(yt)?;
+    }
     gpu.bias_add_f32(&y, bias, n, out_dim)?;
     Ok(y)
 }
@@ -769,18 +762,17 @@ pub(crate) fn linear_f16_no_bias(
     in_dim: usize,
     n: usize,
 ) -> HipResult<GpuTensor> {
-    let yt = gpu.alloc_tensor(&[out_dim * n], DType::F32)?;
-    // See [`linear_f16`] for the gemm_f16_wmma rationale and the
-    // 2-D output-shape requirement (the latter is load-bearing for
-    // downstream rmsnorm_f32 batch inference).
-    if gpu.arch_caps.has_wmma_w32() {
-        gpu.gemm_f16_wmma(w, x, &yt, out_dim, in_dim, n)?;
-    } else {
-        gpu.gemm_f16(w, x, &yt, out_dim, in_dim, n)?;
-    }
+    // See [`linear_f16`] for the mb4-WMMA rationale and the 2-D output-shape
+    // requirement (load-bearing for downstream rmsnorm_f32 batch inference).
     let y = gpu.alloc_tensor(&[n, out_dim], DType::F32)?;
-    gpu.transpose_f32(&yt, &y, out_dim, n)?;
-    gpu.free_tensor(yt)?;
+    if gpu.arch_caps.has_wmma_w32() {
+        gpu.gemm_f16_wmma_mb4(w, x, &y, out_dim, in_dim, n)?;
+    } else {
+        let yt = gpu.alloc_tensor(&[out_dim * n], DType::F32)?;
+        gpu.gemm_f16(w, x, &yt, out_dim, in_dim, n)?;
+        gpu.transpose_f32(&yt, &y, out_dim, n)?;
+        gpu.free_tensor(yt)?;
+    }
     Ok(y)
 }
 
@@ -1198,40 +1190,45 @@ pub fn vision_forward(
         gpu.rmsnorm_f32(&x, &lw.norm2_w, &xn2, eps)?;
         toc!(gpu, "norm2 rmsnorm");
 
-        // 2h. Fused fc13 GEMM (no bias). Layout: yt[2*interm, n] without
-        // transpose — keep head-major so sub_offset can slice cleanly
-        // into separate gate/up `[interm, n]` halves.
-        let fc13_yt = gpu.alloc_tensor(&[two_interm * n_patches], DType::F32)?;
+        // 2h+2i+2j. fc13 SwiGLU → act_nm [n_patches, interm] (fc2 input).
+        let act_nm = gpu.alloc_tensor(&[n_patches, interm], DType::F32)?;
         if use_wmma {
-            gpu.gemm_f16_wmma(&lw.fc13_proj, &xn2, &fc13_yt, two_interm, h, n_patches)?;
+            // Two register-blocked mb4 WMMA GEMMs on the fc1/fc3 halves of the
+            // load-time concat (`fc13_proj` rows [0:interm]=fc1=gate,
+            // [interm:2*interm]=fc3=up). Each writes [n, interm] directly, so
+            // gate/up are clean separate buffers and the silu output is already
+            // position-major — eliminating BOTH the naive fused-GEMM's redundant
+            // weight traffic AND the post-silu transpose.
+            //
+            // `fc13_proj` is `DType::Raw` (1-byte stride) holding F16 data, so
+            // sub_offset takes BYTE offsets: the fc3 half starts at F16 element
+            // `interm*h` = byte `interm*h*2`. (Passing element counts here would
+            // land fc3 mid-fc1 — gemm reads the ptr as _Float16* regardless.)
+            let half_bytes = interm * h * 2;
+            let fc1_w = lw.fc13_proj.sub_offset(0, half_bytes);
+            let fc3_w = lw.fc13_proj.sub_offset(half_bytes, half_bytes);
+            let gate_nm = gpu.alloc_tensor(&[n_patches, interm], DType::F32)?;
+            let up_nm = gpu.alloc_tensor(&[n_patches, interm], DType::F32)?;
+            gpu.gemm_f16_wmma_mb4(&fc1_w, &xn2, &gate_nm, interm, h, n_patches)?;
+            gpu.gemm_f16_wmma_mb4(&fc3_w, &xn2, &up_nm, interm, h, n_patches)?;
+            gpu.silu_mul_f32(&gate_nm, &up_nm, &act_nm)?;
+            gpu.free_tensor(gate_nm)?;
+            gpu.free_tensor(up_nm)?;
         } else {
+            // Non-WMMA fallback: naive fused [2*interm, n] head-major GEMM, then
+            // sub-view gate/up, silu element-wise, transpose to [n, interm].
+            let fc13_yt = gpu.alloc_tensor(&[two_interm * n_patches], DType::F32)?;
             gpu.gemm_f16(&lw.fc13_proj, &xn2, &fc13_yt, two_interm, h, n_patches)?;
+            let gate = fc13_yt.sub_offset(0, interm * n_patches);
+            let up = fc13_yt.sub_offset(interm * n_patches, interm * n_patches);
+            let act = gpu.alloc_tensor(&[interm * n_patches], DType::F32)?;
+            gpu.silu_mul_f32(&gate, &up, &act)?;
+            gpu.free_tensor(fc13_yt)?;
+            gpu.transpose_f32(&act, &act_nm, interm, n_patches)?;
+            gpu.free_tensor(act)?;
         }
         gpu.free_tensor(xn2)?;
-        toc!(gpu, "fc13 GEMM");
-
-        // 2i. SwiGLU on head-major sub-views.
-        //
-        // The fc1+fc3 concat at load-time stacked `fc1` (gate) ABOVE
-        // `fc3` (up) along the M (output) axis, so without the final
-        // transpose yt[0..interm*n] is exactly the gate buffer and
-        // yt[interm*n..2*interm*n] is exactly the up buffer (each in
-        // `[interm, n]` head-major layout). silu_mul_f32 operates
-        // element-wise, so it doesn't care about the (interm, n)
-        // ordering — only that gate[i] and up[i] correspond.
-        let gate = fc13_yt.sub_offset(0, interm * n_patches);
-        let up = fc13_yt.sub_offset(interm * n_patches, interm * n_patches);
-        let act = gpu.alloc_tensor(&[interm * n_patches], DType::F32)?;
-        gpu.silu_mul_f32(&gate, &up, &act)?;
-        gpu.free_tensor(fc13_yt)?;
-        toc!(gpu, "silu_mul");
-
-        // 2j. Transpose act from head-major `[interm, n]` to position-
-        // major `[n, interm]` for the fc2 GEMM input.
-        let act_nm = gpu.alloc_tensor(&[n_patches, interm], DType::F32)?;
-        gpu.transpose_f32(&act, &act_nm, interm, n_patches)?;
-        gpu.free_tensor(act)?;
-        toc!(gpu, "act transpose");
+        toc!(gpu, "fc13 + silu");
 
         // 2k. fc2 projection (no bias) + residual.
         let fc2_y = linear_f16_no_bias(gpu, &lw.fc2, &act_nm, h, interm, n_patches)?;

@@ -54,6 +54,29 @@ levers: vision GEMM (same naive-WMMA class of fix as prefill) and decode
 throughput (the parked hipGraph work targets dispatch-bound boxes; on gfx1100
 decode is compute-bound at ~74 tok/s).
 
+## 2026-05-27 — vision GEMM: register-blocked mb4 WMMA, 49.6s → 39.8s, F1=1.000
+
+New kernel `gemm_f16_wmma_mb4.hip`: NB=4 register blocking over N (one 16×64
+output panel per block, the W tile loaded once per K-step and reused across 4
+N-subtiles) + **transposed [N,M] output** (folds away the per-GEMM
+`transpose_f32`). Wired into `linear_f16`, `linear_f16_no_bias`, and the fc13
+SwiGLU (two mb4 GEMMs on the fc1/fc3 weight halves → silu → no transpose).
+
+Result: vision **49.6s → 39.8s** (~20%), F1=1.000, 13/13, text exact 13/13.
+Modest vs the 4× the weight-traffic cut predicted — the vision GEMM isn't
+purely weight-DRAM-bound at these shapes (X traffic + the 4-accumulator VGPR
+cost trims occupancy); NB=8 / M-blocking / LDS staging are follow-ups. New
+e2e: vision 39.8s + prefill 1.1s + decode 62.3s.
+
+**Bug caught during bring-up (your "stride" instinct):** fc13 first produced a
+decode attractor. Root cause was NOT the kernel (bit-exact vs `gemm_f16_wmma`
+at every shape incl. non-64-divisible N) — it was the weight slice. `fc13_proj`
+is `DType::Raw` (1-byte stride) holding F16 data, so `sub_offset` takes BYTE
+offsets; `sub_offset(interm*h)` landed fc3 mid-fc1. Fix: `sub_offset(interm*h*2)`
+(F16 bytes). The naive path never noticed because `gemm_f16_wmma` reads the ptr
+as `_Float16*` regardless of dtype. Lesson: `sub_offset` on a `Raw` tensor is
+byte-addressed — multiply element indices by the real element size.
+
 ## Root causes (both are the same problem: no real tiled GEMM on RDNA3)
 
 **Prefill = 99% Q8 GEMM.** Per-category timing (`HIPFIRE_PREFILL_TIMING=1`):

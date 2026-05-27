@@ -2467,6 +2467,10 @@ pub const GEMM_F16_SRC: &str = include_str!("../../../kernels/src/gemm_f16.hip")
 /// Y[M,N] = W_f16[M,K] @ X_f32[N,K]^T.  Tiled 16x16 WMMA, ~10-50x vs naive gemm_f16.
 /// Grid=[ceil(M/16), ceil(N/16)], Block=[32].
 pub const GEMM_F16_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_f16_wmma.hip");
+/// Register-blocked (NB=4 over N) WMMA F16 GEMM, transposed [N,M] output —
+/// reuses each W tile across 4 N-subtiles (4x less weight DRAM traffic than
+/// gemm_f16_wmma) and folds away the caller's transpose_f32. gfx1100+.
+pub const GEMM_F16_WMMA_MB4_SRC: &str = include_str!("../../../kernels/src/gemm_f16_wmma_mb4.hip");
 /// Tiled F16 GEMM with shared memory (no WMMA dependency, works on all RDNA).
 /// ~5-10x faster than naive gemm_f16 via LDS data reuse. Tile size 64K.
 pub const GEMM_F16_TILED_SRC: &str = include_str!("../../../kernels/src/gemm_f16_tiled.hip");
