@@ -858,20 +858,15 @@ fn forward_step_after_x(
         gpu.kv_cache_write(&state.k_cache[layer_idx], &state.k, &state.pos_buf, kv_dim)?;
         gpu.kv_cache_write(&state.v_cache[layer_idx], &state.v, &state.pos_buf, kv_dim)?;
 
-        // (6) Attention — split-K flash decode (`attention_flash`): grid
-        // [n_heads, n_chunks] saturates the GPU vs the naive single-token
-        // attention_f32 (grid [n_heads] = ~14% CU occupancy, 71% of decode
-        // GPU time per rocprof). GQA via n_heads / n_kv_heads. F32 KV cache.
-        // GQA-aware split-K when there's a group to share K/V loads and the
-        // context is long enough to fill the grid (n_kv_heads×n_chunks); else
-        // the per-head flash. Both bit-identical; gqa is ~15-23% faster at
-        // OCR decode lengths (5k-11k). Falls to flash for short/non-GQA.
+        // (6) Attention — decode: warp-cooperative GQA when GQA + head_dim=128
+        // (dots.ocr 12:2 default since 2026-05-27: 3.5× faster than prior GQA
+        // partial due to coalesced K/V loads + warp-shuffle dot products, maxdiff
+        // <1e-8 vs reference). Falls to per-head flash for short/non-GQA.
         //
         // Fused variant (opt-in via HIPFIRE_GQA_FUSED=1): single launch
         // per layer, no partials buffer, no reduce. Grid = n_kv_heads only
         // (2 for dots.ocr), so lower occupancy but eliminates the partials
-        // DRAM round-trip + reduce dispatch. Probe of launch-overhead vs
-        // occupancy tradeoff.
+        // DRAM round-trip + reduce dispatch.
         let use_fused = std::env::var("HIPFIRE_GQA_FUSED")
             .map(|v| v == "1").unwrap_or(false);
         if use_fused && n_kv_heads < n_heads {
@@ -880,8 +875,11 @@ fn forward_step_after_x(
                 &state.attn_out,
                 pos + 1, n_heads, n_kv_heads, head_dim, state.max_seq,
             )?;
-        } else if n_kv_heads < n_heads && pos + 1 >= 4096 {
-            Gpu::attention_flash_gqa(gpu,
+        } else if n_kv_heads < n_heads && head_dim == 128 {
+            // Warp-cooperative GQA: one 32-thread warp per query head,
+            // coalesced K/V loads, warp-shuffle dot-product. Default for
+            // dots.ocr (12:2, hd=128) — replaces attention_flash_gqa.
+            Gpu::attention_gqa_warp(gpu,
                 &state.q, &state.k_cache[layer_idx], &state.v_cache[layer_idx],
                 &state.attn_out, &state.attn_partials,
                 pos + 1, n_heads, n_kv_heads, head_dim, state.max_seq,

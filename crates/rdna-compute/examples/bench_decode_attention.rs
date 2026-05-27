@@ -47,7 +47,12 @@ fn main() {
     let d_v = gpu.upload_f32(&lcg(0x9696, max_seq * kv_dim), &[max_seq * kv_dim]).unwrap();
     let d_out = gpu.zeros(&[q_dim], DType::F32).unwrap();
 
-    let n_chunks_max = (max_seq + 127) / 128;
+    // Size partials for the minimum chunk size we might sweep (32), so
+    // HIPFIRE_GQA_CHUNK=32 doesn't overrun the buffer. At max_seq=12000,
+    // this allocates 375 chunks (was 94 at /128).
+    let min_chunk = std::env::var("HIPFIRE_GQA_CHUNK").ok()
+        .and_then(|v| v.parse().ok()).unwrap_or(128).min(32);
+    let n_chunks_max = (max_seq + min_chunk - 1) / min_chunk;
     let d_part = gpu.zeros(&[n_heads * n_chunks_max * (2 + head_dim)], DType::F32).unwrap();
 
     let pos_i32 = (seq_len - 1) as i32;
@@ -120,4 +125,17 @@ fn main() {
     }
     gpu.hip.device_synchronize().unwrap();
     eprintln!("attention_flash_gqa_fused:{:.1} us/call (vs flash maxdiff={maxdiff3:.2e})", t.elapsed().as_secs_f64() * 1e6 / iters as f64);
+
+    // attention_gqa_warp (32-thread warp-cooperative, coalesced K/V loads)
+    let d_out4 = gpu.zeros(&[q_dim], DType::F32).unwrap();
+    gpu.attention_gqa_warp(&d_q, &d_k, &d_v, &d_out4, &d_part, seq_len, n_heads, n_kv_heads, head_dim, max_seq).unwrap();
+    gpu.hip.device_synchronize().unwrap();
+    let d = gpu.download_f32(&d_out4).unwrap();
+    let maxdiff4 = a.iter().zip(&d).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+    let t = std::time::Instant::now();
+    for _ in 0..iters {
+        gpu.attention_gqa_warp(&d_q, &d_k, &d_v, &d_out4, &d_part, seq_len, n_heads, n_kv_heads, head_dim, max_seq).unwrap();
+    }
+    gpu.hip.device_synchronize().unwrap();
+    eprintln!("attention_gqa_warp:  {:.1} us/call (vs flash maxdiff={maxdiff4:.2e})", t.elapsed().as_secs_f64() * 1e6 / iters as f64);
 }

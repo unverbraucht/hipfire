@@ -22736,6 +22736,70 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         )
     }
 
+    /// Warp-cooperative GQA decode attention: 32-thread warp per query head,
+    /// coalesced K/V loads (32 lanes × 4 floats per same-token row), warp-shuffle
+    /// dot-product reduction, online softmax in registers. Same partials layout
+    /// and reduce kernel as `attention_flash_gqa` — drop-in replacement.
+    /// chunk_size must be divisible by 1 for head_dim=128 (4 floats/lane × 32 lanes).
+    pub fn attention_gqa_warp(
+        &mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,
+        out: &GpuTensor, partials: &GpuTensor, seq_len: usize,
+        n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        // Chunk must be ≥128: production partials buffer is allocated as
+        // (max_seq+127)/128. The bench uses a larger buffer to explore
+        // smaller chunks; dispatch must stay safe.
+        let cs_cap = std::env::var("HIPFIRE_GQA_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(128);
+        let chunk_size = if seq_len <= cs_cap { seq_len } else { cs_cap.max(128) };
+        let n_chunks = (seq_len + chunk_size - 1) / chunk_size;
+        let kv_group = n_heads / n_kv_heads;
+        let block = (kv_group * 32) as u32; // one warp per head in group
+
+        self.ensure_kernel("attention_gqa_warp", kernels::ATTENTION_GQA_WARP_SRC, "attention_gqa_warp")?;
+        let q_ptr = q.buf.as_ptr(); let k_ptr = k_cache.buf.as_ptr();
+        let v_ptr = v_cache.buf.as_ptr(); let p_ptr = partials.buf.as_ptr();
+        let sl = seq_len as i32; let nh = n_heads as i32; let nkv = n_kv_heads as i32;
+        let hd = head_dim as i32; let ms = max_seq as i32; let sc = scale; let cs = chunk_size as i32;
+        let mut p1: Vec<*mut c_void> = vec![
+            &q_ptr as *const _ as *mut c_void, &k_ptr as *const _ as *mut c_void,
+            &v_ptr as *const _ as *mut c_void, &p_ptr as *const _ as *mut c_void,
+            &sl as *const _ as *mut c_void, &nh as *const _ as *mut c_void, &nkv as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void, &ms as *const _ as *mut c_void, &sc as *const _ as *mut c_void, &cs as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "attention_gqa_warp",
+            [n_kv_heads as u32, n_chunks as u32, 1], [block, 1, 1], 0, &mut p1,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(q_ptr); b.push_ptr(k_ptr); b.push_ptr(v_ptr); b.push_ptr(p_ptr);
+                b.push_i32(sl); b.push_i32(nh); b.push_i32(nkv);
+                b.push_i32(hd); b.push_i32(ms); b.push_f32(sc); b.push_i32(cs);
+                b
+            },
+        )?;
+
+        // Reuse the same reduce kernel
+        self.ensure_kernel("attention_flash_reduce", kernels::ATTENTION_FLASH_SRC, "attention_flash_reduce")?;
+        let p2_ptr = partials.buf.as_ptr(); let o_ptr = out.buf.as_ptr();
+        let nh2 = n_heads as i32; let nc = n_chunks as i32; let hd2 = head_dim as i32;
+        let mut p2: Vec<*mut c_void> = vec![
+            &p2_ptr as *const _ as *mut c_void, &o_ptr as *const _ as *mut c_void,
+            &nh2 as *const _ as *mut c_void, &nc as *const _ as *mut c_void, &hd2 as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "attention_flash_reduce",
+            [n_heads as u32, 1, 1], [head_dim.min(256) as u32, 1, 1], 0, &mut p2,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(p2_ptr); b.push_ptr(o_ptr);
+                b.push_i32(nh2); b.push_i32(nc); b.push_i32(hd2);
+                b
+            },
+        )
+    }
+
     /// Single-launch GQA decode: one block per kv_head streams all KV once,
     /// accumulates online-softmax for the group in LDS, writes O. No partials,
     /// no reduce. Grid = n_kv_heads. Probe of launch-vs-occupancy floor.
