@@ -77,6 +77,36 @@ offsets; `sub_offset(interm*h)` landed fc3 mid-fc1. Fix: `sub_offset(interm*h*2)
 as `_Float16*` regardless of dtype. Lesson: `sub_offset` on a `Raw` tensor is
 byte-addressed — multiply element indices by the real element size.
 
+## 2026-05-27 — decode profiling: attention-bound (7ms), cheap levers exhausted
+
+Decode 74 tok/s ≈ 13.5ms/token GPU. rocprofv2 trace (1-token) + a synthetic
+`bench_gemv_q8` give the split:
+
+| decode kernel | time/token | note |
+|---|---|---|
+| `attention_flash_gqa_partial` (28×) | **~7ms** | 250µs/call @ ctx 5095, F32 KV ~38 GB/s — occupancy-bound (80 blocks < 96 CUs) |
+| `gemv_q8_0_wide` (qkv/o, M=1536) | ~1ms | **33% peak** (small-M latency-dominated) |
+| gemv gate/up/down (M=8960) | ~2.5ms | 67–73% peak — already good |
+| misc (rmsnorm/silu/rope/add) | ~3ms | — |
+
+`bench_gemv_q8` (gfx1100, ~960 GB/s peak): qkv/o (M1536) 319 GB/s (33%),
+gate/up (M8960) 667 (70%), down 639 (67%), lm_head 697 (73%). Small-M is
+latency-dominated (only ~2.5 MB moved); large-M saturates fine.
+
+**Cheap decode levers confirmed exhausted:**
+- `HIPFIRE_GQA_CHUNK` sweep: 128→270µs, 64→276µs, 32→321µs (+ maxdiff 8.0, the
+  reduce assumes chunk≥64), 16→416µs. More blocks is *worse*, not better —
+  occupancy-via-chunks is a dead end on gfx1100 too (gfx1151 prediction
+  falsified). flash (480 blocks) is *slower* (424µs) than gqa (80, 270µs)
+  because gqa's 6× KV-reuse wins despite fewer blocks.
+- Q8 KV cache: already rejected (project memory — same wall as F32; decode
+  attention is dispatch/occupancy-bound, not KV-byte-bound).
+
+Decode attention (7ms, the dominant block) needs a structural redesign — more
+parallelism without losing the GQA KV-reuse — not a knob. The small-M gemv
+(33% peak) is improvable (multi-row-per-wave) but only ~1ms, ~4% of decode.
+Decode is near its kernel floor on gfx1100 with the current attention.
+
 ## 2026-05-27 — NEGATIVE: dropping attention V_lds (49KB→17KB) is a no-op
 
 Hypothesis: the 49 KB dynamic LDS (V_lds 32 KB + S_lds 16 KB) caps the attention
