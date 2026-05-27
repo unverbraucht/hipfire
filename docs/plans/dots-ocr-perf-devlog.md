@@ -7,7 +7,63 @@ Goal: bring dots.ocr end-to-end latency on a real page toward vLLM's
 Companion design doc: [`dots-ocr.perf-investigation.md`](dots-ocr.perf-investigation.md).
 Per-kernel timing is the tool of record — PMC memory counters
 (`FETCH_SIZE`, `GL2C_*`) read flat zero on this gfx1100 under rocprofv1/v2/v3
-(driver/GFXOFF-gated; see `docs/perf-checkpoints/2026-05-27-*` once written).
+(driver/GFXOFF-gated). The dated entries below are a reverse-chronological log;
+**start with the handoff block, then the ranked headroom at the bottom.**
+
+## Status & handoff (2026-05-27)
+
+Branch `feat/dots-ocr-phase-6-wmma-gemm` (off master `09e94b25`), 9 commits, all
+landed with **F1=1.000** vs the vLLM reference. The dots.ocr F1 grade is the
+**only** correctness gate that matters here — the repo's `coherence-gate.sh`
+runs qwen35 models and does NOT exercise the qwen2/dots-ocr forward path, so any
+change to these kernels/forward must be re-graded:
+
+```
+cargo build --release -p hipfire-arch-dots-ocr --example ocr_e2e
+./target/release/examples/ocr_e2e --hfq /data/hipfire/dots-ocr.q8.hfq \
+  --image benchmarks/images/dots_ocr_smoke_001.jpg \
+  --prompt-json benchmarks/references/dots_ocr_smoke_001.json \
+  --prefill batch > /tmp/our.txt 2>/tmp/our.err          # decodes to EOS (~4633 tok)
+python3 scripts/grade_dots_ocr_e2e.py --our /tmp/our.txt \
+  --ref benchmarks/references/dots_ocr_smoke_001_vllm.json  # want F1=1.000, 13/13
+```
+
+Honest end-to-end (smoke image, full layout to EOS) vs vLLM's ~15s target:
+
+| stage | session start | now | how |
+|---|---|---|---|
+| vision  | 49.6s | **32.2s** | mb4 WMMA GEMM + attention de-spill |
+| prefill | 27.4s | **1.1s**  | wired gfx11 WMMA Q8 GEMMs (25×) |
+| decode (4633 tok) | 62.3s | 62.3s | characterized, near kernel floor |
+| **total** | ~139s | **~96s** | |
+
+(`ocr_e2e` reports honest per-stage times since the async-drain timer fix; the
+decode-loop is timed in isolation. The "vision 49.7 / prefill 27.4" baselines
+above are post-fix — pre-fix the tool mis-reported prefill as 0.1s and decode
+as 2.3 tok/s; see the first dated entry.)
+
+**Tools / repro:**
+- In-engine per-stage timing: `HIPFIRE_PREFILL_TIMING=1` (prefill GEMM/attn
+  split), `HIPFIRE_DECODE_TIMING=1` (per-token forward vs argmax).
+- Microbenches: `cargo run --release -p rdna-compute --example bench_gemv_q8`
+  (decode GEMV bandwidth by shape), `… --example bench_decode_attention --seq
+  5100 --iters 100` (decode attention µs/call; honors `HIPFIRE_GQA_CHUNK`),
+  `… --example check_mb4` (mb4 GEMM bit-exactness, incl. sub_offset halves).
+- Profiler: `rocprofv2 --kernel-trace -d OUT -o t -- <bin>` gives per-kernel
+  timestamps + VGPR/SGPR/LDS (vision profiles fine; **crashes on prefill/long
+  decode** — the AqlPacket many-dispatch bug; use the in-engine timers there).
+  Prepend a `/tmp/hipcc-stub` (`#!/bin/sh\nexit 0`) to PATH so the compiler
+  version-probe doesn't deadlock under the profiler.
+- Static register/LDS/spill (the decisive data the profiler can't see — memory
+  PMC counters are DEAD on this gfx1100 across all profiler versions): the
+  `gfx-kernel-metadata` skill on `.hipfire_kernels/gfx1100/<kernel>.hsaco`
+  (`clang-offload-bundler` unbundle → `llvm-readelf --notes` → vgpr_count /
+  vgpr_spill_count / group_segment_fixed_size). gfx1100 = 1024 VGPR/SIMD,
+  16 max waves/SIMD, 64 KB LDS/CU.
+
+Model: `/data/hipfire/dots-ocr.q8.hfq` (Q8 text weights, F16 vision weights).
+Text decoder: hidden 1536, 28 layers, 12 heads / 2 kv-heads (GQA 6:1), head_dim
+128, interm 8960. Vision: embed 1536, 42 blocks, interm 4224, ~19520 patches.
 
 ## 2026-05-27 — honest end-to-end breakdown (the measurement-bug fix)
 
@@ -180,20 +236,55 @@ WMMA but is naively tiled (one wave per 16×16 output tile, re-reads operands
 from DRAM every K-step, no LDS staging / no reuse) — matches the perf doc's
 "K-tile=16 vs 256, L2 hit <1%, DRAM-bound".
 
-## Plan (ranked by leverage)
+## Plan — done vs remaining
 
-1. **Prefill: wire the existing gfx11 WMMA Q8 GEMM kernels** —
-   `gemm_qkv_q8_0_wmma`, `gemm_gate_up_q8_0_wmma`, `gemm_q8_0_residual_wmma`
-   (all RDNA3 `_w32`, already proven in the qwen35 production path) — into
-   `forward_prefill_batch_embeds`. These are real tiled GEMMs (16×16 output
-   tiles, `blockIdx.y` = batch tile → weight reuse across the batch). NOT a
-   port; just not currently used by the dots.ocr prefill. **Doing the fused
-   variants (QKV in one launch, gate+up in one launch) first** — same as
-   qwen35 prefill.
-2. **Vision GEMM**: replace naive `gemm_f16_wmma` with an LDS-tiled +
-   register-blocked WMMA GEMM; drop the per-GEMM `transpose_f32`.
-3. **Vision attention** (§14.1–14.4 — only ever planned, never implemented,
-   incl. on gfx1151): async V-load, V_lds transpose, N=256, M=128.
+**Done this session (all F1=1.000):**
+- [x] Fix `ocr_e2e` async-drain measurement bug (`9ae0f08e`) — honest per-stage times.
+- [x] **Prefill** WMMA Q8 GEMM: wired the proven gfx11 `gemm_qkv_q8_0_wmma` /
+      `gemm_gate_up_q8_0_wmma` / `gemm_q8_0_residual_wmma` into
+      `forward_prefill_batch_embeds` (`fb767260`). 27.4s → 1.1s (25×).
+- [x] **Vision GEMM**: new `gemm_f16_wmma_mb4.hip` (NB=4 register block +
+      transposed output, drops the per-GEMM transpose), wired into
+      `linear_f16`/`linear_f16_no_bias`/fc13 (`4ed42b7f`). 49.6s → 39.8s.
+- [x] **Vision attention de-spill**: `#pragma unroll 4` on the inner WMMA loops
+      killed the 926-VGPR spill (`7ca958de`). 39.8s → 32.2s.
+- [x] **Decode characterized** (`7471722f`): attention-bound (~7ms/token), cheap
+      levers (GQA-chunk, Q8-KV, V_lds-drop, hipGraph) all confirmed dead.
+
+**Remaining headroom (ranked for the next agent):**
+
+1. **Decode attention structural redesign** — ~7ms/token, the single largest
+   block end-to-end. `attention_flash_gqa` is occupancy-bound: grid =
+   `n_kv_heads(2) × n_chunks(40)` = **80 blocks** underfilling 96 CUs, reading
+   F32 KV at ~38 GB/s. DEAD knobs (do not retry): `HIPFIRE_GQA_CHUNK` (more
+   blocks → worse, breaks <64), per-head flash (480 blocks, slower — GQA's 6×
+   KV-reuse wins), Q8 KV (same wall). NEEDS a decomposition that ADDS
+   parallelism WITHOUT losing the GQA reuse — e.g. also split the head_dim
+   (d-chunks) across blocks (2 kv × 40 chunks × N d-groups) with a reduce that
+   recombines, or a streaming single-pass kernel with more concurrent waves.
+   Files: `kernels/src/attention_flash_gqa.hip`, dispatch
+   `dispatch.rs::attention_flash_gqa`, heuristic
+   `qwen2.rs::forward_step_after_x` (gqa when `n_kv<n_heads && pos+1>=4096`).
+   Validate: `bench_decode_attention` maxdiff vs flash must be ~0, THEN F1.
+2. **Vision attention §14.1–14.4** (perf-investigation.md — planned, never
+   implemented): async V-load (`global_load_lds`), V_lds transpose, N=256.
+   Kernel already de-spilled to unroll-4/VGPR-214. NOTE: LDS *reduction* is a
+   proven no-op (latency-bound, V staging is the latency hider) — don't retry.
+3. **Vision mb4 GEMM** (20.9s; 33% peak at M=1536, 67–73% at M≥8960): 2D (M+N)
+   register blocking or LDS staging for more operand reuse. Spill-free with
+   occupancy headroom → memory-reuse-bound. `kernels/src/gemm_f16_wmma_mb4.hip`.
+4. **Decode small-M gemv** (qkv/o at 33% peak, ~1ms, ~4% of decode): multi-row-
+   per-wave to amortize launch/ramp. Low ROI. `kernels/src/gemv_q8_0_wide.hip`.
+5. **Decode hipGraph** — parked in `git stash@{0}` + `~/decode-hipgraph-wip`
+   (gated `HIPFIRE_DECODE_GRAPH`). No-op on gfx1100 (decode compute-bound), but
+   a real win for the dispatch-bound gfx1151 box.
+
+**Gotchas for the next agent:**
+- `sub_offset` on a `DType::Raw` tensor is BYTE-addressed — `fc13_proj` is Raw
+  F16, so multiply element offsets by 2 (this caused a decode attractor).
+- `hipStreamBeginCapture` records without executing — a capture must be
+  followed by a replay or logits stay stale + kv_cache_write never lands.
+- Any forward-path change → re-grade F1 (coherence-gate does NOT cover dots).
 
 ## rocprofv2 on gfx1100 (this session)
 - Runs; gives per-kernel timestamps + VGPR/SGPR/LDS/occupancy. ✅
