@@ -163,6 +163,62 @@ parallelism without losing the GQA KV-reuse — not a knob. The small-M gemv
 (33% peak) is improvable (multi-row-per-wave) but only ~1ms, ~4% of decode.
 Decode is near its kernel floor on gfx1100 with the current attention.
 
+## 2026-05-27 — decode attention redesign: warp-cooperative kernel, 3.5× speedup
+
+The #1 bottleneck identified in the handoff: `attention_flash_gqa_partial`
+at 270 µs/call × 28 layers = 7.5 ms/token (56% of decode time). Root
+cause: **uncoalesced K/V loads**. Each thread handled one token's full
+128-dim K-dot with stride-256 accesses (`k_cache[t*256 + d]`), wasting
+124 of 128 bytes per 128-byte cacheline.
+
+**Fix: `attention_gqa_warp`** — 32 threads of a warp cooperatively
+compute one query head's attention:
+- Each thread loads 4 consecutive floats from the SAME K-row → perfectly
+  coalesced 128-byte loads (32 lanes × 4 floats × 4 bytes)
+- Warp-shuffle reduce (5 cycles) for the full dot product
+- Online softmax stays in registers (no score-array LDS)
+- V-accumulate also coalesced, scaled in-place via alpha
+
+Kernel metadata: VGPR=31, SGPR=22, spill=0, LDS=0. Reuses the existing
+`attention_flash_reduce` kernel for chunk combination — same partials
+layout as the old GQA.
+
+Results (gfx1100, seq=5100, 12:2 GQA, hd=128):
+- bench microbench: 270 µs → **77 µs** (3.5×, maxdiff=5.6e-9)
+- full-token (28 layers): 8.0 ms → **2.4 ms** (3.38×)
+- decode e2e: 74 tok/s → **128 tok/s** (1.73×, 4633 tokens to EOS in 36s)
+- vision: 32.6s → 32.6s (unchanged)
+- prefill: 1.1s → 1.1s (unchanged)
+- **F1=1.000, 13/13 regions, text exact 13/13 — PASS**
+
+Wired as the default GQA path in `qwen2.rs::forward_step_after_x` for
+GQA models (n_kv_heads < n_heads) with head_dim=128. Old
+`attention_flash_gqa` remains available. `HIPFIRE_GQA_FUSED=1` opt-in
+for the single-launch fused variant (only 2 blocks = 2 CUs, slower).
+`attention_flash` fallback for non-GQA or non-128-dim heads.
+
+Chunk size clamped to ≥128 in dispatch to match the production
+partials-buffer allocation (sized at `(max_seq+127)/128`). The bench
+sweeps smaller chunks (32–256) by allocating a larger buffer.
+
+**Negative (not wired):** chunk≤64 is slightly faster on some shapes
+(68 vs 77 µs at chunk=64) but requires production partials-buffer
+enlargement. Not worth the churn — the 3.5× win at chunk=128 is safe
+and substantial. Chunk=32 has a small-accuracy cliff (`maxdiff=7.0`
+when the partials buffer is undersized; `≤1e-8` when properly allocated
+in the bench, but not wired since the production buffer isn't enlarged).
+
+**New decode breakdown (128 tok/s = 7.8 ms/token):**
+- attention (warp, 28×): **2.4 ms** (was 7.5 ms)
+- GEMV (qkv+o+gate+up+down, 28×): ~3.5 ms (unchanged)
+- misc (rmsnorm+rope+add, 28×): ~2.0 ms (unchanged)
+
+GEMV is now the largest block (~45% of decode). Next lever candidates:
+1. **Fuse q+kv GEMV** into a single kernel (eliminate 2 launches/layer)
+2. **Fuse silu+gate** (eliminate rmsnorm_ffn→gate→silu→up chain)
+3. **Fuse gate+up** into a single fused_gate_up_hfq4g256-style kernel
+   (the kernel exists for MoE; port to dense Q8).
+
 ## 2026-05-27 — NEGATIVE: dropping attention V_lds (49KB→17KB) is a no-op
 
 Hypothesis: the 49 KB dynamic LDS (V_lds 32 KB + S_lds 16 KB) caps the attention
