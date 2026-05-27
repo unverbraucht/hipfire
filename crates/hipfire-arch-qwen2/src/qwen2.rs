@@ -1006,6 +1006,23 @@ pub fn forward_prefill_batch_embeds(
         (None, None)
     };
 
+    // Use the tiled WMMA Q8 GEMMs (gfx11/gfx12) when every projection weight is
+    // Q8_0 and all K dims are WMMA-tileable (multiple of 32). These reuse each
+    // 16×16 weight tile across the batch; the `gemm_q8_0_batched` fallback is
+    // GEMV-style (one block per output row → the weight is re-streamed from DRAM
+    // for every batch row), which dominated prefill (23s FFN at batch=5095).
+    // QKV and gate+up are fused (one launch each); o_proj and down use the
+    // residual-fused variant (Y += A@X) which folds the residual add into the
+    // GEMM. Mirrors the qwen35 production prefill path. Falls back to `proj`
+    // for non-Q8 weights (e.g. HFQ4) or non-tileable K.
+    let use_wmma_q8 = (gpu.arch_caps.has_wmma_w32() || gpu.arch_caps.has_wmma_w32_gfx12())
+        && dim % 32 == 0 && q_dim % 32 == 0 && hidden_dim % 32 == 0
+        && weights.layers.iter().all(|l|
+            l.wq.gpu_dtype == DType::Q8_0 && l.wk.gpu_dtype == DType::Q8_0
+            && l.wv.gpu_dtype == DType::Q8_0 && l.wo.gpu_dtype == DType::Q8_0
+            && l.w_gate.gpu_dtype == DType::Q8_0 && l.w_up.gpu_dtype == DType::Q8_0
+            && l.w_down.gpu_dtype == DType::Q8_0);
+
     // Absolute positions [base .. base+batch) for batched RoPE.
     let pos_bytes: Vec<u8> = (0..batch as i32)
         .flat_map(|i| (i + base as i32).to_ne_bytes())
@@ -1018,9 +1035,18 @@ pub fn forward_prefill_batch_embeds(
 
         gpu.rmsnorm_batched(&x_batch, &layer.attn_norm, &tmp_batch, batch, dim, cfg.rms_norm_eps)?;
 
-        proj(gpu, &layer.wq, &tmp_batch, &q_batch, batch)?;
-        proj(gpu, &layer.wk, &tmp_batch, &k_batch, batch)?;
-        proj(gpu, &layer.wv, &tmp_batch, &v_batch, batch)?;
+        if use_wmma_q8 {
+            gpu.gemm_qkv_q8_0_wmma(
+                &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
+                &tmp_batch,
+                &q_batch, &k_batch, &v_batch,
+                layer.wq.m, layer.wk.m, layer.wv.m, layer.wq.k, batch,
+            )?;
+        } else {
+            proj(gpu, &layer.wq, &tmp_batch, &q_batch, batch)?;
+            proj(gpu, &layer.wk, &tmp_batch, &k_batch, batch)?;
+            proj(gpu, &layer.wv, &tmp_batch, &v_batch, batch)?;
+        }
 
         gpu.bias_add_f32(&q_batch, &layer.wq_bias, batch, q_dim)?;
         gpu.bias_add_f32(&k_batch, &layer.wk_bias, batch, kv_dim)?;
@@ -1050,16 +1076,33 @@ pub fn forward_prefill_batch_embeds(
                 batch, n_heads, n_kv_heads, head_dim)?;
         }
 
-        proj(gpu, &layer.wo, &attn_out_batch, &o_batch, batch)?;
-        gpu.add_inplace_f32(&x_batch, &o_batch)?;
+        if use_wmma_q8 {
+            // x_batch += wo @ attn_out  (residual add fused into the GEMM)
+            gpu.gemm_q8_0_residual_wmma(&layer.wo.buf, &attn_out_batch, &x_batch, layer.wo.m, layer.wo.k, batch)?;
+        } else {
+            proj(gpu, &layer.wo, &attn_out_batch, &o_batch, batch)?;
+            gpu.add_inplace_f32(&x_batch, &o_batch)?;
+        }
 
         gpu.rmsnorm_batched(&x_batch, &layer.ffn_norm, &tmp_batch, batch, dim, cfg.rms_norm_eps)?;
 
-        proj(gpu, &layer.w_gate, &tmp_batch, &gate_batch, batch)?;
-        proj(gpu, &layer.w_up, &tmp_batch, &up_batch, batch)?;
+        if use_wmma_q8 {
+            gpu.gemm_gate_up_q8_0_wmma(
+                &layer.w_gate.buf, &layer.w_up.buf, &tmp_batch,
+                &gate_batch, &up_batch, layer.w_gate.m, layer.w_up.m, layer.w_gate.k, batch,
+            )?;
+        } else {
+            proj(gpu, &layer.w_gate, &tmp_batch, &gate_batch, batch)?;
+            proj(gpu, &layer.w_up, &tmp_batch, &up_batch, batch)?;
+        }
         gpu.silu_mul_f32(&gate_batch, &up_batch, &ffn_hidden_batch)?;
-        proj(gpu, &layer.w_down, &ffn_hidden_batch, &ffn_out_batch, batch)?;
-        gpu.add_inplace_f32(&x_batch, &ffn_out_batch)?;
+        if use_wmma_q8 {
+            // x_batch += w_down @ ffn_hidden  (residual add fused into the GEMM)
+            gpu.gemm_q8_0_residual_wmma(&layer.w_down.buf, &ffn_hidden_batch, &x_batch, layer.w_down.m, layer.w_down.k, batch)?;
+        } else {
+            proj(gpu, &layer.w_down, &ffn_hidden_batch, &ffn_out_batch, batch)?;
+            gpu.add_inplace_f32(&x_batch, &ffn_out_batch)?;
+        }
     }
 
     // Final norm + lm_head for the LAST position only → state.logits.

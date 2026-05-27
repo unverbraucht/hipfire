@@ -34,6 +34,26 @@ hipGraph capture/replay work this session is gated behind
 host-dispatch-bound; it's a deliverable for the dispatch-bound gfx1151 box.
 Parked in `git stash@{0}` + `~/decode-hipgraph-wip/`, not committed.)
 
+## 2026-05-27 — prefill WMMA Q8 wired: 27.4s → 1.1s (≈25×), F1=1.000
+
+Wired the fused gfx11 WMMA Q8 GEMMs into `forward_prefill_batch_embeds`:
+`gemm_qkv_q8_0_wmma` (fused QKV), `gemm_gate_up_q8_0_wmma` (fused gate+up),
+`gemm_q8_0_residual_wmma` for o_proj + down (folds the residual add into the
+GEMM). Gated on all-Q8 weights + WMMA arch + K%32==0; falls back to the old
+`proj()` (GEMV) path otherwise. Mirrors the qwen35 production prefill path; the
+kernels were already proven there, only the wiring is new.
+
+Result (smoke image, full layout decoded to EOS):
+- **prefill 27.4s → 1.1s (4804 tok/s) ≈ 25×**
+- grade vs vLLM: **F1=1.000, 13/13 regions, text exact-match 13/13 — PASS**
+- new end-to-end: vision **49.6s** + prefill 1.1s + decode **62.3s** (4633 tok @ 74 tok/s)
+
+**Decode is now the largest full-page component** (62s > vision 49.6s) — the
+earlier "decode is negligible" held only for the 32-token smoke window. Next
+levers: vision GEMM (same naive-WMMA class of fix as prefill) and decode
+throughput (the parked hipGraph work targets dispatch-bound boxes; on gfx1100
+decode is compute-bound at ~74 tok/s).
+
 ## Root causes (both are the same problem: no real tiled GEMM on RDNA3)
 
 **Prefill = 99% Q8 GEMM.** Per-category timing (`HIPFIRE_PREFILL_TIMING=1`):
