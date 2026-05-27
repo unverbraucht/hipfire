@@ -21037,6 +21037,55 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         )
     }
 
+    /// Fused gate+up Q8_0 GEMV for SwiGLU FFN decode. One launch computes
+    /// gate(x) and up(x) together by dispatching (gate_m + up_m) blocks,
+    /// with each block routing to either the gate or up weight matrix.
+    /// Shares the same input vector x across both projections (L1 cache
+    /// reuse). Eliminates one kernel launch per layer vs 2 separate
+    /// gemv_q8_0 calls. Grid = [(gate_m + up_m), 1, 1], block = 32.
+    pub fn fused_gate_up_q8_0(
+        &mut self,
+        a_gate: &GpuTensor,
+        a_up: &GpuTensor,
+        x: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        gate_m: usize,
+        up_m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("fused_gate_up_q8_0", kernels::FUSED_GATE_UP_Q8_0_SRC, "fused_gate_up_q8_0")?;
+
+        let ag = a_gate.buf.as_ptr();
+        let au = a_up.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let yg = y_gate.buf.as_ptr();
+        let yu = y_up.buf.as_ptr();
+        let gm = gate_m as i32;
+        let um = up_m as i32;
+        let kv = k as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &ag as *const _ as *mut c_void, &au as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void, &yg as *const _ as *mut c_void,
+            &yu as *const _ as *mut c_void, &gm as *const _ as *mut c_void,
+            &um as *const _ as *mut c_void, &kv as *const _ as *mut c_void,
+        ];
+
+        self.launch_maybe_blob(
+            "fused_gate_up_q8_0",
+            [(gate_m + up_m) as u32, 1, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ag); b.push_ptr(au); b.push_ptr(xp);
+                b.push_ptr(yg); b.push_ptr(yu);
+                b.push_i32(gm); b.push_i32(um); b.push_i32(kv);
+                b
+            },
+        )
+    }
+
     /// Y[batch, M] = X[batch, K] @ A_q8[M, K]^T — batched Q8_0 GEMM.
     /// One block per output row (32 threads, one wave). Each thread holds
     /// MAX_BATCH=16 per-batch accumulators and broadcasts each weight load.

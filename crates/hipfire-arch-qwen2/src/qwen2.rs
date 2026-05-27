@@ -900,8 +900,20 @@ fn forward_step_after_x(
         gpu.rmsnorm_f32(&state.x, &layer.ffn_norm, &state.tmp, cfg.rms_norm_eps)?;
 
         // (10) SwiGLU: gate = silu(w_gate(x)) * w_up(x); down(...).
-        weight_gemv(gpu, &layer.w_gate, &state.tmp, &state.gate)?;
-        weight_gemv(gpu, &layer.w_up, &state.tmp, &state.up)?;
+        // When both gate+up are Q8_0, fuse into one launch (saves 1 kernel
+        // launch + reuses x in L1 cache). Otherwise fall back to 2 separate.
+        let both_q8_0 = layer.w_gate.gpu_dtype == DType::Q8_0
+            && layer.w_up.gpu_dtype == DType::Q8_0;
+        if both_q8_0 {
+            gpu.fused_gate_up_q8_0(
+                &layer.w_gate.buf, &layer.w_up.buf, &state.tmp,
+                &state.gate, &state.up,
+                layer.w_gate.m, layer.w_up.m, layer.w_gate.k,
+            )?;
+        } else {
+            weight_gemv(gpu, &layer.w_gate, &state.tmp, &state.gate)?;
+            weight_gemv(gpu, &layer.w_up, &state.tmp, &state.up)?;
+        }
         gpu.silu_mul_f32(&state.gate, &state.up, &state.ffn_hidden)?;
         weight_gemv(gpu, &layer.w_down, &state.ffn_hidden, &state.ffn_out)?;
 
