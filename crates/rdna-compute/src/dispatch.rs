@@ -28892,7 +28892,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             self.hip.launch_kernel(
                 func,
                 [n_heads as u32, q_tiles as u32, 1],
-                [256, 1, 1], // 4 waves per block
+                [128, 1, 1], // 2 waves per block (matches __launch_bounds__(128, 2))
                 shared_mem,
                 self.stream_ref(),
                 &mut params,

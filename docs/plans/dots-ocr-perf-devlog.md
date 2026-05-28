@@ -10,9 +10,9 @@ Per-kernel timing is the tool of record — PMC memory counters
 (driver/GFXOFF-gated). The dated entries below are a reverse-chronological log;
 **start with the handoff block, then the ranked headroom at the bottom.**
 
-## Status & handoff (2026-05-27)
+## Status & handoff (2026-05-28)
 
-Branch `feat/dots-ocr-phase-6-wmma-gemm` (off master `09e94b25`), 9 commits, all
+Branch `feat/dots-ocr-phase-6-wmma-gemm` (off master `09e94b25`), 10 commits, all
 landed with **F1=1.000** vs the vLLM reference. The dots.ocr F1 grade is the
 **only** correctness gate that matters here — the repo's `coherence-gate.sh`
 runs qwen35 models and does NOT exercise the qwen2/dots-ocr forward path, so any
@@ -32,10 +32,10 @@ Honest end-to-end (smoke image, full layout to EOS) vs vLLM's ~15s target:
 
 | stage | session start | after prior agent | **now** | how |
 |---|---|---|---|---|
-| vision  | 49.6s | 32.2s | **29.6s** | MB8 vision GEMM + v4 attention (2× occupancy) |
-| prefill | 27.4s | 1.1s | **1.0s**  | wired gfx11 WMMA Q8 GEMMs (25×) |
+| vision  | 49.6s | 29.6s | **28.3s** | v4 integrated + dispatch launch-bounds fix |
+| prefill | 27.4s | 1.0s | **1.0s**  | wired gfx11 WMMA Q8 GEMMs (25×) |
 | decode (4633 tok) | 62.3s | 62.3s | **34.8s** (133 tok/s) | warp-cooperative attention (3.5×) + fused gate+up |
-| **total** | ~139s | ~96s | **~65s** | |
+| **total** | ~139s | ~93s | **~64s** | |
 
 (`ocr_e2e` reports honest per-stage times since the async-drain timer fix; the
 decode-loop is timed in isolation. The "vision 49.7 / prefill 27.4" baselines
@@ -585,7 +585,85 @@ See git log for commits:
 
 **Key insight**: v4 uses 64-iteration tiles (vs v3's varying tile sizes), matching RDNA4/GCN5 wave scheduling better. Occupancy improved from 1 to 2 workgroups/CU due to reduced shared memory (48 KB → 33 KB).
 
-**Next investigation**: Flash attention for vision encoder (current ~15ms/block, target <10ms/block). Need to analyze:
-- Current attention implementation structure
-- Flash attention kernel availability in hipfire
-- Potential to fuse QKV with attention
+## 2026-05-28 — V4 attention profiling: occupancy only 6%, 136 VGPR spills
+
+rocprofv2 kernel-trace on v4 (single dispatch, warm, seq_len=19520, 12 heads):
+
+| Metric | Value | Problem |
+|--------|-------|---------|
+| Duration | 212 ms | |
+| Arch VGPR | **192** | 2 waves/SIMD max |
+| Scratch/lane | **544 B** | 136 VGPR spills to stack |
+| LDS/WG | **33,792 B** | fits only **1 WG/CU** (goal was 2) |
+| Occupancy | **4 waves/CU (6%)** | target 32–48 |
+
+**VGPR accounting from source:**
+
+| Array | Type | VGPRs | Live when |
+|-------|------|-------|-----------|
+| `Q_frags[8]` | half16_t | 64 | entire kernel |
+| `O_frags[8]` | float8_t | 64 | entire kernel |
+| `s_acc[8]` | float8_t | 64 | Phase A (QK^T) |
+| temporaries | — | ~24 | |
+| **Total** | | **~216** | → 192 allocated, 136 spilled |
+
+**LDS:** 33 KB × 2 = 66 KB > 64 KB limit → v4's 2 WG/CU goal was never achieved.
+
+Per-kernel bench sweep (all variants, seq_len=19520, 12 heads, hd=128):
+
+| Kernel | ms/call |
+|--------|--------|
+| M=16 wmma | 1816 |
+| M=32 wmma | 1733 |
+| M=32 N=64 f32 | 1583 |
+| M=32 N=64 f16-KV | 1450 |
+| M=32 N=128 f16-KV | 1273 |
+| M=64 N=128 O-reg | 600 |
+| M=64 N=128 v2 | 454 |
+| M=64 N=128 v3 | 276 |
+| **M=64 N=64 v4** | **213** |
+
+Vision encoder per-block trace (v4, block 0, HIPFIRE_DOTS_OCR_TRACE=1):
+
+| Operation | ms/block | ×42 |
+|-----------|---------|-----|
+| norm1 rmsnorm | 0.54 | 0.02s |
+| qkv GEMM (MB8) | 108 | 4.5s |
+| qkv split | 1.82 | 0.08s |
+| rope_2d | 1.71 | 0.07s |
+| **attention v4** | **216** | **9.1s** |
+| proj GEMM (MB8) | 35 | 1.5s |
+| residual1 | 0.79 | 0.03s |
+| norm2 rmsnorm | 0.37 | 0.02s |
+| fc13+silu | 192 | 8.1s |
+| fc2 GEMM (MB8) | 92 | 3.9s |
+| residual2 | 0.53 | 0.02s |
+| **Per block** | **648** | **28.3s** |
+
+### Optimization approaches (ranked)
+
+**Approach 2a: V_tile 64→32 (reduce LDS, fit 2 WG/CU)** — DO FIRST
+- V_tile = 32 → V_lds = 8 KB → total LDS = 25.6 KB → 2 WG/CU
+- 5-line code change, same pattern as v3→v4
+- Doubles occupancy from 4→8 waves/CU
+- 2 extra __syncthreads per K-tile (~1.5–3 ms added barrier overhead)
+- Expected: 212 ms → ~110–140 ms (1.5–2× gain)
+
+**Approach 1: Split head_dim 128→2×64 (reduce VGPR pressure)**
+- d_chunks 8→4 → peak VGPRs ~128 → 4 waves/SIMD, zero spills
+- Does not help occupancy (LDS still binding at 1 WG/CU without 2a first)
+- 2× K-tile iterations → 2× HBM reads for K
+- Significant restructuring, new quality risk
+- Best stacked on top of 2a
+
+**Approach 2b: S_lds / V_ldi overlay (aggressive LDS reduction)**
+- Overlay softmax output with V loading → ~17 KB total → 3 WG/CU
+- S_lds stride=130 vs V_lds stride=128 → layout mismatch complicates overlay
+- High risk, uncertain net gain (may trade LDS pressure for VGPR pressure)
+- Consider only if 2a shows room for more
+
+**PMC counters**: dead on this gfx1100 (SQ_WAVES, FETCH_SIZE, GL2C_* all
+return empty results under rocprofv2 7.2.3 and rocprofv3 7.13). Only
+kernel-trace static metadata (VGPR, LDS, scratch, duration) is reliable.
+
+**Next**: Implement approach 2a (V_tile 64→32).
