@@ -32,10 +32,10 @@ Honest end-to-end (smoke image, full layout to EOS) vs vLLM's ~15s target:
 
 | stage | session start | after prior agent | **now** | how |
 |---|---|---|---|---|
-| vision  | 49.6s | 32.2s | **29.5s** | MB8 vision GEMM (8-way blocking) |
-| prefill | 27.4s | 1.1s | **1.1s**  | wired gfx11 WMMA Q8 GEMMs (25×) |
-| decode (4633 tok) | 62.3s | 62.3s | **34.9s** (132 tok/s) | warp-cooperative attention (3.5×) + fused gate+up |
-| **total** | ~139s | ~96s | **~66s** | |
+| vision  | 49.6s | 32.2s | **29.6s** | MB8 vision GEMM + v4 attention (2× occupancy) |
+| prefill | 27.4s | 1.1s | **1.0s**  | wired gfx11 WMMA Q8 GEMMs (25×) |
+| decode (4633 tok) | 62.3s | 62.3s | **34.8s** (133 tok/s) | warp-cooperative attention (3.5×) + fused gate+up |
+| **total** | ~139s | ~96s | **~65s** | |
 
 (`ocr_e2e` reports honest per-stage times since the async-drain timer fix; the
 decode-loop is timed in isolation. The "vision 49.7 / prefill 27.4" baselines
