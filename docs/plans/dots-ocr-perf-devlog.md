@@ -573,3 +573,19 @@ See git log for commits:
 **Trade-off**: Chunking adds register pressure and loop overhead, but occupancy doubling more than compensates. Expected further gains from tuning block size and chunk count.
 
 **Next**: Integrate v4 into hipfire dispatch, then explore v5 (larger block sizes: 256/512 threads).
+
+## 2026-05-29 — V4 kernel integration: 32.2s → 27.3s (1.18× vision speedup)
+
+**Changes**: Integrated `attention_dflash_wmma_m64_n64_f16kv_v4_f32` into `dots_ocr.rs` vision encoder dispatch.
+
+**Results** (seq_len=19520, 42 layers, F1=1.000 validation PASSED):
+- v3 baseline: 32.2 seconds
+- v4 integrated: 27.3 seconds (1.18× faster)
+- **Vision encoder savings: 4.9 seconds**
+
+**Key insight**: v4 uses 64-iteration tiles (vs v3's varying tile sizes), matching RDNA4/GCN5 wave scheduling better. Occupancy improved from 1 to 2 workgroups/CU due to reduced shared memory (48 KB → 33 KB).
+
+**Next investigation**: Flash attention for vision encoder (current ~15ms/block, target <10ms/block). Need to analyze:
+- Current attention implementation structure
+- Flash attention kernel availability in hipfire
+- Potential to fuse QKV with attention
