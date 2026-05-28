@@ -711,6 +711,12 @@ Per-block trace (block 0):
 
 **Remaining headroom**:
 - Scratch 544 B/lane still present (136 VGPR spills)
-- Approach 1 (split head_dim 128→2×64) would reduce VGPRs to ~128, pushing to 4 waves/SIMD
-- Stacking approach 1 on top of 2a: 2 WG/CU × 4 waves/SIMD = 16 waves/CU (25% occupancy)
-- Could further reduce attention to ~100 ms, saving another ~2s off vision
+- Approach 1 (split head_dim 128→2×64) reduces VGPR 168→112, scratch 544→0
+- v6 kernel achieves 109.8 ms (1.34× over v5) in isolated bench with 0 spills, 3 WG/CU
+- **BUT v6 produces NaN in E2E vision encoder** despite perfect microbenchmark match
+- Isolated correctness test (B=19520, L=19520, 12 heads, random + zero data) shows exact match
+- NaN affects block 0 output: `stats[b0_attn]: nan=29982720`
+- Root cause TBD: likely interaction with real weight data causing QK^T overflow
+- v6 kernel committed in kernels/src/ for future investigation
+
+**Next**: Investigate v6 NaN root cause, or try V_tile=16 (approach 2a extreme) for 3 WG/CU with v5's proven codegen.

@@ -2212,6 +2212,7 @@ pub const ATTENTION_DFLASH_WMMA_M64_N128_F16KV_V2_SRC: &str = include_str!("../.
 pub const ATTENTION_DFLASH_WMMA_M64_N128_F16KV_V3_SRC: &str = include_str!("../../../kernels/src/attention_dflash_wmma_m64_n128_f16kv_v3.hip");
 pub const ATTENTION_DFLASH_WMMA_M64_N64_F16KV_V4_SRC: &str = include_str!("../../../kernels/src/attention_dflash_wmma_m64_n64_f16kv_v4_f32.hip");
 pub const ATTENTION_DFLASH_WMMA_M64_N32_F16KV_V5_SRC: &str = include_str!("../../../kernels/src/attention_dflash_wmma_m64_n32_f16kv_v5_f32.hip");
+pub const ATTENTION_DFLASH_WMMA_M64_N32_F16KV_V6_SRC: &str = include_str!("../../../kernels/src/attention_dflash_wmma_m64_n32_f16kv_v6_f32.hip");
 
 /// Causal variant of v3 (M=64, N=128, f16 K/V). Adds causal mask:
 /// S[q, k] = -inf when k > q. Skips entirely-masked tiles. Grid
