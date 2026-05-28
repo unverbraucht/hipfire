@@ -1,0 +1,14 @@
+# Cohort: phase-a-stage-a-awq-9b
+
+**Date:** 2026-05-12
+**Host:** brain
+**Git:** feat/mq-v2-quant-format @ 21772a4d
+**BF16 ref (safetensors / MSE):** `/home/kread/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a`
+**KLD ref:** `qwen3.5-9b-bf16.kldref.bin` (max_chunks=512; quick-slice)
+**KV mode:** asym3 · **Scoring mode:** prefill
+
+## Per-variant metrics
+
+| Variant | Arch | MSE mean (4-bit qts) | KLD mean ± CI | KLD p99 | PPL | HE tokens (sum) | Smoke (default) | Smoke (workaround) |
+|---|---|---:|---|---:|---:|---:|---|---|
+| qwen35-9b-q8f16 | gfx1100 | — | (no-kldref) | — | — | FAIL | ERR_DAEMON_NOT_READY | ERR_DAEMON_NOT_READY |

@@ -1,0 +1,5 @@
+
+
+This image displays a 3x4 grid of scatter plots (with the bottom row empty), each comparing two metrics related to model robustness and accuracy on CelebA and LSUN datasets. The top two rows show relationships between clean accuracy and various adversarial perturbation norms (LGA, LAGS, LAGA, LRA, LARS, LARA), with correlation coefficients indicating moderate to strong positive associations. The middle row explores how adversarial severity (measured by ||Δx||₂^ε) correlates with these same perturbation norms, revealing mixed results—some positive, some negative, and some near-zero correlations. Overall, the plots suggest that while higher clean accuracy often aligns with larger perturbation norms, the relationship between adversarial severity and those norms is inconsistent across different norm types.
+
+

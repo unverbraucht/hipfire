@@ -1,0 +1,9 @@
+=== Compiled n_tile_groups Benchmark ===
+
+proj (1536x19520x1536)
+  PG= 384:   397.94 ms    0.23 TFLOP/s  (  0.2% peak)
+  PG= 512:   398.68 ms    0.23 TFLOP/s  (  0.2% peak)
+  PG= 768:   395.94 ms    0.23 TFLOP/s  (  0.2% peak)
+  PG=1024:   387.39 ms    0.24 TFLOP/s  (  0.2% peak)
+  PG=1536:   388.48 ms    0.24 TFLOP/s  (  0.2% peak)
+

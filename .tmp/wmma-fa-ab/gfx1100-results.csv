@@ -1,0 +1,11 @@
+round,config,prefill_tok_s,model,nctx
+1,scalar,3146.5,qwen3.5-4b.mq4-cuda.hfq,2048
+1,wmma,3206.9,qwen3.5-4b.mq4-cuda.hfq,2048
+2,wmma,3187.1,qwen3.5-4b.mq4-cuda.hfq,2048
+2,scalar,3116.5,qwen3.5-4b.mq4-cuda.hfq,2048
+3,scalar,3123.4,qwen3.5-4b.mq4-cuda.hfq,2048
+3,wmma,3180.0,qwen3.5-4b.mq4-cuda.hfq,2048
+4,wmma,3177.5,qwen3.5-4b.mq4-cuda.hfq,2048
+4,scalar,3110.9,qwen3.5-4b.mq4-cuda.hfq,2048
+5,scalar,3114.2,qwen3.5-4b.mq4-cuda.hfq,2048
+5,wmma,3166.5,qwen3.5-4b.mq4-cuda.hfq,2048

@@ -1,0 +1,26 @@
+{
+  "cohort_label": "phase-a-stage-a-awq-9b",
+  "date_utc": "2026-05-12",
+  "host": "brain",
+  "git_head": "21772a4d478fab5328ea4e67a75586081f16d95c",
+  "git_branch": "feat/mq-v2-quant-format",
+  "bf16_ref": "/home/kread/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+  "variant_spec": "/tmp/cohort-specs/phase-a-stage-a-awq-9b.tsv",
+  "variants": [
+    {
+      "name": "qwen35-9b-q8f16",
+      "hfq_path": "/home/kread/.hipfire/models/qwen3.5-9b.q8f16",
+      "arch": "gfx1100"
+    },
+    {
+      "name": "qwen35-9b-mq4-base",
+      "hfq_path": "/home/kread/.hipfire/models/qwen3.5-9b.mq4-base-2026-05-12",
+      "arch": "gfx1100"
+    },
+    {
+      "name": "qwen35-9b-mq4-awq",
+      "hfq_path": "/home/kread/.hipfire/models/qwen3.5-9b.mq4-awq-2026-05-12",
+      "arch": "gfx1100"
+    }
+  ]
+}

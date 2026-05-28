@@ -1,0 +1,5 @@
+
+
+This image displays a grid of 12 scatter plots (numbered 1-12) comparing various machine learning metrics, primarily focusing on the relationship between "Clean accuracy" and other measures like LGA, LRA, LARS, LAGS, LAGA, and LARA for datasets CelebA and LSUN. Each plot includes a linear regression line and reports correlation coefficients (r) and Spearman's rank correlation (ρ), with the bottom row showing empty plots.
+
+

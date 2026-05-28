@@ -1,0 +1,46 @@
+{
+  "cohort_label": "post-rope-fix-9b",
+  "date_utc": "2026-05-12",
+  "host": "brain",
+  "git_head": "1805d820e00289f2ffb5196c6ad992bc683c60a7",
+  "git_branch": "feat/mq-v2-quant-format",
+  "bf16_ref": "/data/cache/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+  "variant_spec": "/tmp/cohort-specs/post-rope-fix-9b.tsv",
+  "variants": [
+    {
+      "name": "qwen35-9b-q8f16",
+      "hfq_path": "/home/kread/.hipfire/models/qwen3.5-9b.q8f16",
+      "arch": "gfx1100"
+    },
+    {
+      "name": "qwen35-9b-mq4-base",
+      "hfq_path": "/home/kread/.hipfire/models/qwen3.5-9b.mq4-base-2026-05-12",
+      "arch": "gfx1100"
+    },
+    {
+      "name": "qwen35-9b-mq4-awq",
+      "hfq_path": "/home/kread/.hipfire/models/qwen3.5-9b.mq4-awq-loaderfix-2026-05-12",
+      "arch": "gfx1100"
+    },
+    {
+      "name": "qwen35-9b-hfp4",
+      "hfq_path": "/home/kread/.hipfire/models/qwen3.5-9b.hfp4",
+      "arch": "gfx1100"
+    },
+    {
+      "name": "qwen35-9b-mfp4",
+      "hfq_path": "/home/kread/.hipfire/models/qwen3.5-9b.mfp4",
+      "arch": "gfx1100"
+    },
+    {
+      "name": "qwen35-9b-hfp4-l4-l5c",
+      "hfq_path": "/home/kread/.hipfire/models/qwen3.5-9b.hfp4-l4-l5c",
+      "arch": "gfx1100"
+    },
+    {
+      "name": "qwen35-9b-mfp4-l4-l5c",
+      "hfq_path": "/home/kread/.hipfire/models/qwen3.5-9b.mfp4-l4-l5c",
+      "arch": "gfx1100"
+    }
+  ]
+}

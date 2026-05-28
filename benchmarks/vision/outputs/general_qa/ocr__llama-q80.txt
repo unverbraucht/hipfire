@@ -1,0 +1,23 @@
+
+
+(1) Clean accuracy vs. LGA
+(CelebA and LSUN; r = 0.65, ρ = 0.62)
+
+(2) Clean accuracy vs. LAGS (ε = 1)
+(CelebA and LSUN; r = 0.67, ρ = 0.68)
+
+(3) Clean accuracy vs. LAGA (ε = 1)
+(CelebA and LSUN; r = 0.32, ρ = 0.36)
+
+(4) Clean accuracy vs. LRA
+(CelebA and LSUN; r = 0.90, ρ = 0.78)
+
+(5) Clean accuracy vs. LARS (ε = 1)
+(CelebA and LSUN; r = 0.70, ρ = 0.78)
+
+(6) Clean accuracy vs. LARA (ε = 1)
+(CelebA and LSUN; r = 0.51, ρ = 0.43)
+
+(7) Adv. sev. (||Δx||₂^ε) vs. mean ||Δx||₂^ε (LAGS, ε = 1)
+(CelebA and LSUN; r = 0.28, ρ =
+

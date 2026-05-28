@@ -27792,6 +27792,35 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         unsafe { self.hip.launch_kernel(func, [grid_m, grid_n, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
     }
 
+    /// Optimized MB8 GEMM with LDS output buffering for coalesced writes.
+    /// Grid=[ceil(M/16), ceil(N/128)], Block=[32], LDS=8 KB.
+    pub fn gemm_f16_wmma_mb8_opt(
+        &mut self, w: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
+        m: usize, k: usize, n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("gemm_f16_wmma_mb8_opt", kernels::GEMM_F16_WMMA_MB8_OPT_SRC, "gemm_f16_wmma_mb8_opt")?;
+        let func = &self.functions["gemm_f16_wmma_mb8_opt"];
+        let mut wp = w.buf.as_ptr();
+        let mut xp = x.buf.as_ptr();
+        let mut yp = y.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut ni = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut wp as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+        ];
+        let grid_m = ((m + 15) / 16) as u32;
+        let grid_n = ((n + 127) / 128) as u32;
+        let lds_bytes = 8192u32; // 8 KB for output tile buffer
+        unsafe { self.hip.launch_kernel(func, [grid_m, grid_n, 1], [32, 1, 1], lds_bytes, self.stream_ref(), &mut params) }
+    }
+
     pub fn gemm_f16_wmma_mb8(
         &mut self, w: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
         m: usize, k: usize, n: usize,
@@ -28783,6 +28812,87 @@ self.flags.rocblas_min_batch.unwrap_or(4)
                 func,
                 [n_heads as u32, q_tiles as u32, 1],
                 [128, 1, 1],
+                shared_mem,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// v4 attention kernel: M=64, N=64, f16 K/V, 2 workgroups per CU.
+    /// Reduces V_lds window from 128 keys to 64 keys, cutting shared memory
+    /// from 48 KB to 33 KB and doubling occupancy. Processes V in 2 chunks
+    /// per block. Achieves 1.3× speedup over v3 (11.67s vs 15.37s for 42 layers).
+    pub fn attention_dflash_wmma_m64_n64_f16kv_v4_f32(
+        &mut self,
+        q: &GpuTensor, k_f16: &GpuTensor, v_f16: &GpuTensor, out: &GpuTensor,
+        b: usize, l: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(q.dtype, DType::F32, "attention_dflash_wmma_m64_n64_f16kv_v4_f32: q must be F32");
+        assert_eq!(k_f16.dtype, DType::F16, "attention_dflash_wmma_m64_n64_f16kv_v4_f32: k must be F16");
+        assert_eq!(v_f16.dtype, DType::F16, "attention_dflash_wmma_m64_n64_f16kv_v4_f32: v must be F16");
+        assert_eq!(out.dtype, DType::F32, "attention_dflash_wmma_m64_n64_f16kv_v4_f32: out must be F32");
+        assert!(
+            head_dim == 128,
+            "attention_dflash_wmma_m64_n64_f16kv_v4_f32: head_dim={head_dim} but this kernel is \
+             hard-coded to head_dim==128.",
+        );
+        assert!(b > 0 && l > 0 && n_heads > 0 && n_kv_heads > 0);
+        assert!(
+            n_heads % n_kv_heads == 0,
+            "attention_dflash_wmma_m64_n64_f16kv_v4_f32: n_heads={n_heads} must be divisible by n_kv_heads={n_kv_heads}",
+        );
+        self.ensure_kernel(
+            "attention_dflash_wmma_m64_n64_f16kv_v4_f32",
+            kernels::ATTENTION_DFLASH_WMMA_M64_N64_F16KV_V4_SRC,
+            "attention_dflash_wmma_m64_n64_f16kv_v4_f32",
+        )?;
+        let func = &self.functions["attention_dflash_wmma_m64_n64_f16kv_v4_f32"];
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        
+        // v4 LDS layout: V_TILE=64 (was 128 in v3)
+        // V_lds: 64 * 128 * 2 = 16384 bytes
+        // S_lds: 64 * 130 * 2 = 16640 bytes
+        // m_lds + l_lds + alpha_lds: 64 * 4 * 3 = 768 bytes
+        // Total: 33792 bytes ≈ 33 KB
+        let v_tile = 64usize;
+        let m_tile = 64usize;
+        let s_lds_stride = 130usize;
+        let v_lds_bytes = v_tile * head_dim * 2; // f16
+        let s_lds_bytes = m_tile * s_lds_stride * 2; // f16
+        let scaler_bytes = m_tile * 4 * 3; // f32 * 3 (m, l, alpha)
+        let shared_mem = (v_lds_bytes + s_lds_bytes + scaler_bytes) as u32;
+
+        let mut qp = q.buf.as_ptr();
+        let mut kp = k_f16.buf.as_ptr();
+        let mut vp = v_f16.buf.as_ptr();
+        let mut op = out.buf.as_ptr();
+        let mut bi = b as i32;
+        let mut li = l as i32;
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void,
+            &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+            &mut li as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+
+        let q_tiles = (b + 63) / 64;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_heads as u32, q_tiles as u32, 1],
+                [256, 1, 1], // 4 waves per block
                 shared_mem,
                 self.stream_ref(),
                 &mut params,

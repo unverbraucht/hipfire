@@ -1,0 +1,67 @@
+Starting parameter sweep...
+Total combinations: 4 × 3 × 2 × 2 × 3 × 3
+Stage 1: Baseline sweep (NB=8, M_TILE=16, K_UNROLL=16)
+FAIL: qkv_proj nb8_mt16_ku16_pg768_wv8 - benchmark failed
+FAIL: proj nb8_mt16_ku16_pg768_wv8 - benchmark failed
+FAIL: fc1 nb8_mt16_ku16_pg768_wv8 - benchmark failed
+FAIL: fc2 nb8_mt16_ku16_pg768_wv8 - benchmark failed
+
+Stage 2: M_TILE sweep
+FAIL: qkv_proj nb8_mt16_ku16_pg768_wv8 - benchmark failed
+FAIL: qkv_proj nb8_mt32_ku16_pg768_wv8 - benchmark failed
+FAIL: proj nb8_mt16_ku16_pg768_wv8 - benchmark failed
+FAIL: proj nb8_mt32_ku16_pg768_wv8 - benchmark failed
+FAIL: fc1 nb8_mt16_ku16_pg768_wv8 - benchmark failed
+FAIL: fc1 nb8_mt32_ku16_pg768_wv8 - benchmark failed
+FAIL: fc2 nb8_mt16_ku16_pg768_wv8 - benchmark failed
+FAIL: fc2 nb8_mt32_ku16_pg768_wv8 - benchmark failed
+
+Stage 3: K_UNROLL sweep
+FAIL: qkv_proj nb8_mt16_ku8_pg768_wv8 - benchmark failed
+FAIL: qkv_proj nb8_mt16_ku16_pg768_wv8 - benchmark failed
+FAIL: proj nb8_mt16_ku8_pg768_wv8 - benchmark failed
+FAIL: proj nb8_mt16_ku16_pg768_wv8 - benchmark failed
+FAIL: fc1 nb8_mt16_ku8_pg768_wv8 - benchmark failed
+FAIL: fc1 nb8_mt16_ku16_pg768_wv8 - benchmark failed
+FAIL: fc2 nb8_mt16_ku8_pg768_wv8 - benchmark failed
+FAIL: fc2 nb8_mt16_ku16_pg768_wv8 - benchmark failed
+
+Stage 4: Persistent groups sweep
+FAIL: qkv_proj nb8_mt16_ku16_pg384_wv8 - benchmark failed
+FAIL: qkv_proj nb8_mt16_ku16_pg768_wv8 - benchmark failed
+FAIL: qkv_proj nb8_mt16_ku16_pg1152_wv8 - benchmark failed
+FAIL: proj nb8_mt16_ku16_pg384_wv8 - benchmark failed
+FAIL: proj nb8_mt16_ku16_pg768_wv8 - benchmark failed
+FAIL: proj nb8_mt16_ku16_pg1152_wv8 - benchmark failed
+FAIL: fc1 nb8_mt16_ku16_pg384_wv8 - benchmark failed
+FAIL: fc1 nb8_mt16_ku16_pg768_wv8 - benchmark failed
+FAIL: fc1 nb8_mt16_ku16_pg1152_wv8 - benchmark failed
+FAIL: fc2 nb8_mt16_ku16_pg384_wv8 - benchmark failed
+FAIL: fc2 nb8_mt16_ku16_pg768_wv8 - benchmark failed
+FAIL: fc2 nb8_mt16_ku16_pg1152_wv8 - benchmark failed
+
+Stage 5: Waves per SIMD sweep
+FAIL: qkv_proj nb8_mt16_ku16_pg768_wv4 - benchmark failed
+FAIL: qkv_proj nb8_mt16_ku16_pg768_wv8 - benchmark failed
+FAIL: qkv_proj nb8_mt16_ku16_pg768_wv12 - benchmark failed
+FAIL: proj nb8_mt16_ku16_pg768_wv4 - benchmark failed
+FAIL: proj nb8_mt16_ku16_pg768_wv8 - benchmark failed
+FAIL: proj nb8_mt16_ku16_pg768_wv12 - benchmark failed
+FAIL: fc1 nb8_mt16_ku16_pg768_wv4 - benchmark failed
+FAIL: fc1 nb8_mt16_ku16_pg768_wv8 - benchmark failed
+FAIL: fc1 nb8_mt16_ku16_pg768_wv12 - benchmark failed
+FAIL: fc2 nb8_mt16_ku16_pg768_wv4 - benchmark failed
+FAIL: fc2 nb8_mt16_ku16_pg768_wv8 - benchmark failed
+FAIL: fc2 nb8_mt16_ku16_pg768_wv12 - benchmark failed
+
+Sweep complete! Results in /tmp/sweep_results/results.csv
+
+Top 5 configurations per shape:
+
+qkv_proj:
+
+proj:
+
+fc1:
+
+fc2:

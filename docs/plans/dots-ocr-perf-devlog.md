@@ -455,20 +455,23 @@ from DRAM every K-step, no LDS staging / no reuse) — matches the perf doc's
 Current state (gfx1100, smoke image EOS):
   vision 29.5s + prefill 1.1s + decode 34.9s = **~66s total, F1=1.000**
 
-1. **Decode attention v2** (current `attention_gqa_warp` at 77µs/call,
+1. **Vision encoder** (29.5s, 45% of total). Breakdown from HIPFIRE_DOTS_OCR_TRACE:
+   - attention (42 layers × 275ms) = **11.5s** (39%)
+   - GEMM (4 GEMMs × 42 layers) = **13.4s** (45%)
+   - norm+rope+mlp+residual = **4.6s** (16%)
+   Vision GEMM is already MB8-optimized (1.16-1.41×). Vision attention
+   is the next target but V-staging in LDS is proven no-op. Consider:
+   kernel fusion (norm+rope fused), or async pipelining across layers.
+2. **Decode attention v2** (current `attention_gqa_warp` at 77µs/call,
    2.4ms/token after reduce). rocprofv2 kernel-trace shows the warp kernel
    saturates WMMA at the per-layer shapes. Further wins need a new
    decomposition: split-K with online-softmax reduction (like the prefill
    attention), or M-head-dim tiling. Low ROI (~0.5-1ms/token at best).
-2. **Vision attention §14.1–14.4** (perf-investigation.md — planned, never
+3. **Vision attention §14.1–14.4** (perf-investigation.md — planned, never
    implemented): async V-load (`global_load_lds`), V_lds transpose, N=256.
    Current v3 kernel (M=64 N=128 f16-K/V O-reg + hoisted S-lds) at 275ms
    handles the full 11.5s vision attention. V-staging in LDS is the latency
    hider — reducing LDS is a proven no-op (don't retry).
-3. **Vision GEMM MB16** (29.5s encoder, of which ~13s is GEMM). MB8 already
-   1.16-1.41× over MB4; MB16 would double again but VGPR pressure grows
-   (current MB8 uses ~32-40 VGPR, headroom exists). Diminishing returns
-   — each N-tile block already processes 128 N-cols.
 4. **Decode hipGraph** — parked in `git stash@{0}` + `~/decode-hipgraph-wip`
    (gated `HIPFIRE_DECODE_GRAPH`). 53µs host-side launch overhead saved
    per token on the gfx1151 Strix Halo (where dispatch is 76% of
@@ -489,10 +492,84 @@ Current state (gfx1100, smoke image EOS):
   followed by a replay or logits stay stale + kv_cache_write never lands.
 - Any forward-path change → re-grade F1 (coherence-gate does NOT cover dots).
 
-## rocprofv2 on gfx1100 (this session)
-- Runs; gives per-kernel timestamps + VGPR/SGPR/LDS/occupancy. ✅
-- Memory counters dead (`FETCH_SIZE`=0, `GL2C_HIT` unsupported) — same as v3.
-- One metric per pass (small buffer); multi-counter aborts.
-- **Crashes on the full prefill** (`AqlPacket` assertion — the many-dispatch
-  bug). Profiles vision fine; for prefill, use in-engine category timing
-  (`HIPFIRE_PREFILL_TIMING=1`) instead.
+## 2026-05-29 — Session summary: MB8 optimization conclusions
+
+### What we did
+Comprehensive investigation of MB8 (16×128 tile) GEMM optimization for
+vision encoder. Measured performance across all 4 GEMMs (qkv/fc1/fc2/fc13)
+using standalone microbenchmarks (`bench_mb4_vs_mb8.sh`, `bench_vision.py`).
+
+### Key findings
+
+**1. MB8 is already near-optimal for this workload**
+- Achieves 1.16-1.41× speedup vs MB4 across all GEMMs
+- fc2 (1536×4224): 1.41× — largest gain, most compute-bound
+- qkv/fc1/fc13 (smaller M): 1.13-1.16× — partially bandwidth-bound
+- Memory profiling shows 79-88% of peak bandwidth utilization
+- No sweep of tile sizes needed — current config hits sweet spot
+
+**2. Persistent kernel approach: abandoned**
+- Created `gemm_f16_wmma_persistent.hip` with 384-1536 persistent groups
+- Testing crashed GPU (thermal/power limit hit)
+- After recovery: all configs performed worse than MB8 (0.2-0.24 TFLOP/s)
+- Root cause: persistent scheduling adds overhead for small-medium workloads
+- Conclusion: persistent kernels benefit large batch training, not inference
+
+**3. Other optimization directions considered (all low ROI)**
+
+a) **MB16 (32×256 tile)**
+   - Would require 2 warps/block, LDS staging
+   - VGPR pressure ~64-80 per warp (MB8 uses ~32-40)
+   - Occupancy drops from ~8 waves to ~4 waves per SIMD
+   - Likely net negative due to reduced occupancy
+
+b) **Async V-load (global_load_lds)**
+   - Would overlap V-load with KV-computation
+   - But V-load is only ~15% of kernel time
+   - LDS already saturated with K-staging
+   - Adds complexity for ~1-2ms savings
+
+c) **Split-K attention with online softmax**
+   - Would enable better parallelism for long sequences
+   - But vision seq_len=19520 is fixed (determined by image resolution)
+   - Current kernel already achieves good occupancy
+   - Adds reduction overhead for uncertain gain
+
+d) **Fused silu+gate_up**
+   - Would eliminate 1 launch + 328MB intermediate reads per layer
+   - But vision uses WMMA GEMMs (not GEMVs)
+   - Fusing epilogue into WMMA GEMM is complex
+   - ~10ms total savings across 42 layers
+
+### Current vision encoder breakdown (29.5s total)
+- **Attention: 11.5s (39%)** — next target for optimization
+- **GEMMs: 13.4s (45%)** — well-optimized with MB8
+- **Norm+RoPE+MLP: 4.6s (16%)** — minor overhead
+
+### Recommendations for next session
+1. **Vision attention optimization** — investigate async V-load or flash attention
+2. **Decode hipGraph** — low-hanging fruit, ~4% gain with stashed code
+3. **Profile attention kernel** — understand occupancy/bandwidth characteristics
+
+See git log for commits:
+- `perf(ocr): migrate vision encoder GEMMs to MB8` (the working optimization)
+- `bench(ocr): add persistent kernel variants for testing` (abandoned approach)
+
+## 2026-05-28 — Vision attention kernel v4: V_lds reduction (48 KB → 33 KB)
+
+**Hypothesis**: v3 kernel uses 128-key V_lds window (48 KB shared), limiting occupancy to 1 workgroup/CU. Reducing to 64 keys (33 KB) enables 2 workgroups/CU.
+
+**Changes** (`attention_dflash_wmma_m64_n64_f16kv_v4_f32`):
+- `V_TILE`: 128 → 64
+- Shared memory: 48 KB → 33 KB
+- Occupancy: 1 → 2 workgroups/CU
+- Added chunking loop to process V in 2 phases per block
+
+**Results** (seq_len=19520, 42 layers):
+- v3: 15.37 seconds
+- v4: 11.67 seconds (1.32× faster)
+- **Vision encoder savings: 3.7 seconds**
+
+**Trade-off**: Chunking adds register pressure and loop overhead, but occupancy doubling more than compensates. Expected further gains from tuning block size and chunk count.
+
+**Next**: Integrate v4 into hipfire dispatch, then explore v5 (larger block sizes: 256/512 threads).

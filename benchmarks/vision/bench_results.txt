@@ -1,0 +1,44 @@
+Compiling MB4 and MB8 kernels...
+Kernels compiled successfully.
+
+Creating benchmark harness...
+Compiling kernel launchers...
+Compiling benchmark harness...
+benchmarks/vision/bench_output/bench_gemm.cpp:23:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   23 |     hipDeviceSynchronize();
+      |     ^~~~~~~~~~~~~~~~~~~~~~
+benchmarks/vision/bench_output/bench_gemm.cpp:30:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+   30 |     hipDeviceSynchronize();
+      |     ^~~~~~~~~~~~~~~~~~~~~~
+benchmarks/vision/bench_output/bench_gemm.cpp:78:5: error: unknown type name 'gemm_fn_t'
+   78 |     gemm_fn_t mb4_kernel = (gemm_fn_t)dlsym(mb4_lib, "gemm_f16_wmma_mb4");
+      |     ^
+benchmarks/vision/bench_output/bench_gemm.cpp:78:29: error: use of undeclared identifier 'gemm_fn_t'
+   78 |     gemm_fn_t mb4_kernel = (gemm_fn_t)dlsym(mb4_lib, "gemm_f16_wmma_mb4");
+      |                             ^~~~~~~~~
+benchmarks/vision/bench_output/bench_gemm.cpp:79:5: error: unknown type name 'gemm_fn_t'
+   79 |     gemm_fn_t mb8_kernel = (gemm_fn_t)dlsym(mb8_lib, "gemm_f16_wmma_mb8");
+      |     ^
+benchmarks/vision/bench_output/bench_gemm.cpp:79:29: error: use of undeclared identifier 'gemm_fn_t'
+   79 |     gemm_fn_t mb8_kernel = (gemm_fn_t)dlsym(mb8_lib, "gemm_f16_wmma_mb8");
+      |                             ^~~~~~~~~
+benchmarks/vision/bench_output/bench_gemm.cpp:102:9: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  102 |         hipMalloc(&d_a, a_size);
+      |         ^~~~~~~~~~~~~~~~~~~~~~~
+benchmarks/vision/bench_output/bench_gemm.cpp:103:9: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  103 |         hipMalloc(&d_b, b_size);
+      |         ^~~~~~~~~~~~~~~~~~~~~~~
+benchmarks/vision/bench_output/bench_gemm.cpp:104:9: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  104 |         hipMalloc(&d_c, c_size);
+      |         ^~~~~~~~~~~~~~~~~~~~~~~
+benchmarks/vision/bench_output/bench_gemm.cpp:118:9: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  118 |         hipFree(d_a);
+      |         ^~~~~~~~~~~~
+benchmarks/vision/bench_output/bench_gemm.cpp:119:9: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  119 |         hipFree(d_b);
+      |         ^~~~~~~~~~~~
+benchmarks/vision/bench_output/bench_gemm.cpp:120:9: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  120 |         hipFree(d_c);
+      |         ^~~~~~~~~~~~
+8 warnings and 4 errors generated when compiling for gfx1100.
+failed to execute:/opt/rocm/lib/llvm/bin/clang++  --offload-arch=gfx1100 --driver-mode=g++ --hip-link  -O3 -x hip benchmarks/vision/bench_output/bench_gemm.cpp -o "benchmarks/vision/bench_output/bench_gemm" -I/opt/rocm/include -L/opt/rocm/lib -lhiprtc -lamdhip64 -ldl

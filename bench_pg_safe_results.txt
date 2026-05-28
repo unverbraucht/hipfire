@@ -1,0 +1,1 @@
+/bin/bash: line 1: ./bench_pg_safe: No such file or directory

@@ -1,0 +1,64 @@
+
+tensor                                                                        qt             n           MSE   max_abs_err
+------------------------------------------------------------------------------------------------------------------------
+model.language_model.layers.20.linear_attn.conv1d.weight                    Q8_0         24576     1.3623e-6     4.9286e-3
+model.language_model.layers.21.linear_attn.conv1d.weight                    Q8_0         24576     1.2889e-6     4.6921e-3
+model.language_model.layers.17.linear_attn.conv1d.weight                    Q8_0         24576     1.1542e-6     3.5934e-3
+model.language_model.layers.18.linear_attn.conv1d.weight                    Q8_0         24576     1.0801e-6     4.3488e-3
+model.language_model.layers.16.linear_attn.conv1d.weight                    Q8_0         24576     8.5295e-7     6.2714e-3
+model.language_model.layers.22.linear_attn.conv1d.weight                    Q8_0         24576     7.5521e-7     4.7607e-3
+model.language_model.layers.4.linear_attn.conv1d.weight                     Q8_0         24576     5.5563e-7     4.1199e-3
+model.language_model.layers.12.linear_attn.conv1d.weight                    Q8_0         24576     5.3639e-7     4.7150e-3
+model.language_model.layers.5.linear_attn.conv1d.weight                     Q8_0         24576     4.3679e-7     5.2795e-3
+model.language_model.layers.2.linear_attn.conv1d.weight                     Q8_0         24576     3.8862e-7     5.1727e-3
+model.language_model.layers.13.linear_attn.conv1d.weight                    Q8_0         24576     3.6054e-7     2.8992e-3
+model.language_model.layers.6.linear_attn.conv1d.weight                     Q8_0         24576     3.5683e-7     3.3035e-3
+model.language_model.layers.14.linear_attn.conv1d.weight                    Q8_0         24576     3.4987e-7     2.7885e-3
+model.language_model.layers.8.linear_attn.conv1d.weight                     Q8_0         24576     2.9395e-7     2.8572e-3
+model.language_model.layers.1.linear_attn.conv1d.weight                     Q8_0         24576     2.8760e-7     7.0038e-3
+model.language_model.layers.0.linear_attn.conv1d.weight                     Q8_0         24576     2.8047e-7     6.5155e-3
+model.language_model.layers.10.linear_attn.conv1d.weight                    Q8_0         24576     2.7966e-7     5.1117e-3
+model.language_model.layers.9.linear_attn.conv1d.weight                     Q8_0         24576     2.5585e-7     4.1504e-3
+model.language_model.layers.9.linear_attn.norm.weight                        F16           128     1.7707e-7     9.5367e-4
+model.language_model.layers.14.linear_attn.norm.weight                       F16           128     1.6737e-7     9.1553e-4
+model.language_model.layers.13.linear_attn.norm.weight                       F16           128     1.5445e-7     8.5449e-4
+model.language_model.layers.12.linear_attn.norm.weight                       F16           128     1.4935e-7     9.1553e-4
+model.language_model.layers.6.linear_attn.norm.weight                        F16           128     1.4768e-7     9.1553e-4
+model.language_model.layers.10.linear_attn.norm.weight                       F16           128     1.4030e-7     8.5449e-4
+model.language_model.layers.22.linear_attn.norm.weight                       F16           128     1.3501e-7     9.1553e-4
+model.language_model.layers.8.linear_attn.norm.weight                        F16           128     1.1909e-7     9.1553e-4
+model.language_model.layers.0.linear_attn.norm.weight                        F16           128     9.6049e-8     9.6893e-4
+model.language_model.layers.5.linear_attn.norm.weight                        F16           128     9.0116e-8     8.5449e-4
+model.language_model.layers.2.linear_attn.norm.weight                        F16           128     6.6121e-8     8.5449e-4
+model.language_model.layers.1.linear_attn.norm.weight                        F16           128     5.8094e-8     9.1553e-4
+model.language_model.layers.4.linear_attn.norm.weight                        F16           128     4.1560e-8     8.5449e-4
+model.language_model.layers.0.linear_attn.in_proj_a.weight                  Q8_0         16384     4.0892e-8     7.0286e-4
+model.language_model.layers.16.linear_attn.norm.weight                       F16           128     3.9769e-8     9.4604e-4
+model.language_model.layers.22.linear_attn.in_proj_a.weight                 Q8_0         16384     3.4298e-8     8.5831e-4
+model.language_model.layers.21.linear_attn.in_proj_a.weight                 Q8_0         16384     2.8718e-8     8.0299e-4
+model.language_model.layers.20.linear_attn.in_proj_a.weight                 Q8_0         16384     2.8349e-8     7.9346e-4
+model.language_model.layers.1.linear_attn.in_proj_a.weight                  Q8_0         16384     2.8074e-8     7.7057e-4
+model.language_model.layers.2.linear_attn.in_proj_a.weight                  Q8_0         16384     2.5200e-8     7.7820e-4
+model.language_model.layers.4.linear_attn.in_proj_a.weight                  Q8_0         16384     2.2773e-8     6.7043e-4
+model.language_model.layers.17.linear_attn.in_proj_a.weight                 Q8_0         16384     2.1677e-8     8.4496e-4
+model.language_model.layers.12.linear_attn.in_proj_a.weight                 Q8_0         16384     2.1673e-8     6.3324e-4
+model.language_model.layers.9.linear_attn.in_proj_a.weight                  Q8_0         16384     2.0870e-8     9.6893e-4
+model.language_model.layers.16.linear_attn.in_proj_a.weight                 Q8_0         16384     2.0055e-8     5.9032e-4
+model.language_model.layers.21.linear_attn.norm.weight                       F16           128     1.8803e-8     7.3242e-4
+model.language_model.layers.18.linear_attn.in_proj_a.weight                 Q8_0         16384     1.8776e-8     7.6103e-4
+model.language_model.layers.10.linear_attn.in_proj_a.weight                 Q8_0         16384     1.8518e-8     6.6376e-4
+model.language_model.layers.5.linear_attn.in_proj_a.weight                  Q8_0         16384     1.8143e-8     5.8937e-4
+model.language_model.layers.19.self_attn.v_proj.weight                      Q8_0        524288     1.7930e-8     1.4267e-3
+model.language_model.layers.20.linear_attn.in_proj_qkv.weight               Q8_0       6291456     1.7795e-8     2.2240e-3
+model.language_model.layers.17.linear_attn.norm.weight                       F16           128     1.7084e-8     9.1553e-4
+
+=== Aggregate stats by quant type ===
+qt          tensors    total_params        mean MSE         p99 MSE         max MSE
+-------------------------------------------------------------------------------------
+F16             115           56128       1.4210e-8       1.6737e-7       1.7707e-7
+Q8_0            205       752336896       6.0176e-8       1.1542e-6       1.3623e-6
+
+=== Skipped ===
+  filter:           0
+  no safetensors:   0
+  3D expert:        0
