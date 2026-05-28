@@ -37,6 +37,40 @@ Honest end-to-end (smoke image, full layout to EOS) vs vLLM's ~15s target:
 | decode (4633 tok) | 62.3s | 62.3s | **34.8s** (133 tok/s) | warp-cooperative attention (3.5×) + fused gate+up |
 | **total** | ~139s | ~93s | **~60s** | |
 
+**Performance projection audit (2026-05-28):** The original projections in
+perf-investigation.md were calibrated against Strix Halo (gfx1151, 115 GB/s
+LPDDR5X). On gfx1100 (960 GB/s GDDR6), DRAM-bound bottlenecks have less
+headroom because transfers complete faster and compute becomes relatively
+more important. Key audit findings:
+
+- §4.1 "K-tile 16→64: expected 2-4×" → **actual +7.2%**. Overstated 28-56×
+  because per-tile fixed costs are tiny vs DRAM traffic on fast-BW hardware.
+- §4.2 "f16 K/V: expected +30-100%" → **actual +18%**. Upper bound was
+  unrealistic; bandwidth savings hit a compute floor.
+- §8.4 "M=64: expected ~2× DRAM halving" → **actual +53%**. DRAM halving
+  gives 1.5× at most because compute doesn't shrink.
+- §12 S_lds bank-conflict fix → **actual +31%**. Compiler couldn't vectorize
+  stride-128 f16 reads; bank conflicts were the real bottleneck.
+- §13 "v3 hoisted S_lds: expected 8× fewer reads" → **actual +2.6%**.
+  Compiler had already vectorized reads into `ds_read_b128`.
+- §14.1 "async V-load: +10-15% vision" → **revised: +5-10%** on gfx1100 (8×
+  more BW means less DRAM stall overlap).
+- §14.5 "causal WMMA+GQA: 5-10× text-prefill" → **revised: <1% total**.
+  Prefill is already 1.0s; even 10× speedup saves <0.5s of 60s total.
+- §14.6 "hipGraph: 1.5-2× decode" → **revised: +3-5% decode**. gfx1100
+  dispatch is ~340µs vs 7.5ms compute; only 4.5% of decode time.
+- §14.4 "M=128 sub-tiling: +15-25%" → **revised: +5-15%**. gfx1100's faster
+  BW means DRAM traffic reduction helps less; LDS/register pressure remains.
+
+Negative results from this session that invalidate future projections:
+- **v6 (split d_half, n_tile=128):** s_acc[4] overflow → NaN; s_acc[8] fix
+  correct but 5.7× slower than v5 due to 2× K-tile iterations.
+- **v6b (split d_half, n_tile=64):** 11.6× slower than v5 (4× total WMMA
+  iterations). **Conclusion: splitting head_dim into multiple passes NEVER
+  profits for full-softmax attention.** Softmax needs the complete 128-dim
+  dot product; each pass must scan the full K sequence. Any tiling that
+  increases total iteration count is a net loss.
+
 (`ocr_e2e` reports honest per-stage times since the async-drain timer fix; the
 decode-loop is timed in isolation. The "vision 49.7 / prefill 27.4" baselines
 above are post-fix — pre-fix the tool mis-reported prefill as 0.1s and decode
@@ -450,40 +484,49 @@ from DRAM every K-step, no LDS staging / no reuse) — matches the perf doc's
       per block). fc2 got 1.41×, qproj 1.16×, fc13 1.13×. Vision 32.2s
       → 29.5s. Benchmark: `test_mb8_shapes.rs`.
 
-**Remaining headroom (ranked for the next agent, post-warp+MB8):**
+**Remaining headroom (revised 2026-05-28 — recalibrated for gfx1100):**
 
 Current state (gfx1100, smoke image EOS):
-  vision 29.5s + prefill 1.1s + decode 34.9s = **~66s total, F1=1.000**
+  vision 24.2s + prefill 1.0s + decode 34.8s = **~60s total, F1=1.000**
 
-1. **Vision encoder** (29.5s, 45% of total). Breakdown from HIPFIRE_DOTS_OCR_TRACE:
-   - attention (42 layers × 275ms) = **11.5s** (39%)
-   - GEMM (4 GEMMs × 42 layers) = **13.4s** (45%)
-   - norm+rope+mlp+residual = **4.6s** (16%)
-   Vision GEMM is already MB8-optimized (1.16-1.41×). Vision attention
-   is the next target but V-staging in LDS is proven no-op. Consider:
-   kernel fusion (norm+rope fused), or async pipelining across layers.
-2. **Decode attention v2** (current `attention_gqa_warp` at 77µs/call,
-   2.4ms/token after reduce). rocprofv2 kernel-trace shows the warp kernel
-   saturates WMMA at the per-layer shapes. Further wins need a new
-   decomposition: split-K with online-softmax reduction (like the prefill
-   attention), or M-head-dim tiling. Low ROI (~0.5-1ms/token at best).
-3. **Vision attention §14.1–14.4** (perf-investigation.md — planned, never
-   implemented): async V-load (`global_load_lds`), V_lds transpose, N=256.
-   Current v3 kernel (M=64 N=128 f16-K/V O-reg + hoisted S-lds) at 275ms
-   handles the full 11.5s vision attention. V-staging in LDS is the latency
-   hider — reducing LDS is a proven no-op (don't retry).
-4. **Decode hipGraph** — parked in `git stash@{0}` + `~/decode-hipgraph-wip`
-   (gated `HIPFIRE_DECODE_GRAPH`). 53µs host-side launch overhead saved
-   per token on the gfx1151 Strix Halo (where dispatch is 76% of
-   per-token wall). On this gfx1100, launch overhead is ~340µs (trivial
-   vs 7.5ms GPU compute) — would give ~4% decode win at best.
-5. **QKV fusion** (3 separate GEMV launches → 1 fused launch). Saves
-   2 launches/layer × 28 layers × 0.6µs = 34µs total. ~0.5% decode
-   win. Not worth the kernel complexity.
-6. **Fuse silu+gate_up** (single kernel: load x once, compute silu(x_W_gate)*x_W_up
-   inline, write result). Eliminates 328MB reads + 1 launch per layer.
-   But vision GEMMs are WMMA (not GEMV) — fusing silu into a WMMA GEMM
-   epilogue adds complexity for ~10ms total savings.
+Projections below are calibrated for **gfx1100** (960 GB/s GDDR6, 96 CUs) —
+the Strix Halo (115 GB/s LPDDR5X) projections in perf-investigation.md §14.11
+overstated impact because DRAM stalls are a smaller fraction on faster BW.
+
+| Rank | Lever | Target | Revised impact | Complexity | Notes |
+|---:|---|---|---|---|---|
+| 1 | **QKV-cast fusion** (GEMM outputs f16 K/V directly) | Vision E2E | ~420ms saved (~0.7% total) | Medium | Independent of attention kernel; avoids separate cast kernel |
+| 2 | **V_lds transpose** (vectorize Phase C reads) | Vision attn | +5-10% attention (0.6-1.2s) | Low | LDS layout change; ds_read_b128 instead of 16× ds_read_u16 |
+| 3 | **Async V-load** (`global_load_lds`) | Vision attn | +5-10% attention (0.6-1.2s) | Medium | Overlap DRAM V-load with Phase A compute; less benefit on gfx1100 (960 GB/s) than Strix Halo (115 GB/s) |
+| 4 | **FP8/MFP4 K/V** | Vision attn | +20-40% attention (2.4-4.8s) | High | Needs accuracy validation; halves DRAM traffic again |
+| 5 | **M=128 two-pass sub-tiling** | Vision attn | +5-15% attention (0.6-1.8s) | Medium | Halves K+V DRAM traffic but less impact on gfx1100; increased LDS/register pressure |
+| 6 | **HIP graph capture** | Decode | +3-5% decode (~1-2s) | High | Stashed code exists; gfx1100 dispatch ~340µs is only 4.5% of decode |
+| 7 | **gfx1100 GQA chunk sweep** | Decode | +0-5% decode (0-1.7s) | Low | Just env var tuning; little data on gfx1100 | 
+| 8 | **Causal WMMA + GQA** (text prefill) | Text prefill | <1% total (<0.5s) | Medium | Prefill already 1.0s; 10× attention speedup saves <0.5s of 60s |
+| 9 | **Fused attention-reduce + o_proj** | Decode | +1-3% decode (~0.3-1s) | Low | Tiny DRAM saving; marginal launch saving |
+| 10 | **F16 KV cache** | Decode (long seq) | +0-5% decode (0-1.7s) | Low | Dispatch-dominated on gfx1100 at seq=5100; may help at 12k+ |
+
+**Approaches proven not to work (do not revisit):**
+- Split head_dim into multiple passes (v6/v6b): 11.6× slower. Softmax
+  requires complete 128-dim dot product; any tiling that increases total
+  iteration count is a net loss.
+- Reducing V_tile below 32 (approach 2a extreme): v5 at V_tile=32
+  already achieves 2 WG/CU (12.5% occupancy). V_tile=16 would need S_lds/V_lds
+  overlay for 3 WG/CU; diminishing returns.
+- Persistent WMMA GEMM kernels: regressed 0.2-0.24 TFLOP/s vs MB8 on
+  inference-sized batches.
+- V-staging into LDS: proven no-op on this DRAM-bound workload.
+- Increasing n_tile beyond 128: requires dropping V_lds entirely (4×
+  per-wave V traffic increase) or M=128+ sub-tiling; see rank 5.
+
+**Approaches with unclear ROI (need data):**
+- Norm+RoPE kernel fusion (vision elementwise ops are 4.6s = 16% of
+  vision wall; fusion might save 1-2s but requires careful correctness
+  gating).
+- Async pipelining across vision encoder layers (layer N's GEMM while
+  layer N-1's attention runs; requires double-buffering intermediate tensors).
+- Decode: split-K attention or M-head-dim tiling (~0.5-1ms/token best
+  case at current decode shapes).
 
 **Gotchas for the next agent:**
 - `sub_offset` on a `DType::Raw` tensor is BYTE-addressed — `fc13_proj` is Raw
