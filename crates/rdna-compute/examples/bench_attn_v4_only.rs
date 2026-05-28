@@ -33,14 +33,14 @@ fn main() {
     gpu.cast_f32_to_f16(&d_v, &d_v_f16).unwrap();
 
     // Warm-up (JIT compile the kernel).
-    gpu.attention_dflash_wmma_m64_n32_f16kv_v5_f32(
+    gpu.attention_dflash_wmma_m64_n32_f16kv_v6_f32(
         &d_q, &d_k_f16, &d_v_f16, &d_out,
         b, l, n_heads, n_kv_heads, hd,
     ).unwrap();
     gpu.hip.device_synchronize().unwrap();
 
     // Profiled dispatch — single call.
-    gpu.attention_dflash_wmma_m64_n32_f16kv_v5_f32(
+    gpu.attention_dflash_wmma_m64_n32_f16kv_v6_f32(
         &d_q, &d_k_f16, &d_v_f16, &d_out,
         b, l, n_heads, n_kv_heads, hd,
     ).unwrap();

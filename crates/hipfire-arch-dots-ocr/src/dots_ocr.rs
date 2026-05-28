@@ -1122,6 +1122,23 @@ pub fn vision_forward(
         // VGPRs/lane in WMMA frag_c layout) to free the LDS budget the
         // doubled query rows would have eaten.
         if use_wmma && head_dim == 128 && n_patches >= 64 {
+            // Debug: dump Q/K to disk for v6 replay testing (block 0 only)
+            if std::env::var("HIPFIRE_DOTS_OCR_ATTN_DUMP").ok().as_deref() == Some("1") && li == 0 {
+                let path = std::path::PathBuf::from("/tmp/attn_capture");
+                std::fs::create_dir_all(&path).ok();
+                let q_h = gpu.download_f32(&q_buf).unwrap();
+                let k_h = gpu.download_f32(&k_buf).unwrap();
+                let v_h = gpu.download_f32(&v_buf).unwrap();
+                std::fs::write(path.join("meta.bin"), &[n_patches as u8, (n_patches >> 8) as u8, (n_patches >> 16) as u8, 0]).ok();
+                let q_bytes: Vec<u8> = q_h.iter().flat_map(|v| v.to_le_bytes()).collect();
+                let k_bytes: Vec<u8> = k_h.iter().flat_map(|v| v.to_le_bytes()).collect();
+                let v_bytes: Vec<u8> = v_h.iter().flat_map(|v| v.to_le_bytes()).collect();
+                std::fs::write(path.join("q_f32.bin"), &q_bytes).ok();
+                std::fs::write(path.join("k_f32.bin"), &k_bytes).ok();
+                std::fs::write(path.join("v_f32.bin"), &v_bytes).ok();
+                eprintln!("[attn-dump] wrote Q/K/V block 0 to /tmp/attn_capture (n_patches={n_patches})");
+            }
+
             let k_f16 = gpu.alloc_tensor(&[n_patches, h], DType::F16)?;
             let v_f16 = gpu.alloc_tensor(&[n_patches, h], DType::F16)?;
             gpu.cast_f32_to_f16(&k_buf, &k_f16)?;

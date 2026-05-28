@@ -2,30 +2,41 @@
 // Copyright (c) 2026 Kevin Read
 // hipfire — see LICENSE and NOTICE in the project root.
 
-// v6 of attention_dflash_wmma — split head_dim into two d-halves.
-// Processes head_dim=128 in two passes of 64 dims each, reducing peak
-// VGPR from ~168 to ~120 and eliminating scratch spills (544→0 B).
+// v6b: split head_dim into two 64-dim passes with n_tile=64.
+// Each pass has s_acc[4] (n_tile/16=4, matching array size exactly).
 //
-// Trade-off: 2× K-tile iterations (2× K reads, 2× softmax) but each
-// iteration uses Q_frags[4]+s_acc[8]+O_frags[4] instead of [8]+[8].
+// vs v5:  halved n_tile (64 vs 128), doubled K-tile count (305 vs 153),
+//         halved Q_frags/O_frags/d_chunks (4 vs 8).
+// vs v6:  n_tile=64 (was 128), n_chunks=4 (was 8), so s_acc[4] is correct.
 //
-// LDS: 21.5 KB → 3 WG/CU, 12 waves/CU (18% occupancy).
+// LDS budget:
+//   V_lds: 32 × 64 × 2 =  4,096 B   (only 64 d-dims per pass)
+//   S_lds: 64 × 66 × 2 =  8,448 B   (stride 66: 64 active + 2 pad)
+//   scalars:           =    768 B
+//   Total:               13,312 B = 13 KB → 5 WGs/CU (5×13=65 < 64 KB)
+//   Actually 65 KB > 64 KB → 4 WGs/CU (4×13=52 < 64 KB).
+//
+// VGPR target: Q[4]+O[4]+s_acc[4] = 64+32+32 = 128 VGPR (bare minimum
+//  for Q+O+s_acc coexistence), leaving ~128 VGPR for Q_other + b_reg +
+//  temps + control flow. Realistic ~160–200 VGPR → 2–3 waves/SIMD.
+//
+// Softmax covers 64 K-columns per K-tile (stride 66, reads 2×32=64 elements).
 
 #include <hip/hip_runtime.h>
 
 typedef _Float16 __attribute__((ext_vector_type(16))) half16_t;
 typedef float    __attribute__((ext_vector_type(8)))  float8_t;
 
-constexpr int S_LDS_STRIDE = 130;
-constexpr int V_tile = 32; // same as v5
+constexpr int S_LDS_STRIDE  = 66;   // 64 active cols + 2 pad
+constexpr int V_tile        = 32;
+constexpr int d_half_chunks = 4;    // d_chunks per pass (64/16)
+constexpr int n_chunks      = 4;    // K-tile chunks (64/16)
+constexpr int n_tile        = 64;   // K-tile width
+constexpr int m_tile        = 64;   // query rows
+constexpr int v_chunks_per_ktile = 2;  // n_tile/V_tile = 64/32
 
-constexpr int d_half_chunks = 4;   // d_chunks per d-half (128/2/16)
-constexpr int n_chunks      = 8;   // K-tile chunks (128/16)
-constexpr int n_tile        = 128; // K-tile width
-constexpr int m_tile        = 64;  // query rows
-
-extern "C" __global__ void __launch_bounds__(128, 3)
-attention_dflash_wmma_m64_n32_f16kv_v6_f32(
+extern "C" __global__ void __launch_bounds__(128, 4)
+attention_dflash_wmma_m64_n32_f16kv_v6b_f32(
     const float* __restrict__ q,
     const _Float16* __restrict__ k,
     const _Float16* __restrict__ v,
@@ -35,7 +46,7 @@ attention_dflash_wmma_m64_n32_f16kv_v6_f32(
 ) {
     const int head = blockIdx.x;
     const int qt = blockIdx.y;
-    const int q_start = qt * 64;
+    const int q_start = qt * m_tile;
     const int tid = threadIdx.x;
 
     if (head >= n_heads || q_start >= B) return;
@@ -55,7 +66,7 @@ attention_dflash_wmma_m64_n32_f16kv_v6_f32(
 
     extern __shared__ float sdata[];
     _Float16* V_lds = (_Float16*)sdata;
-    _Float16* S_lds = (_Float16*)(V_lds + V_tile * 64); // only 64 dims per d_half
+    _Float16* S_lds = (_Float16*)(V_lds + V_tile * 64);  // V_tile × 64 dims
     float*    m_lds = (float*)(S_lds + m_tile * S_LDS_STRIDE);
     float*    l_lds = m_lds + m_tile;
     float*    alpha_lds = l_lds + m_tile;
@@ -66,33 +77,12 @@ attention_dflash_wmma_m64_n32_f16kv_v6_f32(
     for (int d_half = 0; d_half < 2; ++d_half) {
         const int d_base = d_half * 64;
 
-        // Barrier: ensure ALL threads have finished the previous d_half's
-        // finalize (which reads l_lds) before this iteration re-initializes
-        // m_lds/l_lds.
+        // Barrier: ensure all threads finished previous d_half's
+        // finalize (which reads l_lds) before we re-init.
         if (d_half > 0) __syncthreads();
 
-        // Load Q for this d_half into registers (4 × half16_t = 32 VGPR)
-        half16_t Q_frags[4];
-        {
-            #pragma unroll
-            for (int dc = 0; dc < d_half_chunks; ++dc) {
-                int d0 = d_base + dc * 16;
-                int gq = q_start + my_row_base + half;
-                const float* q_row = (gq < B)
-                    ? (q + gq * q_stride + head * head_dim)
-                    : nullptr;
-                if (q_row) {
-                    #pragma unroll
-                    for (int j = 0; j < 16; ++j) Q_frags[dc][j] = (_Float16)q_row[d0 + j];
-                } else {
-                    #pragma unroll
-                    for (int j = 0; j < 16; ++j) Q_frags[dc][j] = (_Float16)0.0f;
-                }
-            }
-        }
-
-        // Initialize O_frags and softmax state
-        float8_t O_frags[4];
+        // Initialize O_frags (output accumulator, stays in regs across all K-tiles)
+        float8_t O_frags[d_half_chunks];
         #pragma unroll
         for (int dc = 0; dc < d_half_chunks; ++dc) {
             O_frags[dc] = (float8_t){0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
@@ -103,20 +93,38 @@ attention_dflash_wmma_m64_n32_f16kv_v6_f32(
         }
         __syncthreads();
 
-        // Loop over K-tiles of width 128
+        // Loop over K-tiles of width 64
         for (int kt_start = 0; kt_start < L; kt_start += n_tile) {
 
             // ============================================================
-            // Phase A: Compute full QK^T across both d-halves
+            // Phase A: Compute full QK^T across both d-halves (64 K-cols)
             // ============================================================
-            float8_t s_acc[n_chunks];  // 8 K-chunks, NOT 4!
+            float8_t s_acc[n_chunks];  // 4 slots for 4 K-chunks ✓
             #pragma unroll
             for (int c = 0; c < n_chunks; ++c) {
                 s_acc[c] = (float8_t){0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
             }
 
-            // Current d_half contribution: use Q_frags already in registers
+            // Current d_half contribution: load Q into registers locally,
+            // so the compiler can alias with Q_other later (VGPR reuse).
             {
+                half16_t Q_cur[d_half_chunks];
+                #pragma unroll
+                for (int dc = 0; dc < d_half_chunks; ++dc) {
+                    int d0 = d_base + dc * 16;
+                    int gq = q_start + my_row_base + half;
+                    const float* q_row = (gq < B)
+                        ? (q + gq * q_stride + head * head_dim)
+                        : nullptr;
+                    if (q_row) {
+                        #pragma unroll
+                        for (int j = 0; j < 16; ++j) Q_cur[dc][j] = (_Float16)q_row[d0 + j];
+                    } else {
+                        #pragma unroll
+                        for (int j = 0; j < 16; ++j) Q_cur[dc][j] = (_Float16)0.0f;
+                    }
+                }
+
                 #pragma unroll
                 for (int kc = 0; kc < n_chunks; ++kc) {
                     int my_k = kt_start + kc * 16 + half;
@@ -135,15 +143,16 @@ attention_dflash_wmma_m64_n32_f16kv_v6_f32(
                             #pragma unroll
                             for (int j = 0; j < 16; ++j) b_reg[j] = (_Float16)0.0f;
                         }
-                        s_acc[kc] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(Q_frags[dc], b_reg, s_acc[kc]);
+                        s_acc[kc] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(Q_cur[dc], b_reg, s_acc[kc]);
                     }
                 }
             }
 
-            // Other d_half contribution: load Q from global memory
+            // Other d_half contribution: load Q from global memory.
+            // Q_cur is dead here — compiler can alias Q_cur and Q_oth VGPRs.
             {
                 const int other_base = (d_half == 0) ? 64 : 0;
-                half16_t Q_other[4];
+                half16_t Q_oth[d_half_chunks];
                 #pragma unroll
                 for (int dc = 0; dc < d_half_chunks; ++dc) {
                     int d0 = other_base + dc * 16;
@@ -153,10 +162,10 @@ attention_dflash_wmma_m64_n32_f16kv_v6_f32(
                         : nullptr;
                     if (q_row) {
                         #pragma unroll
-                        for (int j = 0; j < 16; ++j) Q_other[dc][j] = (_Float16)q_row[d0 + j];
+                        for (int j = 0; j < 16; ++j) Q_oth[dc][j] = (_Float16)q_row[d0 + j];
                     } else {
                         #pragma unroll
-                        for (int j = 0; j < 16; ++j) Q_other[dc][j] = (_Float16)0.0f;
+                        for (int j = 0; j < 16; ++j) Q_oth[dc][j] = (_Float16)0.0f;
                     }
                 }
 
@@ -178,12 +187,13 @@ attention_dflash_wmma_m64_n32_f16kv_v6_f32(
                             #pragma unroll
                             for (int j = 0; j < 16; ++j) b_reg[j] = (_Float16)0.0f;
                         }
-                        s_acc[kc] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(Q_other[dc], b_reg, s_acc[kc]);
+                        s_acc[kc] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(Q_oth[dc], b_reg, s_acc[kc]);
                     }
                 }
             }
+            // Q_cur and Q_oth are both dead here.
 
-            // Write S to LDS (f16 padded stride)
+            // Write S to LDS (f16, stride 66)
             #pragma unroll
             for (int c = 0; c < n_chunks; ++c) {
                 int s_col = c * 16 + half;
@@ -196,18 +206,20 @@ attention_dflash_wmma_m64_n32_f16kv_v6_f32(
                     S_lds[s_row * S_LDS_STRIDE + s_col] = (_Float16)s_val_f32;
                 }
             }
+            // s_acc is dead here — compiler can alias with Phase C regs.
 
             // ============================================================
-            // Phase B: Cooperative wave-32 softmax (same as v5)
+            // Phase B: Cooperative wave-32 softmax (64 columns)
             // ============================================================
             #pragma unroll 1
             for (int r_local = 0; r_local < 16; ++r_local) {
                 int row = my_row_base + r_local;
                 _Float16* s_row = S_lds + row * S_LDS_STRIDE;
 
+                // Scan 64 elements (2 × 32) instead of 128 (4 × 32) as in v5.
                 float local_max = -INFINITY;
                 #pragma unroll
-                for (int kk = 0; kk < 4; ++kk) {
+                for (int kk = 0; kk < 2; ++kk) {
                     int idx = lane + kk * 32;
                     local_max = fmaxf(local_max, (float)s_row[idx]);
                 }
@@ -224,7 +236,7 @@ attention_dflash_wmma_m64_n32_f16kv_v6_f32(
 
                 float local_sum = 0.0f;
                 #pragma unroll
-                for (int kk = 0; kk < 4; ++kk) {
+                for (int kk = 0; kk < 2; ++kk) {
                     int idx = lane + kk * 32;
                     float e = expf((float)s_row[idx] - m_new);
                     s_row[idx] = (_Float16)e;
@@ -245,7 +257,7 @@ attention_dflash_wmma_m64_n32_f16kv_v6_f32(
             __syncthreads();
 
             // ============================================================
-            // Phase C: Alpha-fold + SV accumulation (only current d_half)
+            // Phase C: Alpha-fold + SV accumulation (64 d-dims, 2 v-chunks)
             // ============================================================
             #pragma unroll
             for (int dc = 0; dc < d_half_chunks; ++dc) {
@@ -257,11 +269,12 @@ attention_dflash_wmma_m64_n32_f16kv_v6_f32(
                 }
             }
 
-            // Process V in 4 chunks of 32 keys each
-            for (int v_chunk = 0; v_chunk < 4; ++v_chunk) {
+            // Process V in 2 chunks of 32 keys each (n_tile=64 / V_tile=32)
+            #pragma unroll
+            for (int v_chunk = 0; v_chunk < v_chunks_per_ktile; ++v_chunk) {
                 int v_start = v_chunk * V_tile;
 
-                // Stage V into V_lds (f16). Only current d_half's 64 dims.
+                // Stage V into V_lds: only this d_half's 64 dims.
                 for (int kr_local = 0; kr_local < 8; ++kr_local) {
                     int kr = wave * 8 + kr_local;
                     int gk = kt_start + v_start + kr;
@@ -272,12 +285,12 @@ attention_dflash_wmma_m64_n32_f16kv_v6_f32(
                     for (int dd = 0; dd < 64; dd += 32) {
                         int d = dd + lane;
                         _Float16 vv = v_row ? v_row[d] : (_Float16)0.0f;
-                        V_lds[kr * 64 + d] = vv; // stride=64 for this d_half
+                        V_lds[kr * 64 + d] = vv;
                     }
                 }
                 __syncthreads();
 
-                // SV accumulation
+                // SV accumulation: 2 S-chunks per v_chunk (32 K-cols)
                 #pragma unroll
                 for (int c = 0; c < n_chunks; ++c) {
                     int s_col_base = c * 16;
