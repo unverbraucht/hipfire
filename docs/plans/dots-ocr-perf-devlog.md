@@ -32,10 +32,10 @@ Honest end-to-end (smoke image, full layout to EOS) vs vLLM's ~15s target:
 
 | stage | session start | after prior agent | **now** | how |
 |---|---|---|---|---|
-| vision  | 49.6s | 29.6s | **28.3s** | v4 integrated + dispatch launch-bounds fix |
+| vision  | 49.6s | 29.6s | **24.2s** | v5 attention (V_tile=32, 2 WG/CU achieved, 1.44× faster) |
 | prefill | 27.4s | 1.0s | **1.0s**  | wired gfx11 WMMA Q8 GEMMs (25×) |
 | decode (4633 tok) | 62.3s | 62.3s | **34.8s** (133 tok/s) | warp-cooperative attention (3.5×) + fused gate+up |
-| **total** | ~139s | ~93s | **~64s** | |
+| **total** | ~139s | ~93s | **~60s** | |
 
 (`ocr_e2e` reports honest per-stage times since the async-drain timer fix; the
 decode-loop is timed in isolation. The "vision 49.7 / prefill 27.4" baselines
@@ -667,3 +667,50 @@ return empty results under rocprofv2 7.2.3 and rocprofv3 7.13). Only
 kernel-trace static metadata (VGPR, LDS, scratch, duration) is reliable.
 
 **Next**: Implement approach 2a (V_tile 64→32).
+
+## 2026-05-28 — V5 attention: V_tile 32, 2 WG/CU achieved (147 ms, 1.44× faster)
+
+Implemented approach 2a: `attention_dflash_wmma_m64_n32_f16kv_v5_f32`.
+
+**Changes** from v4:
+- V_tile = 32 (was 64)
+- V_lds: 8 KB (was 16 KB)
+- Total LDS: 25.6 KB (was 33.4 KB)
+- 4 V-chunks per K-tile (was 2)
+- Each wave loads 8 V-rows (was 16)
+
+**rocprofv2 kernel trace** (warm dispatch, seq_len=19520):
+
+| Metric | v4 | v5 | Change |
+|--------|----|----|--------|
+| Duration | 212.2 ms | **147.3 ms** | 1.44× |
+| LDS | 33,792 B | **25,600 B** | −24% |
+| VGPR | 192 | **168** | −24 |
+| Scratch | 544 B | 544 B | same |
+| WGs/CU | 1 | **2** | 2× |
+| waves/CU | 4 (6%) | **8 (12%)** | 2× |
+
+**E2E results** (F1=1.000, 13/13 exact match, PASS):
+- Vision encoder: 28.3s → **24.2s** (1.17×, saved 4.1s)
+- Attention/block: 216 ms → **150 ms** (1.44×)
+- Total: ~64s → **~60s**
+
+Per-block trace (block 0):
+- attention_dflash: 150 ms (was 216)
+- qkv GEMM: 100 ms (unchanged)
+- fc13+silu: 205 ms (unchanged)
+- fc2 GEMM: 91 ms (unchanged)
+
+**Bench sweep** (all variants, seq_len=19520):
+
+| Kernel | ms/call |
+|--------|--------|
+| M=64 N=128 v3 | 276 |
+| M=64 N=64 v4 | 213 |
+| **M=64 N=32 v5** | **163** |
+
+**Remaining headroom**:
+- Scratch 544 B/lane still present (136 VGPR spills)
+- Approach 1 (split head_dim 128→2×64) would reduce VGPRs to ~128, pushing to 4 waves/SIMD
+- Stacking approach 1 on top of 2a: 2 WG/CU × 4 waves/SIMD = 16 waves/CU (25% occupancy)
+- Could further reduce attention to ~100 ms, saving another ~2s off vision

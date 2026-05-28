@@ -1126,7 +1126,7 @@ pub fn vision_forward(
             let v_f16 = gpu.alloc_tensor(&[n_patches, h], DType::F16)?;
             gpu.cast_f32_to_f16(&k_buf, &k_f16)?;
             gpu.cast_f32_to_f16(&v_buf, &v_f16)?;
-            gpu.attention_dflash_wmma_m64_n64_f16kv_v4_f32(
+            gpu.attention_dflash_wmma_m64_n32_f16kv_v5_f32(
                 &q_buf, &k_f16, &v_f16, &attn,
                 n_patches, n_patches, n_heads, n_heads, head_dim,
             )?;
