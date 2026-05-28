@@ -1,17 +1,22 @@
 //! Focused bench harness for vision-encoder attention shapes.
 //!
-//! Runs `attention_dflash_wmma_f32` (M=16) and `attention_dflash_wmma_m32_f32`
-//! at the dots.ocr smoke-image shape (B=L=19520, head_dim=128, n_heads=12,
-//! n_kv_heads=12 — vision is self-attention with full per-head KV). Warm-up
-//! iter + N timed iters. Designed for `rocprofv3 --kernel-include-regex` to
-//! pin down the actual hot kernel without the parity-sweep noise.
+//! Benchmarks the production attention kernels at the dots.ocr smoke-image
+//! shape (B=L=19520, head_dim=128, n_heads=12, n_kv_heads=12 — vision is
+//! self-attention with full per-head KV).
+//!
+//! Kept variants:
+//!   - M=16, M=32 scalar fallbacks (still used for small configs)
+//!   - v3 (M=64 N=128, hoisted S_lds — base for v3_causal in qwen2)
+//!   - v5 (M=64 N=32, V_tile=32 — production for dots-ocr vision)
+//!
+//! Removed variants (2026-05-28 cleanup):
+//!   - v1 (baseline n128): superseded by v3
+//!   - v2 (pad+coop softmax): intermediate step to v3
+//!   - v4 (n64 V_tile): insight (V_tile reduction) now in v5
+//!   - v6/v6b (split d_half): 11.6× slower than v5, negative result
 //!
 //! Usage:
 //!     ./target/release/examples/bench_attention_vision [--iters N]
-//!
-//! Default 3 iters of each kernel. With `rocprofv3 --pmc <list> --` the
-//! counters are summed over all kernel invocations matching the kernel
-//! regex; pick whichever counters you care about.
 
 use rdna_compute::{DType, Gpu};
 
@@ -63,18 +68,14 @@ fn main() {
     gpu.cast_f32_to_f16(&d_k, &d_k_f16).unwrap();
     gpu.cast_f32_to_f16(&d_v, &d_v_f16).unwrap();
 
-    // Warm-up.
+    // Warm-up: all kernels that will be benchmarked.
     gpu.attention_dflash_wmma_f32(&d_q, &d_k, &d_v, &d_out, b, l, n_heads, n_kv_heads, hd).unwrap();
     gpu.attention_dflash_wmma_m32_f32(&d_q, &d_k, &d_v, &d_out, b, l, n_heads, n_kv_heads, hd).unwrap();
     gpu.attention_dflash_wmma_n64_f32(&d_q, &d_k, &d_v, &d_out, b, l, n_heads, n_kv_heads, hd).unwrap();
     gpu.attention_dflash_wmma_n64_f16kv_f32(&d_q, &d_k_f16, &d_v_f16, &d_out, b, l, n_heads, n_kv_heads, hd).unwrap();
     gpu.attention_dflash_wmma_n128_f16kv_f32(&d_q, &d_k_f16, &d_v_f16, &d_out, b, l, n_heads, n_kv_heads, hd).unwrap();
-    gpu.attention_dflash_wmma_m64_n128_f16kv_f32(&d_q, &d_k_f16, &d_v_f16, &d_out, b, l, n_heads, n_kv_heads, hd).unwrap();
-    gpu.attention_dflash_wmma_m64_n128_f16kv_v2_f32(&d_q, &d_k_f16, &d_v_f16, &d_out, b, l, n_heads, n_kv_heads, hd).unwrap();
     gpu.attention_dflash_wmma_m64_n128_f16kv_v3_f32(&d_q, &d_k_f16, &d_v_f16, &d_out, b, l, n_heads, n_kv_heads, hd).unwrap();
-    gpu.attention_dflash_wmma_m64_n64_f16kv_v4_f32(&d_q, &d_k_f16, &d_v_f16, &d_out, b, l, n_heads, n_kv_heads, hd).unwrap();
     gpu.attention_dflash_wmma_m64_n32_f16kv_v5_f32(&d_q, &d_k_f16, &d_v_f16, &d_out, b, l, n_heads, n_kv_heads, hd).unwrap();
-    gpu.attention_dflash_wmma_m64_n32_f16kv_v6_f32(&d_q, &d_k_f16, &d_v_f16, &d_out, b, l, n_heads, n_kv_heads, hd).unwrap();
     gpu.hip.device_synchronize().unwrap();
 
     let t = std::time::Instant::now();
@@ -114,20 +115,6 @@ fn main() {
 
     let t = std::time::Instant::now();
     for _ in 0..iters {
-        gpu.attention_dflash_wmma_m64_n128_f16kv_f32(&d_q, &d_k_f16, &d_v_f16, &d_out, b, l, n_heads, n_kv_heads, hd).unwrap();
-    }
-    gpu.hip.device_synchronize().unwrap();
-    eprintln!("M=64 N=128 f16-K/V O-reg wmma:    {:.1} ms / iter ({iters} iters)", t.elapsed().as_secs_f32() * 1000.0 / iters as f32);
-
-    let t = std::time::Instant::now();
-    for _ in 0..iters {
-        gpu.attention_dflash_wmma_m64_n128_f16kv_v2_f32(&d_q, &d_k_f16, &d_v_f16, &d_out, b, l, n_heads, n_kv_heads, hd).unwrap();
-    }
-    gpu.hip.device_synchronize().unwrap();
-    eprintln!("M=64 N=128 v2 (pad+coop softmax): {:.1} ms / iter ({iters} iters)", t.elapsed().as_secs_f32() * 1000.0 / iters as f32);
-
-    let t = std::time::Instant::now();
-    for _ in 0..iters {
         gpu.attention_dflash_wmma_m64_n128_f16kv_v3_f32(&d_q, &d_k_f16, &d_v_f16, &d_out, b, l, n_heads, n_kv_heads, hd).unwrap();
     }
     gpu.hip.device_synchronize().unwrap();
@@ -135,24 +122,10 @@ fn main() {
 
     let t = std::time::Instant::now();
     for _ in 0..iters {
-        gpu.attention_dflash_wmma_m64_n64_f16kv_v4_f32(&d_q, &d_k_f16, &d_v_f16, &d_out, b, l, n_heads, n_kv_heads, hd).unwrap();
-    }
-    gpu.hip.device_synchronize().unwrap();
-    eprintln!("M=64 N=64  v4 (V_tile=64, 2 WG/CU): {:.1} ms / iter ({iters} iters)", t.elapsed().as_secs_f32() * 1000.0 / iters as f32);
-
-    let t = std::time::Instant::now();
-    for _ in 0..iters {
         gpu.attention_dflash_wmma_m64_n32_f16kv_v5_f32(&d_q, &d_k_f16, &d_v_f16, &d_out, b, l, n_heads, n_kv_heads, hd).unwrap();
     }
     gpu.hip.device_synchronize().unwrap();
-    eprintln!("M=64 N=32  v5 (V_tile=32, 2 WG/CU real): {:.1} ms / iter ({iters} iters)", t.elapsed().as_secs_f32() * 1000.0 / iters as f32);
-
-    let t = std::time::Instant::now();
-    for _ in 0..iters {
-        gpu.attention_dflash_wmma_m64_n32_f16kv_v6_f32(&d_q, &d_k_f16, &d_v_f16, &d_out, b, l, n_heads, n_kv_heads, hd).unwrap();
-    }
-    gpu.hip.device_synchronize().unwrap();
-    eprintln!("M=64 N=32  v6 (split d_half, 0 spill):  {:.1} ms / iter ({iters} iters)", t.elapsed().as_secs_f32() * 1000.0 / iters as f32);
+    eprintln!("M=64 N=32  v5 (V_tile=32, 2 WG/CU): {:.1} ms / iter ({iters} iters)", t.elapsed().as_secs_f32() * 1000.0 / iters as f32);
 
     gpu.free_tensor(d_q).unwrap();
     gpu.free_tensor(d_k).unwrap();

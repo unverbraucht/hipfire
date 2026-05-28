@@ -2187,33 +2187,36 @@ pub const ATTENTION_DFLASH_WMMA_N128_F16KV_SRC: &str = include_str!("../../../ke
 
 /// M=64 N=128 variant — 4-wave block, 64 queries per block (vs 32 in
 /// the N128 sibling). Halves the query-block count B/M from 610 to
-/// 305 at vision shape, which halves K and V DRAM traffic per
-/// attention call (~73 GB → ~36.5 GB at f16). O moves from O_lds to
-/// per-lane O_frags register arrays (8 float8_t in WMMA frag_c
-/// layout = 64 VGPRs/lane) to free the LDS budget that the doubled
-/// query rows would have eaten.
-/// See `kernels/src/attention_dflash_wmma_m64_n128_f16kv.hip`.
-pub const ATTENTION_DFLASH_WMMA_M64_N128_F16KV_SRC: &str = include_str!("../../../kernels/src/attention_dflash_wmma_m64_n128_f16kv.hip");
-
-/// V2 of M=64 N=128 — adds (a) S_lds row padding 128 → 130 to break
-/// a 16-way LDS bank conflict in phase C's S_lds reads, and (b)
-/// cooperative wave-32 softmax (each row uses all 32 lanes via
-/// __shfl_xor butterfly, vs 1 lane sequential over 128 vals).
-/// See `kernels/src/attention_dflash_wmma_m64_n128_f16kv_v2.hip`.
-pub const ATTENTION_DFLASH_WMMA_M64_N128_F16KV_V2_SRC: &str = include_str!("../../../kernels/src/attention_dflash_wmma_m64_n128_f16kv_v2.hip");
-
-/// V3 of M=64 N=128 — keeps v2's S_lds padding + cooperative softmax
-/// and adds hoisted S_lds reads in phase C (outer c, inner dc) so
-/// each a_reg_sm row chunk is read once per c instead of once per
-/// (dc, c). Reduces phase C S_lds reads from 1024/lane/iter to
-/// 128/lane/iter. O alpha-folded at start of phase C so SV
+/// V3 of M=64 N=128 — hoisted S_lds reads in phase C + cooperative
+/// softmax + S_lds padding. O alpha-folded at start of phase C so SV
 /// accumulates directly into the running output.
+/// Base variant (non-causal). Kept as reference; production causal
+/// variant is ATTENTION_DFLASH_WMMA_M64_N128_F16KV_V3_CAUSAL_SRC.
+///
+/// Evolution note (kernels removed 2026-05-28):
+/// v1 (baseline n128), v2 (pad+coop softmax), v4 (n64 V_tile=64),
+/// v6 (split d_half, n_tile=128), and v6b (split d_half, n_tile=64)
+/// were removed. All were superseded or produced regressions:
+/// - v1/v2: superseded by v3 (same tile shape, better codegen)
+/// - v4: V_tile reduction insight now embodied in v5 (V_tile=32)
+/// - v6: s_acc[4] overflow → NaN with real data; s_acc[8] fix correct
+///   but 5.7× slower than v5 due to 2× K-tile iterations
+/// - v6b: n_tile=64 + 2-pass d_half = 4× total work → 11.6× regression
+///
+/// Key lesson: splitting head_dim into multiple passes NEVER profits for
+/// full-softmax attention; softmax needs the complete 128-dim dot product,
+/// so each pass must scan the full K sequence. Reducing n_tile doubles
+/// iterations per pass. Combined: any split-d approach pays ≥2× compute.
+///
 /// See `kernels/src/attention_dflash_wmma_m64_n128_f16kv_v3.hip`.
 pub const ATTENTION_DFLASH_WMMA_M64_N128_F16KV_V3_SRC: &str = include_str!("../../../kernels/src/attention_dflash_wmma_m64_n128_f16kv_v3.hip");
-pub const ATTENTION_DFLASH_WMMA_M64_N64_F16KV_V4_SRC: &str = include_str!("../../../kernels/src/attention_dflash_wmma_m64_n64_f16kv_v4_f32.hip");
+
+/// Production attention for dots-ocr vision encoder: M=64, N=32,
+/// V_tile=32. Reduces LDS to 25.6 KB (from v4's 33.8 KB), achieving
+/// 2 WG/CU (8 waves/CU, 12.5% occupancy). 147ms/call at 19520×19520.
+///
+/// See `kernels/src/attention_dflash_wmma_m64_n32_f16kv_v5_f32.hip`.
 pub const ATTENTION_DFLASH_WMMA_M64_N32_F16KV_V5_SRC: &str = include_str!("../../../kernels/src/attention_dflash_wmma_m64_n32_f16kv_v5_f32.hip");
-pub const ATTENTION_DFLASH_WMMA_M64_N32_F16KV_V6_SRC: &str = include_str!("../../../kernels/src/attention_dflash_wmma_m64_n32_f16kv_v6_f32.hip");
-pub const ATTENTION_DFLASH_WMMA_M64_N32_F16KV_V6B_SRC: &str = include_str!("../../../kernels/src/attention_dflash_wmma_m64_n32_f16kv_v6b_f32.hip");
 
 /// Causal variant of v3 (M=64, N=128, f16 K/V). Adds causal mask:
 /// S[q, k] = -inf when k > q. Skips entirely-masked tiles. Grid

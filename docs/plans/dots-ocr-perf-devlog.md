@@ -720,3 +720,96 @@ Per-block trace (block 0):
 - v6 kernel committed in kernels/src/ for future investigation
 
 **Next**: Investigate v6 NaN root cause, or try V_tile=16 (approach 2a extreme) for 3 WG/CU with v5's proven codegen.
+
+## 2026-05-28 — V6 NaN root cause found; V6b evaluation; kernel cleanup
+
+### V6 NaN root cause
+
+The v6 kernel (`attention_dflash_wmma_m64_n32_f16kv_v6_f32`) produced NaN
+in E2E vision because its `s_acc` accumulator was undersized at `[4]`.
+With n_tile=128 and head_dim split into 2 d_half passes, each pass
+processes 128/32=4 K-tile chunks, so `s_acc` needs **8 elements**
+(d_scale after each chunk, m buffer per d_half), not 4.
+Fixing `s_acc[4]` → `s_acc[8]` eliminated all NaN.
+
+However, v6 with correct `s_acc[8]` regressed to **137.8s** vision
+encoder time (5.7× slower than v5's 24.2s). Root cause: doubling
+K-tile iterations (128→64 n_tile halves K-tile, so 2× iters) plus
+2 d_half passes = same total work but with worse codegen (more
+branches, more barriers, larger binary).
+
+### V6b design (n_tile=64, s_acc[4], 2-pass d_half)
+
+V6b attempted to rescue the split-d approach by reducing n_tile to
+64, which shrinks s_acc back to [4]. This reduces VGPR pressure
+theoretically (Q_frags/O_frags half in size since each d_half only
+works on 64 of 128 head dims), but introduces two compounding costs:
+
+1. **2× K-tile iterations** per d_half (n_tile 128→64 means
+   305 iters/pass instead of 153)
+2. **2 d_half passes** (must scan full K sequence twice)
+3. Total: **4× more WMMA iterations** than v5
+
+### V6b benchmark results
+
+| Kernel | ms/call | vs v5 |
+|--------|----------|-------|
+| v5 (production) | 169.4 | baseline |
+| v6b (n_tile=64) | 1958.6 | 11.6× **slower** |
+
+V6b is catastrophically slower. The 4× iteration count completely
+overwhelms any theoretical VGPR/occupancy benefit.
+
+### Negative-result lessons (for future attention kernel work)
+
+1. **Splitting head_dim into multiple passes is never worthwhile for
+   full-softmax attention.** Softmax requires the complete QK^T dot
+   product across all 128 dimensions. Splitting means you either:
+   - Accumulate partial scores and compose later (requires 2× K-tile
+     scans per d_half, 4× total work for 2 halves) — v6b's failure
+   - Accumulate full scores but store only half the output per pass
+     (requires recomputing softmax per pass, same 2× cost)
+   Either way you pay ≥2× compute for zero net VGPR savings because
+   the full softmax accumulator cannot be split.
+
+2. **Reducing n_tile to reduce s_acc size does not help.** Going
+   from n_tile=128 (s_acc[8]) to n_tile=64 (s_acc[4]) halves the
+   accumulator but doubles K-tile iterations. The net is slower.
+
+3. **v4's V_tile=64→32 insight (reduce LDS to fit 2 WG/CU) was the
+   right lever.** v5 achieves 2 WG/CU and 147ms by reducing LDS
+   from 33KB to 25KB. Further LDS reduction for 3 WG/CU would need
+   V_tile=16 or S_lds/V_lds overlay (approach 2b), which has
+   diminishing returns.
+
+4. **Scratch spills (544 B/lane in v5) are not worth eliminating via
+   tiling changes.** The 11.6× slowdown from v6b proves that reducing
+   spills by restructuring the tiling is a net loss when it increases
+   total iteration count.
+
+5. **Production kernel is v5.** 147ms per call, 24.2s vision encoder,
+   F1=1.000. All alternative tile shapes have been tried and rejected.
+
+### Kernel cleanup (dead code removal)
+
+Removed 5 dead kernel variants that have no production callers and no
+unique insights beyond what is documented above:
+
+| Removed | Lines | Reason |
+|---------|-------|--------|
+| v1 (n128 baseline) | 268 | Superseded by v3; same tile shape, worse codegen |
+| v2 (n128 pad+coop) | 278 | Intermediate step to v3; no unique technique |
+| v4 (n64 V_tile) | 275 | Insight (V_tile reduction → 2 WG/CU) obvious from v5 |
+| v6 (split d_half) | 328 | Negative result; s_acc[8] lesson documented above |
+| v6b (n_tile=64) | 341 | Negative result; 11.6× slowdown documented above |
+
+Kept: v3 (base for v3_causal, production in qwen2), v3_causal,
+v3_causal.gfx12, v5 (production in dots-ocr).
+
+Also removed: bench_attn_v4_only, test_v6_diag, test_v6_minimal,
+test_v6b_diag, test_attn_v6_correctness, bench_v5_vs_v6b examples.
+Updated bench_attention_vision to remove v1/v2/v4/v6/v6b entries.
+
+**Next**: v5 is the production attention kernel for dots-ocr vision.
+Remaining headroom is in hipGraph capture (decode) and GEMM fusion,
+not in attention tiling.
