@@ -280,55 +280,7 @@ Token-attractor root cause (calibration retrain) deferred. Smoke
 test: tool-calling prompt against `qwen3.5-9b.mq4` should never
 return raw `<tool_call>` text in `message.content`.
 
-### D. GPU Power Management (Performance Pitfall)
-
-**Symptom**: Vision encoder or compute-heavy workloads run 2-5× slower than expected, while decode performance appears normal. Power consumption abnormally low (80-90W instead of 300W+).
-
-**Root cause**: Two separate GPU power controls must be optimized:
-
-1. **power_dpm_force_performance_level** - Must be "high" or "manual"
-2. **pp_power_profile_mode** - Must be COMPUTE (index 5), not BOOTUP_DEFAULT (index 0)
-
-The `pp_power_profile_mode` is often overlooked but critical. BOOTUP_DEFAULT uses conservative power limits that prevent the GPU from sustaining peak clocks during sustained workloads. COMPUTE profile allows the GPU to maintain 300W+ power draw.
-
-**Detection**: Check current power state:
-```bash
-# Check power profile mode
-cat /sys/class/drm/card*/device/pp_power_profile_mode | grep '\*'
-
-# Check performance level
-cat /sys/class/drm/card*/device/power_dpm_force_performance_level
-
-# Monitor actual power consumption
-rocm-smi --showpower
-```
-
-Expected output for optimal performance:
-- pp_power_profile_mode: ` 5        COMPUTE*:` (COMPUTE active)
-- power_dpm_force_performance_level: `high` or `manual`
-- Graphics Package Power: 250-350W under full load
-
-**Fix**: Set both controls to optimal state:
-```bash
-# Set COMPUTE power profile (most important for sustained workloads)
-echo 5 | sudo tee /sys/class/drm/card*/device/pp_power_profile_mode
-
-# Also ensure high performance level
-echo high | sudo tee /sys/class/drm/card*/device/power_dpm_force_performance_level
-```
-
-**Pre-flight check**: Hipfire now warns at startup if `pp_power_profile_mode != COMPUTE` or `power_dpm_force_performance_level != high`. Override with `HIPFIRE_SKIP_POWER_CHECK=1` if intentional.
-
-**Impact**: Switching to COMPUTE profile typically yields 2-3× speedup on vision encoder (29s → 12-15s). Decode also benefits from sustained higher clocks. Power consumption increases to expected levels (250-350W on RX 7900 XTX).
-
-**Persistence**: These settings are reset on every reboot. Add to `/etc/rc.local` or systemd service for persistence:
-```bash
-echo "Setting GPU to COMPUTE power profile..."
-echo 5 > /sys/class/drm/card1/device/pp_power_profile_mode
-echo high > /sys/class/drm/card1/device/power_dpm_force_performance_level
-```
-
-### E. Inherited from v0.1.8 (still load-bearing)
+### D. Inherited from v0.1.8 (still load-bearing)
 
 - **Phase 1: prompt-shape adaptation — DEFAULT ON (2026-04-26)**
 

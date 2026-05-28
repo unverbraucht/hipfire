@@ -591,66 +591,6 @@ impl Gpu {
         }
         eprintln!("GPU dev {}: {} ({:.1} GB VRAM, HIP {}.{})", id, arch, vram_total as f64 / 1e9, hip_major, hip_minor);
 
-        // Preflight: check GPU power management (warn if not optimal).
-        // Only warns — does not block init. Override with HIPFIRE_SKIP_POWER_CHECK=1.
-        //
-        // Two independent sysfs settings control GPU power on AMD (gfx1100+):
-        //   1. power_dpm_force_performance_level: 'low' | 'high' | 'manual'
-        //      Controls DPM floor — 'low' forces lowest clocks.
-        //   2. pp_power_profile_mode: 0=BOOTUP_DEFAULT, 1=3D_FULL_SCREEN,
-        //      2=POWER_SAVING, 3=VIDEO, 4=VR, 5=COMPUTE, 6=CUSTOM, 7=WINDOW_3D.
-        //      Controls the clock-ramp response curve (MinActiveFreq, BoosterFreq).
-        //      BOOTUP_DEFAULT is *passive* — the GPU only ramps up under sustained
-        //      heavy load. Vision-encoder workloads are bursty (mix of tiny
-        //      norm/rope kernels and big GEMMs) and trigger ramp-up delays that
-        //      inflate per-block wall time 2-5x. COMPUTE sets MinActiveFreq=2 (1 GHz)
-        //      which keeps clocks high between bursts.
-        //
-        // Both must be correct: 'high' perf level + 'COMPUTE' profile.
-        // Critical on integrated laptop GPUs (Strix Halo) and bursty vision
-        // workloads. Discrete dGPU (RX 7900 XTX) still shows 10-30% slowdown
-        // under BOOTUP_DEFAULT for bursty kernels.
-        if std::env::var("HIPFIRE_SKIP_POWER_CHECK").is_err() {
-            let (perf_level, profile_mode) = (0..4)
-                .find_map(|i| {
-                    let perf = std::fs::read_to_string(format!(
-                        "/sys/class/drm/card{i}/device/power_dpm_force_performance_level"
-                    )).ok().map(|s| s.trim().to_string());
-                    let prof = std::fs::read_to_string(format!(
-                        "/sys/class/drm/card{i}/device/pp_power_profile_mode"
-                    )).ok();
-                    perf.map(|p| (p, prof))
-                })
-                .unwrap_or_else(|| ("n/a".into(), None));
-
-            let active_profile = profile_mode.as_deref()
-                .and_then(|s| s.lines().find(|l| l.contains('*')))
-                .and_then(|l| l.split_whitespace().nth(1))
-                .map(|name| name.trim_end_matches(|c| c == '*' || c == ':'))
-                .unwrap_or("unknown");
-
-            let perf_ok = perf_level == "high" || perf_level == "manual";
-            let profile_ok = active_profile == "COMPUTE";
-
-            if !perf_ok {
-                eprintln!("WARNING: GPU power_dpm_force_performance_level = {perf_level} (expected 'high').");
-                eprintln!("  Fix: echo high | sudo tee /sys/class/drm/card1/device/power_dpm_force_performance_level");
-            }
-            if !profile_ok {
-                eprintln!("WARNING: GPU pp_power_profile_mode = {active_profile} (expected 'COMPUTE').");
-                eprintln!("  {active_profile} profile causes 2-5x slowdown during bursty compute workloads");
-                eprintln!("  (vision encoder norm/rope kernels intermixed with GEMMs). Benchmark numbers");
-                eprintln!("  are NOT authoritative until profile is set to COMPUTE.");
-                eprintln!("  Fix with:");
-                eprintln!("    echo 5 | sudo tee /sys/class/drm/card1/device/pp_power_profile_mode");
-                eprintln!("  Profile numbers: 0=BOOTUP_DEFAULT 1=3D_FULL_SCREEN 2=POWER_SAVING");
-                eprintln!("                   3=VIDEO 4=VR 5=COMPUTE 6=CUSTOM 7=WINDOW_3D");
-            }
-            if !perf_ok || !profile_ok {
-                eprintln!("  Suppress this warning with: HIPFIRE_SKIP_POWER_CHECK=1");
-            }
-        }
-
         let flags = Arc::new(FeatureFlags::from_env(&arch));
         let arch_caps = crate::arch_caps::ArchCaps::new(&arch, flags.clone());
 
