@@ -361,4 +361,46 @@ needs a separate long-context profile.
 
 ---
 
-## Findings
+## Finding 11: Increasing PREFILL_MAX_BATCH to 1024 gives +9.3% prefill speed
+
+**Date:** 2026-06-03
+
+`PREFILL_MAX_BATCH=256` (default) splits 2048 tokens into 8 sequential chunks.
+Increasing the batch size amortizes kernel launch overhead and improves ALU utilization:
+
+| PREFILL_MAX_BATCH | pp2048 tok/s | Δ vs default |
+|-------------------|-------------|--------------|
+| 256 (default) | 220.9 | baseline |
+| 512 | 233.0 | +5.5% |
+| 1024 | 241.5 | **+9.3%** |
+| 2048 | 242.2 | +9.6% |
+
+Most gain is 256→1024. 1024→2048 is marginal (+0.3%). VRAM cost is only
+~192 MiB additional at B=1024.
+
+**Kernel-level analysis (B=1024 vs B=256):**
+- gate_up: 3.77× time for 4× work — near-linear
+- residual: 3.17× time for 4× work — sub-linear, kernel MORE efficient
+- Total launches: 1798 vs 7192 — 75% fewer
+- Kernel-only throughput: 241.6 vs 221.3 tok/s (+9.2%)
+
+**Recommendation:** Change `PREFILL_MAX_BATCH` default from 256 to 1024.
+
+---
+
+## Remaining prefill optimization opportunities
+
+1. **Attention scaling at long context (pp4096+):** 204 tok/s vs 241 at pp2048.
+   The attention kernel is at 111.7 GiB/s (near-peak BW). Cost is inherent.
+   Best lever: reduce KV head count via GQA or use MQ8 KV cache.
+
+2. **DeltaNet batch_seq (10.5% of time):** Sequential recurrence at 9.9 GiB/s.
+   Potential: parallel scan, wider per-step processing, fuse conv1d+ssm.
+
+3. **Kernel fusion for small ops (4.3% of time):** 13+ small kernels total 395ms.
+   Fusing adjacent operations would reduce dispatch overhead and LDS traffic.
+
+4. **Prefill chunk pipelining:** Overlap chunk N's compute with chunk N-1's KV write.
+
+5. **Q8_1 activation persistence:** Keep activations as Q8_1 across layers
+   instead of dequant→requant at each GEMM boundary.
