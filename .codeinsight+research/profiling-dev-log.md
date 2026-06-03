@@ -270,8 +270,29 @@ of the GEMV will improve decode performance.** The bottleneck is the memory bus.
 4. **[LOW] Prefill scaling** — hipfire wins pp128 by 2× but loses pp2048 by 7%.
    The GEMM kernels (24-33 GiB/s) may need better tiling at large batch sizes.
 
-5. **[INFO] GEMV kernel is already optimal** — 98-109% of peak BW. No further
-   kernel tuning needed for decode GEMV.
+## Finding 9: ROCm 7.14 closes the decode gap — 20.2 tok/s, matching llama.cpp
+
+**Date:** 2026-06-03
+
+Rebuilt hipfire against ROCm 7.14 (was 6.4.3). Same source, same hardware, same model:
+
+| Config | tok/s (avg of 3) |
+|--------|------------------|
+| ROCm 6.4.3, no graph | 19.57 |
+| ROCm 6.4.3, with graph | 19.10 |
+| **ROCm 7.14, no graph** | **20.17** |
+| ROCm 7.14, with graph | 20.13 |
+| llama.cpp (ROCm 6.4.3) | 20.66 |
+
+**Key findings:**
+1. ROCm 7.14 gives +3.1% decode speed over 6.4.3 for free (no code changes)
+2. Graph replay is neutral on 7.14 (no longer the 2.5% regression seen on 6.4.3)
+3. hipfire at 20.2 tok/s is now within 2.4% of llama.cpp's 20.7 tok/s
+4. The remaining gap is likely from host-side dispatch overhead that graph
+   replay doesn't help with at only 20 tok/s (each kernel is ~100-200µs,
+   leaving less room for dispatch savings)
+
+**The decode gap is essentially closed.**
 
 ---
 

@@ -431,6 +431,10 @@ fn main() {
     }
     let warmup_ms = t_warmup.elapsed().as_secs_f64() * 1000.0;
     eprintln!("  total: {warmup_ms:.1}ms  avg: {:.2}ms/tok", warmup_ms / warmup_len as f64);
+    // Signal end of warmup turn — promotes any captured graph to replay
+    // for the timed gen loop (hipGraph policy: at least one captured
+    // full turn must complete before replay is enabled).
+    gpu.end_decode_turn();
 
     // HIPFIRE_DPM_WARMUP_SECS: optional DPM-stabilization pass before the
     // timed decode. See crates/rdna-compute/src/dispatch.rs `dpm_warmup`.
