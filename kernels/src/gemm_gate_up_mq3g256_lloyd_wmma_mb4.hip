@@ -11,7 +11,7 @@
 typedef _Float16 __attribute__((ext_vector_type(16))) half16_t;
 typedef float __attribute__((ext_vector_type(8))) float8_t;
 
-__launch_bounds__(32, 2)
+__launch_bounds__(32, 10)
 extern "C" __global__ void gemm_gate_up_mq3g256_lloyd_wmma_mb4(
     const char*    __restrict__ A_gate,
     const char*    __restrict__ A_up,

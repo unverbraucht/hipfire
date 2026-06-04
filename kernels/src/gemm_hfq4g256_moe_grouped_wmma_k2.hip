@@ -40,7 +40,7 @@ typedef float __attribute__((ext_vector_type(8))) float8_t;
 // `x_row_div` controls how sorted_slot_index maps to X_src rows:
 //   gate_up: X_src = x_rot_batch[N × K], x_row_div = K_TOP → x_row = flat / K_TOP
 //   down:    X_src = rot_batch[total_slots × K], x_row_div = 1 → x_row = flat
-__launch_bounds__(32, 2)
+__launch_bounds__(32, 10)
 extern "C" __global__ void gemm_hfq4g256_moe_grouped_wmma_k2(
     const unsigned long long* __restrict__ expert_weight_ptrs, // [E]
     const int*                __restrict__ expert_tile_ids,    // [m_total / 16]

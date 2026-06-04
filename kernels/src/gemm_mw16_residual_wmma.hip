@@ -21,7 +21,7 @@
 typedef _Float16 __attribute__((ext_vector_type(16))) half16_t;
 typedef float __attribute__((ext_vector_type(8))) float8_t;
 
-__launch_bounds__(32, 2)
+__launch_bounds__(32, 10)
 extern "C" __global__ void gemm_mw16_residual_wmma(
     const _Float16* __restrict__ W,
     const _Float16* __restrict__ X,

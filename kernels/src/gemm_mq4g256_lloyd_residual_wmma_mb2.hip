@@ -10,7 +10,7 @@
 // small-M residual cases (M=4096 model-dim wo + mlp.down). Diagnosis
 // (post-D profile, devlog 2026-05-09): mb4 grid (M/16, batch/64) at
 // M=4096 batch=256 produces only 1024 WGs across 40 CUs, giving 25
-// WGs/CU. Combined with VGPR=106 forcing __launch_bounds__(32, 2) to
+// WGs/CU. Combined with VGPR=106 forcing __launch_bounds__(32, 10) to
 // 2 waves/CU, SIMDs are starved for latency hiding.
 //
 // mb2 trades half the per-WG weight reuse (2× vs mb4's 4×) for 2× the
@@ -24,7 +24,7 @@
 typedef _Float16 __attribute__((ext_vector_type(16))) half16_t;
 typedef float __attribute__((ext_vector_type(8))) float8_t;
 
-__launch_bounds__(32, 2)
+__launch_bounds__(32, 10)
 extern "C" __global__ void gemm_mq4g256_lloyd_residual_wmma_mb2(
     const char*    __restrict__ A,
     const _Float16* __restrict__ X,

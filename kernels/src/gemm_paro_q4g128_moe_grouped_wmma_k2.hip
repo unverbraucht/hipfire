@@ -40,7 +40,7 @@
 typedef _Float16 __attribute__((ext_vector_type(16))) half16_t;
 typedef float __attribute__((ext_vector_type(8))) float8_t;
 
-__launch_bounds__(32, 2)
+__launch_bounds__(32, 10)
 extern "C" __global__ void gemm_paro_q4g128_moe_grouped_wmma_k2(
     const unsigned long long* __restrict__ expert_weight_ptrs, // [E]
     const int*                __restrict__ expert_tile_ids,    // [m_total / 16]

@@ -42,7 +42,7 @@ typedef float __attribute__((ext_vector_type(8))) float8_t;
 // enough that more concurrent waves don't help (vs Q8's simpler dequant
 // where (32, 8) wins +1%). Kept at (32, 2) — see gemm_q8_0_wmma.hip
 // for the contrasting case.
-__launch_bounds__(32, 2)
+__launch_bounds__(32, 10)
 extern "C" __global__ void gemm_mq2g256_lloyd_moe_grouped_wmma_k2(
     const unsigned long long* __restrict__ expert_weight_ptrs, // [E]
     const int*                __restrict__ expert_tile_ids,    // [m_total / 16]
