@@ -53,7 +53,7 @@ typedef float   __attribute__((ext_vector_type(8)))  float8_t;
 //
 // X_q8_src is the result of running `quantize_q8_1_mmq_ds4` on a buffer of
 // `x_src_rows × K` floats. Layout: X_q8_src[kb_q8 * x_src_rows + x_row].
-__launch_bounds__(32, 2)
+__launch_bounds__(32, 10)
 extern "C" __global__ void gemm_hfq4g256_moe_grouped_mmq_k4_gfx1151(
     const unsigned long long*  __restrict__ expert_weight_ptrs, // [E]
     const int*                 __restrict__ expert_tile_ids,    // [m_total / 16]

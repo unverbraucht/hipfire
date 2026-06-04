@@ -20,7 +20,7 @@
 typedef _Float16 __attribute__((ext_vector_type(16))) half16_t;
 typedef float __attribute__((ext_vector_type(8))) float8_t;
 
-__launch_bounds__(32, 2)
+__launch_bounds__(32, 10)
 extern "C" __global__ void gemm_mq4g256_lloyd_residual_wmma_mb4(
     const char*    __restrict__ A,
     const _Float16* __restrict__ X,
@@ -175,7 +175,7 @@ extern "C" __global__ void gemm_mq4g256_lloyd_residual_wmma_mb4(
 #else
 
 // Stub: this kernel is gfx1151-only. Other archs route through the generic mb4 kernel.
-__launch_bounds__(32, 2)
+__launch_bounds__(32, 10)
 extern "C" __global__ void gemm_mq4g256_lloyd_residual_wmma_mb4(
     const char*, const _Float16*, float*, int, int, int) {}
 

@@ -52,7 +52,7 @@ typedef int32_t __attribute__((ext_vector_type(4)))  int32x4_t;
 typedef int32_t __attribute__((ext_vector_type(8)))  int32x8_t;
 typedef float   __attribute__((ext_vector_type(8)))  float8_t;
 
-__launch_bounds__(32, 2)
+__launch_bounds__(32, 10)
 extern "C" __global__ void gemm_hfq4g128_mmq_gfx1151(
     const char*                __restrict__ A,            // [M × (K/128) × 72] HFQ4-G128 packed
     const block_q8_1_mmq*      __restrict__ X_q8_src,     // [K/128 × N] Q8_1 mmq DS4 (pre-quantized)

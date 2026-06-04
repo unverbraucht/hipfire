@@ -56,7 +56,7 @@ typedef float   __attribute__((ext_vector_type(8)))  float8_t;
 // `x_row_div` controls how sorted_slot_index maps to X_q8_src rows:
 //   gate_up: X_src_f32 was [N × K], x_row_div = K_TOP → x_row = flat / K_TOP
 //   down:    X_src_f32 was [N*K_TOP × K], x_row_div = 1 → x_row = flat
-__launch_bounds__(32, 2)
+__launch_bounds__(32, 10)
 extern "C" __global__ void gemm_paro_q4g128_moe_grouped_mmq_gfx1151(
     const unsigned long long*  __restrict__ expert_weight_ptrs, // [E]
     const int*                 __restrict__ expert_tile_ids,    // [m_total / 16]
