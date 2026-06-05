@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 alpineq
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Multi-GPU pipeline-parallel orchestration. Layer bands, boundary copy,
 //! peer-access plumbing.
 //!
@@ -91,13 +95,14 @@ impl Gpus {
         }
         let device_ids = resolve_device_ids(n_devices)?;
         let devices = construct_devices(&device_ids)?;
-        preflight_vram(&devices)?;
+        preflight_vram_with_opts(&devices, /*check_vram_delta=*/ true)?;
         let per_device = uniform_split_counts(n_devices, n_layers);
         Self::from_parts(devices, per_device, n_layers)
     }
 
-    /// Explicit escape hatch for asymmetric VRAM / hand-tuned splits. Same
-    /// pre-flight checks as `init_uniform`. `per_device` length determines
+    /// Explicit escape hatch for asymmetric VRAM / hand-tuned splits.
+    /// Keeps arch-mismatch and per-device bind/free pre-flight checks, but
+    /// skips the uniform VRAM-delta gate. `per_device` length determines
     /// `n_devices`; sum determines `n_layers`.
     pub fn init_layers(per_device: &[usize]) -> HipResult<Self> {
         let n_devices = per_device.len();
@@ -110,7 +115,12 @@ impl Gpus {
         let n_layers: usize = per_device.iter().sum();
         let device_ids = resolve_device_ids(n_devices)?;
         let devices = construct_devices(&device_ids)?;
-        preflight_vram(&devices)?;
+        // init_layers is the documented escape hatch for asymmetric VRAM
+        // splits — the caller has declared the per-device counts, so skip
+        // the VRAM-delta check (which would otherwise reject 32 GB MI50 +
+        // 12 GB 6700 XT pairs out of the box). Arch-mismatch + per-device
+        // bind+free probe still run.
+        preflight_vram_with_opts(&devices, /*check_vram_delta=*/ false)?;
         Self::from_parts(devices, per_device.to_vec(), n_layers)
     }
 
@@ -348,7 +358,7 @@ fn uniform_split_counts(n_devices: usize, n_layers: usize) -> Vec<usize> {
 /// `HIPFIRE_DEVICES=0,1` selects the first two HIP-visible devices. When
 /// unset, takes the first `n_devices` visible IDs.
 fn resolve_device_ids(n_devices: usize) -> HipResult<Vec<i32>> {
-    if let Ok(s) = std::env::var("HIPFIRE_DEVICES") {
+    if let Some(ref s) = crate::config::get().devices {
         let ids: Vec<i32> = s
             .split(',')
             .map(|p| p.trim())
@@ -378,33 +388,47 @@ fn construct_devices(ids: &[i32]) -> HipResult<Vec<Gpu>> {
     Ok(devices)
 }
 
-fn preflight_vram(devices: &[Gpu]) -> HipResult<()> {
+fn preflight_vram_with_opts(devices: &[Gpu], check_vram_delta: bool) -> HipResult<()> {
     if devices.is_empty() {
         return Ok(());
     }
     let arch0 = devices[0].arch.clone();
+    let allow_mixed = crate::config::get().allow_mixed_arch;
     let mut frees = Vec::with_capacity(devices.len());
     for d in devices {
         if d.arch != arch0 {
-            return Err(HipError::new(
-                0,
-                &format!(
-                    "preflight_vram: arch mismatch — dev 0 is {arch0}, dev {} is {}. \
-                     Mixed-arch is not supported in v1.",
+            if allow_mixed {
+                eprintln!(
+                    "preflight_vram: mixed-arch detected — dev 0 is {arch0}, dev {} is {}. \
+                     Proceeding because HIPFIRE_ALLOW_MIXED_ARCH=1. \
+                     Per-arch JIT cache will be populated on first run; boundary_copy uses \
+                     hipMemcpyPeer / hipMemcpyPeerAsync which fall through to host-staging \
+                     if peer access is unsupported by the pair (correctness holds either way).",
                     d.device_id, d.arch,
-                ),
-            ));
+                );
+            } else {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "preflight_vram: arch mismatch — dev 0 is {arch0}, dev {} is {}. \
+                         Mixed-arch is not supported by default; set HIPFIRE_ALLOW_MIXED_ARCH=1 to override.",
+                        d.device_id, d.arch,
+                    ),
+                ));
+            }
         }
         d.bind_thread()?;
         let (free, _total) = d.hip.get_vram_info()?;
         frees.push(free);
     }
+    if !check_vram_delta {
+        return Ok(());
+    }
     let max_free = *frees.iter().max().unwrap();
     let min_free = *frees.iter().min().unwrap();
     let delta_gb = (max_free - min_free) as f64 / 1e9;
-    let tol_gb = std::env::var("HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB")
-        .ok()
-        .and_then(|s| s.parse::<f64>().ok())
+    let tol_gb = crate::config::get().uniform_vram_tolerance_gb
+        .map(|t| t as f64)
         .unwrap_or(DEFAULT_VRAM_TOLERANCE_GB);
     if delta_gb > tol_gb {
         return Err(HipError::new(

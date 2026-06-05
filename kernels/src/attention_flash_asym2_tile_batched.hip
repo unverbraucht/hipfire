@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 // Batched flash attention tile for asym2: K at 2-bit rotated, V at Q8_0.
 // Structure mirrors asym4_tile_batched but with 2-bit K packing (1 byte per thread per half).
 #include <hip/hip_runtime.h>
@@ -25,6 +29,7 @@ __global__ void attention_flash_asym2_tile_batched(
     int batch_offset,
     int block_start,                           // ignored when tree_bias == nullptr
     int block_cols,                            // ignored when tree_bias == nullptr
+    int v_mode,                                // 8 = Q8_0 V (only mode for asym2)
     // Sliding-window lookback (Gemma 4). 0 = no window / full causal.
     int window_size
 ) {

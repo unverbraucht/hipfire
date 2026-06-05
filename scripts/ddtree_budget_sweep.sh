@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # DDTree budget/topk sweep — post-kernel-fuse era.
 #
 # Task #71 picked b12-k2 on 2026-04-14, before: #90 gemm_mw16 fix,
@@ -109,7 +114,7 @@ run_config() {
         out=$("$EXE" \
             --target "$TARGET_27B" --draft "$DRAFT_27B" \
             --prompt "$prompt" --max "$max" --ctx 2048 \
-            --kv-mode asym3 --no-chatml \
+            --kv-mode q8 --no-chatml \
             --ddtree-batched --ddtree-budget "$budget" --ddtree-topk "$topk" 2>&1)
         blob+="$out"$'\x1e'
     done

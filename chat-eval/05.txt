@@ -1,0 +1,2 @@
+When I disable the internal GPU on a ryzen 4650g, does it free up PCI Express lanes for the external GPU?
+

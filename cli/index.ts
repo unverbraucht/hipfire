@@ -5,9 +5,10 @@
 //   hipfire run qwen3.5:9b [prompt]  → generate (auto-pulls if needed)
 //   hipfire serve                     → start daemon + HTTP server
 //   hipfire list                      → show local + available models
+//   hipfire sidecar-gen <model>       → generate TriAttention calibration sidecar
 
 import { spawn } from "bun";
-import { existsSync, readdirSync, statSync, unlinkSync, mkdirSync } from "fs";
+import { existsSync, readdirSync, statSync, unlinkSync, mkdirSync, copyFileSync, cpSync, rmSync, renameSync } from "fs";
 import { join, resolve, basename, dirname } from "path";
 import { homedir } from "os";
 
@@ -23,6 +24,17 @@ mkdirSync(MODELS_DIR, { recursive: true });
 // ─── Persistent config ─────────────────────────────────
 export interface HipfireConfig {
   kv_cache: string;       // "auto" (per-arch default), "q8", "asym4", "asym3", "asym2"
+  // Adaptive KV: runtime VRAM-fit precision downshift as context grows.
+  //   "off" (default)  — fixed-precision KV (no behavior change)
+  //   "conservative"   — V q8→lloyd4 only (gentlest)
+  //   "balanced"       — V q8→lloyd4→lloyd3→lloyd2 + K fwht4→fwht2
+  //   "aggressive"     — same floor as balanced, earliest thresholds
+  //   "advanced:k=<fwht4|fwht3|fwht2>,v=<lloyd4|lloyd3|lloyd2>" — explicit floors
+  // With adaptive on, max_seq is the context GUARANTEED at the floor tier;
+  // short contexts run fast/high-precision and downshift only as needed.
+  // Works best with kv_cache=fwht4 (K starts at fwht4). Opt-in; passed to the
+  // daemon as params.kv_adaptive, overriding the HIPFIRE_KV_ADAPTIVE env.
+  kv_adaptive: string;
   flash_mode: string;     // "auto" (ctx-gated), "always", "never" — only affects Q8 path
   default_model: string;  // model tag for serve pre-warm, e.g. "qwen3.5:9b"
   temperature: number;    // default temperature for run
@@ -32,6 +44,7 @@ export interface HipfireConfig {
   max_seq: number;        // KV cache capacity allocated at model load (shared across turns)
   thinking: string;       // "on" (model reasons in <think>, stripped from display) | "off" (suppress thinking)
   max_think_tokens: number; // per-turn budget for <think>...</think> reasoning (0 = unlimited)
+  max_total_think_tokens: number; // re-arm-proof TOTAL <think> budget across the turn (0 = off). Force-closes + blocks <think> re-open at the cap; hard-EOS past it. Bounds models that re-open <think> and out-think client timeouts.
   host: string;           // default serve bind address
   port: number;           // default serve port
   idle_timeout: number;   // serve: seconds of inactivity before unloading the model (0 = never)
@@ -148,8 +161,13 @@ export interface HipfireConfig {
   prefill_recent: number;          // Always-keep tail. Default 1024.
   prefill_block: number;           // Scoring block size. Default 128.
   prefill_drafter: string;         // Path to drafter HFQ. "" disables.
+  prefill_drafter_device: number;  // HIP device for the PFlash drafter. -1 = same as target (default). Set to a sibling device for hetero compress.
   prefill_profile: boolean;        // Per-stage timing logs.
   prefill_sparse_threshold: number;// Phase 3 sparse-attention threshold (32768).
+
+  // ── MTP speculative decode ──────────────────────────────
+  mtp_mode: string;      // "off" | "on" | "auto"
+  mtp_k: number;         // draft tokens per spec-decode window
 }
 
 // Detect GPU at import time for smart defaults
@@ -158,6 +176,7 @@ const ARCH_DEFAULTS = archDefaults(DETECTED_ARCH);
 
 const CONFIG_DEFAULTS: HipfireConfig = {
   kv_cache: ARCH_DEFAULTS.kv_cache,
+  kv_adaptive: "off",
   flash_mode: "auto",
   default_model: "qwen3.5:9b",
   temperature: 0.3,
@@ -167,10 +186,23 @@ const CONFIG_DEFAULTS: HipfireConfig = {
   // causes MQ4/MQ6 models to emit gibberish at temp=0 because the penalty
   // applies uniformly even in greedy mode. 1.05 is user-validated.
   repeat_penalty: 1.05,
-  max_tokens: 512,
+  // 4096 is large enough for code-emit tool calls (Pi's `write`/`edit`
+  // tools pass entire file bodies as a string argument inside a single
+  // `<tool_call>` block) without being so large that a runaway thinking
+  // loop burns minutes of decode. Bumped from 512 in 2026-05-28 after
+  // a Pi session truncated a Zig source file mid-string at 512 tokens
+  // and silently dropped the tool call (parseToolCalls returned null
+  // on the unclosed `<tool_call>` block → finish_reason="stop").
+  max_tokens: 4096,
   max_seq: 32768,
   thinking: "on",
-  max_think_tokens: 0,
+  // Default reasoning budget (was 0 = unlimited). A non-zero cap bounds the
+  // <think> span so a long-reasoning turn force-closes and commits to its
+  // answer (daemon splices the continuation) instead of running until the
+  // client times out and terminates the stream mid-think. Override per-model
+  // or set 0 for unlimited (e.g. reasoning.effort=xhigh maps to 0).
+  max_think_tokens: 2048,
+  max_total_think_tokens: 0,
   host: DEFAULT_HOST,
   port: DEFAULT_PORT,
   idle_timeout: 300,
@@ -209,13 +241,39 @@ const CONFIG_DEFAULTS: HipfireConfig = {
   prefill_recent: 1024,
   prefill_block: 128,
   prefill_drafter: "",
+  prefill_drafter_device: -1,
   prefill_profile: false,
   prefill_sparse_threshold: 32768,
+  mtp_mode: "auto",
+  mtp_k: 3,
 };
+
+const KV_ADAPTIVE_OPTIONS = [
+  "off",
+  "conservative",
+  "balanced",
+  "aggressive",
+  "advanced:k=fwht4,v=lloyd4",
+  "advanced:k=fwht4,v=lloyd3",
+  "advanced:k=fwht4,v=lloyd2",
+  "advanced:k=fwht3,v=lloyd4",
+  "advanced:k=fwht3,v=lloyd3",
+  "advanced:k=fwht3,v=lloyd2",
+  "advanced:k=fwht2,v=lloyd4",
+  "advanced:k=fwht2,v=lloyd3",
+  "advanced:k=fwht2,v=lloyd2",
+];
+
+function validateKvAdaptiveValue(value: any): boolean {
+  if (typeof value !== "string") return false;
+  if (KV_ADAPTIVE_OPTIONS.includes(value)) return true;
+  return /^advanced:k=(fwht4|fwht3|fwht2),v=(lloyd4|lloyd3|lloyd2)$/.test(value);
+}
 
 function validateConfigValue(key: string, value: any): boolean {
   switch (key) {
-    case "kv_cache": return ["auto", "q8", "asym4", "asym3", "asym2", "turbo", "turbo4", "turbo3", "turbo2"].includes(value);
+    case "kv_cache": return ["auto", "q8", "asym4", "asym3", "asym2", "fwht4", "fwht3", "fwht2", "turbo", "turbo4", "turbo3", "turbo2"].includes(value);
+    case "kv_adaptive": return validateKvAdaptiveValue(value);
     case "flash_mode": return ["auto", "always", "never"].includes(value);
     case "temperature": return typeof value === "number" && value >= 0 && value <= 2;
     case "top_p": return typeof value === "number" && value > 0 && value <= 1;
@@ -224,6 +282,7 @@ function validateConfigValue(key: string, value: any): boolean {
     case "max_seq": return typeof value === "number" && Number.isInteger(value) && value >= 512 && value <= 524288;
     case "thinking": return ["on", "off"].includes(value);
     case "max_think_tokens": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 32768;
+    case "max_total_think_tokens": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 1000000;
     case "host": return typeof value === "string" && value.trim() === value && value.length > 0 && value.length <= 255 && !/\s/.test(value);
     case "port": return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 65535;
     case "idle_timeout": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 86400;
@@ -251,8 +310,11 @@ function validateConfigValue(key: string, value: any): boolean {
     case "prefill_recent": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 65536;
     case "prefill_block": return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 4096;
     case "prefill_drafter": return typeof value === "string";
+    case "prefill_drafter_device": return typeof value === "number" && Number.isInteger(value) && value >= -1 && value <= 15;
     case "prefill_profile": return typeof value === "boolean";
     case "prefill_sparse_threshold": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 524288;
+    case "mtp_mode": return ["off", "on", "auto"].includes(value);
+    case "mtp_k": return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 10;
     default: return false;
   }
 }
@@ -296,8 +358,8 @@ const PER_MODEL_CONFIG_PATH = join(HIPFIRE_DIR, "per_model_config.json");
 // Fields that make sense to override per-model. host + port + idle_timeout + default_model
 // are serve-wide so they stay global-only.
 const PER_MODEL_KEYS = [
-  "kv_cache", "flash_mode", "temperature", "top_p",
-  "repeat_penalty", "max_tokens", "max_seq", "thinking", "max_think_tokens",
+  "kv_cache", "kv_adaptive", "flash_mode", "temperature", "top_p",
+  "repeat_penalty", "max_tokens", "max_seq", "thinking", "max_think_tokens", "max_total_think_tokens",
   "dflash_adaptive_b", "dflash_mode", "dflash_ngram_block",
   "cask_sidecar", "cask",
   "cask_budget", "cask_beta", "cask_core_frac", "cask_fold_m",
@@ -309,8 +371,9 @@ const PER_MODEL_KEYS = [
   // changing other targets.
   "prefill_compression", "prefill_threshold", "prefill_keep_ratio",
   "prefill_alpha", "prefill_min_keep", "prefill_sink", "prefill_recent",
-  "prefill_block", "prefill_drafter", "prefill_profile",
+  "prefill_block", "prefill_drafter", "prefill_drafter_device", "prefill_profile",
   "prefill_sparse_threshold",
+  "mtp_mode", "mtp_k",
 ] as const;
 type PerModelKey = typeof PER_MODEL_KEYS[number];
 
@@ -363,9 +426,13 @@ function savePerModelConfigs(all: PerModelConfigs) {
 function resolveModelConfig(tag: string | null | undefined): HipfireConfig {
   const base = loadConfig();
   if (!tag) return base;
+  const all = loadPerModelConfigs();
   const resolved = resolveModelTag(tag);
-  const overrides = loadPerModelConfigs()[resolved] ?? loadPerModelConfigs()[tag] ?? {};
-  return { ...base, ...overrides };
+  // Layer both keys: a model can carry overrides under the canonical
+  // registry tag AND under the user alias. Alias wins where both set a
+  // key, but neither drops the other. Previous `resolved ?? tag` picked
+  // exactly one entry, so any key only present on the other vanished.
+  return { ...base, ...(all[resolved] ?? {}), ...(tag !== resolved ? (all[tag] ?? {}) : {}) };
 }
 
 // applyThinkingMode is intentionally NOT called anywhere. The previous
@@ -430,6 +497,15 @@ function buildLoadMessage(path: string, tag?: string | null): any {
     console.error(`[hipfire] kv_mode bumped for ${tag}: ${baseMode} → ${effectiveMode} (deep stack, asym3 layer-count compounding)`);
   }
   params.kv_mode = effectiveMode;
+
+  // Adaptive KV (opt-in). When set to anything other than "off", forward the
+  // selector as params.kv_adaptive — the daemon prefers it over the
+  // HIPFIRE_KV_ADAPTIVE env (param wins; env is fallback; neither ⇒ off).
+  // Left absent on the default "off" so existing loads are byte-for-byte
+  // unchanged.
+  if (resolved.kv_adaptive && resolved.kv_adaptive !== "off") {
+    params.kv_adaptive = resolved.kv_adaptive;
+  }
 
   // Optional DFlash draft. The daemon wires this into a greedy speculative-
   // decode fast path that triggers on temperature==0 requests. Two sources:
@@ -547,7 +623,12 @@ function buildLoadMessage(path: string, tag?: string | null): any {
   // glob-style fallback for `<model>.triattn*.bin` next to the weights for
   // sidecars dropped manually.
   let autoAttachedSidecar: string | null = null;
+  // HIPFIRE_CASK_OFF=1 is an ops escape hatch: forces no auto-attach
+  // regardless of per-model/global config, so a missing/dangling sidecar
+  // can never fatally crash serve load. Pairs with cask_auto_attach=false.
+  const caskForcedOff = process.env.HIPFIRE_CASK_OFF === "1";
   if (
+    !caskForcedOff &&
     (!resolved.cask_sidecar || resolved.cask_sidecar.length === 0) &&
     !isA3B &&
     resolved.cask_auto_attach !== false
@@ -624,6 +705,7 @@ function buildLoadMessage(path: string, tag?: string | null): any {
     params.prefill_recent = resolved.prefill_recent;
     params.prefill_block = resolved.prefill_block;
     params.prefill_drafter = resolved.prefill_drafter;
+    params.prefill_drafter_device = resolved.prefill_drafter_device;
     params.prefill_profile = resolved.prefill_profile;
     params.prefill_sparse_threshold = resolved.prefill_sparse_threshold;
   } else if (resolved.prefill_compression !== "off") {
@@ -635,6 +717,9 @@ function buildLoadMessage(path: string, tag?: string | null): any {
       `Continuing with PFlash disabled.`
     );
   }
+
+  params.mtp_mode = resolved.mtp_mode;
+  params.mtp_k = resolved.mtp_k;
 
   return { type: "load", model: path, params };
 }
@@ -671,6 +756,13 @@ interface ModelEntry {
   /// auto-attached — see feedback_a3b_r_not_acceptable.md (R̄≈0.36–0.39 +
   /// eviction = confident-wrong hallucination on multi-turn).
   triattn?: { file: string };
+  /// Optional published MTP (Multi-Token Prediction) sidecar — currently
+  /// DeepSeek V4 only. When set, `hipfire pull` also fetches the file next
+  /// to the weights. The daemon's V4F arm auto-discovers the sidecar via
+  /// the `<stem>-mtp.<ext>` sibling convention at load time (see
+  /// `crates/hipfire-arch-deepseek4/src/arch.rs`), so no explicit env var
+  /// is required once the file is in MODELS_DIR.
+  mtp?: { file: string };
 }
 
 // Registry data lives in cli/registry.json. The CLI is bundled as a single
@@ -744,30 +836,33 @@ interface ArchDefaults {
 }
 
 function archDefaults(arch: string): ArchDefaults {
-  // Default KV cache policy (RotorQuant asymmetric):
-  //   asym3 (K 3-bit rotated + V Q8) is the default across arches — 5.5×
-  //   compression vs fp32 with verbatim rare-token recall on head_dim=256
-  //   models (Qwen 3.5 family). Memory-tight cards get asym2 (6.0×, still
-  //   recall-safe for common tokens). Users can override to `q8` for
-  //   maximum quality or `asym4` for extra K precision headroom.
+  // Default KV cache policy (FWHT-rotated, DFlash-safe):
+  //   fwht3 (K 3-bit FWHT-rotated + V Q8) is the default across arches — same
+  //   ~5.5× compression and byte layout as asym3, but the K-rotation basis
+  //   matches the MQ4 weight/draft FWHT convention, so DFlash speculative
+  //   acceptance stays high. asym3/asym4 use a Givens basis the draft was not
+  //   calibrated against → degraded acceptance / attractors with DFlash (which
+  //   is default-on for the 27B). Memory-tight cards get fwht2 (the asym2 byte
+  //   tier, FWHT-rotated). Override to `q8` for byte-exact reference quality,
+  //   or the `asym*` modes for the legacy Givens behavior.
   switch (arch) {
-    // RDNA3 — asym3 everywhere; 24 GB cards fit full context easily.
-    case "gfx1100": return { kv_cache: "asym3", vram_gb: 24 };  // 7900 XTX
-    case "gfx1101": return { kv_cache: "asym3", vram_gb: 16 };  // 7900 XT
-    case "gfx1102": return { kv_cache: "asym3", vram_gb: 12 };  // 7800 XT
-    case "gfx1151": return { kv_cache: "asym2", vram_gb: 16 };  // Strix Halo APU (shared mem — tight)
+    // RDNA3
+    case "gfx1100": return { kv_cache: "fwht3", vram_gb: 24 };  // 7900 XTX
+    case "gfx1101": return { kv_cache: "fwht3", vram_gb: 16 };  // 7900 XT
+    case "gfx1102": return { kv_cache: "fwht3", vram_gb: 12 };  // 7800 XT
+    case "gfx1151": return { kv_cache: "fwht2", vram_gb: 16 };  // Strix Halo APU (shared mem — tight)
     // RDNA4
     case "gfx1200": case "gfx1201":
-      return { kv_cache: "asym3", vram_gb: 16 };                // 9070 XT
+      return { kv_cache: "fwht3", vram_gb: 16 };                // 9070 XT
     // RDNA2
-    case "gfx1030": return { kv_cache: "asym3", vram_gb: 32 };  // V620 (32 GB — plenty of headroom)
-    case "gfx1031": return { kv_cache: "asym3", vram_gb: 12 };  // 6700 XT
-    case "gfx1032": return { kv_cache: "asym2", vram_gb: 8 };   // 6600 XT (8 GB — asym2 for headroom)
+    case "gfx1030": return { kv_cache: "fwht3", vram_gb: 32 };  // V620 (32 GB — plenty of headroom)
+    case "gfx1031": return { kv_cache: "fwht3", vram_gb: 12 };  // 6700 XT
+    case "gfx1032": return { kv_cache: "fwht2", vram_gb: 8 };   // 6600 XT (8 GB — fwht2 for headroom)
     // RDNA1
-    case "gfx1010": return { kv_cache: "asym2", vram_gb: 8 };   // 5700 XT
-    case "gfx1013": return { kv_cache: "asym2", vram_gb: 14 };  // BC-250 APU
-    // Fallback — unknown arch, asym3 is the new safe default.
-    default: return { kv_cache: "asym3", vram_gb: 8 };
+    case "gfx1010": return { kv_cache: "fwht2", vram_gb: 8 };   // 5700 XT
+    case "gfx1013": return { kv_cache: "fwht2", vram_gb: 14 };  // BC-250 APU
+    // Fallback — unknown arch, fwht3 is the safe DFlash-compatible default.
+    default: return { kv_cache: "fwht3", vram_gb: 8 };
   }
 }
 
@@ -839,6 +934,13 @@ function applyConfigEnv(cfg: HipfireConfig, modelTag?: string | null): void {
   } else {
     delete process.env.HIPFIRE_DFLASH_NGRAM_BLOCK;
   }
+  // Total-think cap (re-arm-proof <think> bound; daemon reads it per generate).
+  // Shell env wins if the user exported it; 0/unset = off (daemon default).
+  if (!process.env.HIPFIRE_MAX_TOTAL_THINK_TOKENS && cfg.max_total_think_tokens > 0) {
+    process.env.HIPFIRE_MAX_TOTAL_THINK_TOKENS = String(cfg.max_total_think_tokens);
+  }
+  process.env.HIPFIRE_MTP_MODE = cfg.mtp_mode;
+  process.env.HIPFIRE_MTP_K = String(cfg.mtp_k);
 }
 
 // ─── Background serve lifecycle ─────────────────────────
@@ -889,9 +991,9 @@ async function runViaHttp(
   temp: number, maxTokens: number, repeatPenalty: number, topP: number,
   system?: string,
 ): Promise<boolean> {
-  // VL flows go through the image-base64 path on the daemon which the HTTP
-  // wrapper doesn't expose — fall back to local spawn.
-  if (image) return false;
+  // VL requests proxy through the daemon's `image_base64` IPC field —
+  // `hipfire run --image` can hit a running serve instead of cold-spawning
+  // a fresh daemon per call.
 
   const messages: any[] = [];
   if (system) messages.push({ role: "system", content: system });
@@ -902,6 +1004,23 @@ async function runViaHttp(
     temperature: temp, max_tokens: maxTokens,
     repeat_penalty: repeatPenalty, top_p: topP,
   };
+
+  if (image) {
+    const imgBuf = Bun.file(resolve(image));
+    if (!(await imgBuf.exists())) { console.error(`Image not found: ${image}`); return false; }
+    const imgBytes = await imgBuf.arrayBuffer();
+    const imgBase64 = Buffer.from(imgBytes).toString("base64");
+    const ext = image.toLowerCase().split(".").pop();
+    const mime = ext === "jpg" || ext === "jpeg" ? "image/jpeg" : ext === "png" ? "image/png" : null;
+    if (!mime) { console.error(`Unsupported image format: ${ext} — supported: png, jpeg`); return false; }
+    body.messages = [{
+      role: "user",
+      content: [
+        { type: "text", text: prompt },
+        { type: "image_url", image_url: { url: `data:${mime};base64,${imgBase64}` } },
+      ],
+    }];
+  }
 
   let resp: Response;
   try {
@@ -1221,6 +1340,36 @@ async function pull(tag: string): Promise<string> {
     }
   }
 
+  // MTP sidecar: same pattern as TriAttention. Daemon auto-attaches via the
+  // `<stem>-mtp.<ext>` sibling convention (see arch-deepseek4/src/arch.rs);
+  // missing sidecar = plain decode only, no spec-decode.
+  if (entry.mtp?.file) {
+    const sidecarDest = join(MODELS_DIR, entry.mtp.file);
+    if (existsSync(sidecarDest)) {
+      console.error(`  MTP sidecar already present: ${entry.mtp.file}`);
+    } else {
+      const sidecarUrl = `${HF_BASE}/${entry.repo}/resolve/main/${entry.mtp.file}`;
+      console.error(`  Fetching MTP sidecar: ${entry.mtp.file}`);
+      try {
+        const sres = await fetch(sidecarUrl, { headers: hfHeaders() });
+        if (!sres.ok) {
+          console.error(`  WARN: MTP sidecar fetch failed (${sres.status} ${sres.statusText}) — base is usable; spec-decode unavailable until sidecar present.`);
+        } else {
+          const sTmp = sidecarDest + ".tmp";
+          const sWriter = Bun.file(sTmp).writer();
+          for await (const chunk of sres.body as AsyncIterable<Uint8Array>) sWriter.write(chunk);
+          await sWriter.end();
+          const { renameSync } = await import("fs");
+          renameSync(sTmp, sidecarDest);
+          const ssz = (statSync(sidecarDest).size / 1e9).toFixed(2);
+          console.error(`  Saved: ${sidecarDest} (${ssz}GB)`);
+        }
+      } catch (e) {
+        console.error(`  WARN: MTP sidecar fetch error: ${e} — non-fatal.`);
+      }
+    }
+  }
+
   return dest;
 }
 
@@ -1248,7 +1397,7 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
   // If a serve daemon is already running on this port, proxy through its HTTP
   // API — saves the 2-5s cold-start cost of loading the model every invocation.
   // Local spawn falls through only when no serve is present (or HTTP errors out).
-  const useLocal = process.env.HIPFIRE_LOCAL === "1" || image !== undefined;
+  const useLocal = process.env.HIPFIRE_LOCAL === "1";
   if (!useLocal && await isServeUp(cfg.port, cfg.host)) {
     const ok = await runViaHttp(cfg.port, cfg.host, model, prompt, image, temp, maxTokens, repeatPenalty, topP, system);
     if (ok) return;
@@ -1359,6 +1508,19 @@ async function serve(port: number, host: string) {
   // or a client-sent body.max_tokens) needs more headroom than the KV cache
   // was allocated for — and reload instead of letting the daemon overrun.
   let currentMaxSeq: number | null = null;
+  let modelHasVL = false;
+  // Architecture tag from the most recent daemon `loaded` event (e.g.
+  // "qwen2", "qwen35", "deepseek4"). Used to gate format-specific
+  // serve-side prompt construction — V4F's daemon path renders tools
+  // via DSML and reads multi-turn history from structured `messages`,
+  // so the legacy Hermes `<tools>` block injection and ChatML
+  // conversation rebuild both turn into off-distribution noise.
+  let currentArch: string | null = null;
+  // Daemon-advertised prompt-cache capability (the `cache_capable` field on
+  // the `loaded` response). Source of truth for the per-request reset
+  // decision; null when an older daemon doesn't send it (we then fall back to
+  // the arch-string allowlist below).
+  let currentCacheCapable: boolean | null = null;
 
   // Idle eviction: after `idle_timeout` seconds of no requests, unload the
   // model to free VRAM. Next request reloads it (one-shot cost). 0 disables.
@@ -1390,10 +1552,16 @@ async function serve(port: number, host: string) {
       console.error(`[hipfire] idle for ${cfg.idle_timeout}s — unloading model (VRAM freed; next request will reload)`);
       await e.send({ type: "unload" });
       await e.recv();
-      current = null;
-      currentMaxSeq = null;
     } catch (err: any) {
       console.error(`[hipfire] eviction failed: ${err?.message ?? err}`);
+    } finally {
+      // Reset capability state regardless of whether send/recv threw.
+      // Leaving these stale (e.g. modelHasVL=true after a broken-pipe
+      // eviction) makes the next request forward image_base64 to a
+      // daemon that has nothing loaded.
+      current = null;
+      currentMaxSeq = null;
+      modelHasVL = false;
     }
   }, Math.min(60_000, idleTimeoutMs)) : null;
   // Keep process alive irrespective of the interval; clean up on exit.
@@ -1418,6 +1586,9 @@ async function serve(port: number, host: string) {
         await e.send({ type: "reset" }); await e.recv();
         current = warmPath;
         currentMaxSeq = warmLoadMsg.params.max_seq;
+        modelHasVL = loadResult.vl === true;
+        currentArch = typeof loadResult.arch === "string" ? loadResult.arch : null;
+        currentCacheCapable = typeof loadResult.cache_capable === "boolean" ? loadResult.cache_capable : null;
         console.error(`[hipfire] warm-up complete`);
       }
     } catch (err: any) {
@@ -1485,9 +1656,53 @@ async function serve(port: number, host: string) {
         const messages: any[] = body.messages || [];
         const tools: any[] = body.tools || [];
 
-        // OpenAI API is stateless: each request has the full conversation.
-        // Reset daemon state so prior requests don't bleed into this one.
-        await e.send({ type: "reset" }); await e.recv();
+        // Opt-in request-body dump. Lets an operator see the full
+        // prompt a client (e.g. Pi) is sending without having to attach
+        // a strace. Off by default — gigantic for typical agent prompts.
+        if (process.env.HIPFIRE_DUMP_REQUEST === "1") {
+          try {
+            const path = `/tmp/hipfire-request-${Date.now()}.json`;
+            require("fs").writeFileSync(path, JSON.stringify(body, null, 2));
+            console.error(`[hipfire] dumped request → ${path} (msgs=${messages.length} tools=${tools.length} stream=${body.stream})`);
+          } catch (e: any) {
+            console.error(`[hipfire] request dump failed: ${e?.message ?? e}`);
+          }
+        }
+
+        // OpenAI API is stateless: each request CARRIES the full
+        // conversation. For most archs we tell the daemon to reset
+        // here so prior turn KV doesn't bleed into this one.
+        //
+        // V4F (`deepseek4`) and Qwen3.5/3.6 (`qwen35`) are exceptions.
+        // Their daemon arms run LCP detection (Reasonix-style prefix
+        // caching): if the freshly-tokenized prompt fully extends
+        // `m.conversation_tokens` from the prior turn, the daemon
+        // skips prefill for the matching prefix and only prefills the
+        // suffix — exactly the cache-hit shape Reasonix engineers for
+        // upstream. Calling `reset` here clears `m.conversation_tokens`
+        // and forces lcp=0 every turn, throwing away the cache. Skip
+        // the reset for those arches and let the daemon's auto-LCP
+        // (with strict "fully extends" guards — DeltaNet-non-reversible
+        // for qwen35, SWA-ring safety for deepseek4) decide whether
+        // this is a continuation or a fresh request.
+        // Operators can force the legacy stateless behavior by setting
+        // `HIPFIRE_QWEN_PROMPT_CACHE=0` (qwen35 daemon also honors it,
+        // so reset is harmless when the daemon-side cache is disabled
+        // — we omit reset regardless to keep behavior symmetric).
+        // Prefer the daemon's advertised `cache_capable` flag (source of
+        // truth, next to the cache impl). Fall back to the arch-string
+        // allowlist only for older daemons that don't send the flag.
+        const cacheCapable = currentCacheCapable !== null
+          ? currentCacheCapable
+          : (currentArch === "deepseek4"
+            || currentArch === "qwen3_5"
+            || currentArch === "qwen3_5_moe");
+        if (process.env.HIPFIRE_QWEN_CACHE_TRACE === "1") {
+          console.error(`[cache-route] arch=${JSON.stringify(currentArch)} daemon_cache_capable=${currentCacheCapable} cacheCapable=${cacheCapable} -> ${cacheCapable ? "skip reset (cache)" : "SEND RESET (stateless)"}`);
+        }
+        if (!cacheCapable) {
+          await e.send({ type: "reset" }); await e.recv();
+        }
 
         // Build prompt from messages with proper role handling
         let systemPrompt = "";
@@ -1500,16 +1715,59 @@ async function serve(port: number, host: string) {
         // prompt, which the model has no way to recover from. Issue #79.
         // Image parts are filtered out (no vision encoder in serve path);
         // matches the daemon's existing text-only behaviour.
-        const extractText = (content: any): string => {
-          if (typeof content === "string") return content;
+        const extractContent = (content: any): { text: string, images: string[], unsupportedImage: boolean, remoteImageUrl: boolean, malformedImage: boolean } => {
+          // OpenAI assistant messages carrying only `tool_calls` send
+          // `content: null`. Returning `String(null) === "null"` here
+          // (the legacy fallback below) leaked the literal text `null`
+          // into the rendered prompt — V4F prompt dumps showed this as
+          // `<｜Assistant｜>null<｜end▁of▁sentence｜>` for every prior
+          // tool-call turn, which the model reads as "the assistant
+          // previously said the word null", not as an empty turn.
+          // Treat null/undefined as empty content.
+          if (content == null) return { text: "", images: [], unsupportedImage: false, remoteImageUrl: false, malformedImage: false };
+          if (typeof content === "string") return { text: content, images: [], unsupportedImage: false, remoteImageUrl: false, malformedImage: false };
           if (Array.isArray(content)) {
-            return content
-              .filter((p: any) => p && p.type === "text")
-              .map((p: any) => p.text ?? "")
-              .join("");
+            const textParts: string[] = [];
+            const images: string[] = [];
+            let unsupportedImage = false;
+            let remoteImageUrl = false;
+            let malformedImage = false;
+            for (const p of content) {
+              if (p?.type === "text") textParts.push(p.text ?? "");
+              else if (p?.type === "image_url") {
+                if (p.image_url?.url) {
+                  const url: string = p.image_url.url;
+                  if (url.startsWith("data:")) {
+                    const mimeMatch = url.match(/^data:(image\/(png|jpeg));base64,/);
+                    if (mimeMatch) {
+                      const raw = url.slice(url.indexOf(",") + 1);
+                      images.push(raw);
+                    } else {
+                      // Anything else under `data:` is unsupported. Flag
+                      // both data:image/<other> (webp, gif, ...) AND
+                      // non-image data: URIs (data:application/pdf, ...)
+                      // so the request fails loudly instead of silently
+                      // dropping the part and proceeding as text-only.
+                      unsupportedImage = true;
+                    }
+                  } else {
+                    // Non-data: URLs (https://, http://, file://, etc.)
+                    // are not supported — hipfire does not fetch remote
+                    // images. Use a separate flag so the error message
+                    // distinguishes "bad format" from "unsupported transport".
+                    remoteImageUrl = true;
+                  }
+                } else {
+                  malformedImage = true;
+                }
+              }
+            }
+            return { text: textParts.join(""), images, unsupportedImage, remoteImageUrl, malformedImage };
           }
-          return "";
+          return { text: String(content), images: [], unsupportedImage: false, remoteImageUrl: false, malformedImage: false };
         };
+
+        const extractText = (content: any): string => extractContent(content).text;
 
         // Strip <think>...</think> blocks from historical assistant text. Same
         // rationale as the inline-ChatML builder below (line 1513): the Qwen3.5
@@ -1537,7 +1795,17 @@ async function serve(port: number, host: string) {
           for (const m of msgs) {
             if (!m || typeof m !== "object") continue;
             let role: string = m.role;
+            // Aliases:
+            //   developer        → system (OpenAI o1/o3 alias)
+            //   toolResult       → tool   (Pi/Anthropic-internal alias; Pi's
+            //                              SDK sometimes leaks the internal
+            //                              role name through to OpenAI-style
+            //                              requests, which would otherwise
+            //                              drop the message entirely and
+            //                              break LCP on the next turn)
+            //   tool_result      → tool   (Anthropic spelling, defensive)
             if (role === "developer") role = "system";
+            if (role === "toolResult" || role === "tool_result") role = "tool";
             if (role !== "system" && role !== "user" && role !== "assistant" && role !== "tool") {
               continue;
             }
@@ -1581,15 +1849,14 @@ async function serve(port: number, host: string) {
         const sysMsg = messages.find((m: any) => m.role === "system" || m.role === "developer");
         if (sysMsg) systemPrompt = extractText(sysMsg.content);
 
-        // Format tools into system prompt (Hermes format)
-        if (tools.length > 0) {
-          const toolsBlock = "# Tools\n\nYou have access to the following functions:\n\n<tools>\n"
-            + tools.map((t: any) => JSON.stringify(t)).join("\n")
-            + "\n</tools>\n\n"
-            + 'If you choose to call a function ONLY reply in the following format with NO suffix:\n\n'
-            + '<tool_call>\n{"name": "example_function", "arguments": {"param": "value"}}\n</tool_call>';
-          systemPrompt = systemPrompt ? systemPrompt + "\n\n" + toolsBlock : toolsBlock;
-        }
+        // The legacy Hermes `<tools>` block injection happens LATER, after
+        // the model has actually been loaded/reloaded and `currentArch` is
+        // known to reflect the target model — not the pre-warmed one. See
+        // the post-reload site below for the actual append. We can't add
+        // it here because a request that triggers a reload to a different
+        // arch would flip the rule under our feet (e.g. pre-warmed V4F,
+        // requested Qwen35: at this point currentArch is still "deepseek4"
+        // and we'd skip the Hermes block — but Qwen35 needs it).
 
         // Build conversation as multi-turn ChatML prompt.
         // The daemon wraps the prompt as: <|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n
@@ -1608,10 +1875,28 @@ async function serve(port: number, host: string) {
            .replace(/<think>[\s\S]*$/, "");
 
         const nonSystem = messages.filter((m: any) => m.role !== "system" && m.role !== "developer");
+        let requestImages: string[] = [];
         const convParts: string[] = [];
+        // Image-validation errors fire inline (per-message) so the
+        // returned 400 reflects the actual offending turn rather than
+        // an aggregate across the conversation. Helper unifies the
+        // safeRelease + Response.json shape.
+        const rejectImage = (message: string) => {
+          safeRelease();
+          return Response.json(
+            { error: { message, type: "invalid_request_error" } },
+            { status: 400 },
+          );
+        };
         for (let i = 0; i < nonSystem.length; i++) {
           const m = nonSystem[i];
-          const role = m.role;
+          // Accept Pi/Anthropic-style aliases for tool messages so the
+          // inline-ChatML reconstruction doesn't silently drop them
+          // (which would corrupt history for legacy non-cacheCapable
+          // arches that only consume the inline `prompt` field).
+          const role = m.role === "toolResult" || m.role === "tool_result"
+            ? "tool"
+            : m.role;
           let text = "";
 
           if (role === "tool") {
@@ -1621,9 +1906,41 @@ async function serve(port: number, host: string) {
             if (m.tool_calls) {
               for (const tc of m.tool_calls) {
                 const fn = tc.function || tc;
-                text += `\n<tool_call>\n${JSON.stringify({ name: fn.name, arguments: JSON.parse(fn.arguments || "{}") })}\n</tool_call>`;
+                let args = {};
+                try {
+                  args = JSON.parse(fn.arguments || "{}");
+                } catch (err: any) {
+                  // Surface the parse failure so a malformed-args call
+                  // doesn't silently turn into a "tool was called with {}"
+                  // entry in the conversation. Keep the call in-stream
+                  // (using {}) so the model isn't left with a torn turn,
+                  // but make the divergence visible in serve logs.
+                  console.error(`[hipfire] tool_call: failed to parse arguments JSON for "${fn.name}" (${err?.message ?? err}) — substituting {}`);
+                }
+                text += `\n<tool_call>\n${JSON.stringify({ name: fn.name, arguments: args })}\n</tool_call>`;
               }
             }
+          } else if (role === "user") {
+            const content = extractContent(m.content);
+            if (content.malformedImage) {
+              return rejectImage("malformed image part — image_url.url is required");
+            }
+            if (content.remoteImageUrl) {
+              return rejectImage("remote image URLs are not supported — embed images as base64 data: URLs (supported formats: png, jpeg)");
+            }
+            if (content.unsupportedImage) {
+              return rejectImage("unsupported image format — supported: png, jpeg");
+            }
+            if (content.images.length > 0) {
+              if (i < nonSystem.length - 1) {
+                return rejectImage("images in earlier user turns are not supported — image must be in the last user message");
+              }
+              if (content.images.length + requestImages.length > 1) {
+                return rejectImage("multiple images not supported — only one image per request");
+              }
+              requestImages.push(...content.images);
+            }
+            text = content.text;
           } else {
             text = extractText(m.content);
           }
@@ -1642,6 +1959,10 @@ async function serve(port: number, host: string) {
           }
         }
         userPrompt = convParts.join("");
+        // V4F-specific override of `userPrompt` (collapse to live user
+        // message only) ALSO happens after the reload check below —
+        // same reasoning as the Hermes block: `currentArch` may change
+        // if the request triggers a reload, so we can't gate on it yet.
 
         const rawPath = findModel(body.model || "default");
         if (!rawPath) { safeRelease(); return Response.json({ error: "model not found" }, { status: 404 }); }
@@ -1655,7 +1976,8 @@ async function serve(port: number, host: string) {
         // the daemon would either reject or, worse, overrun the buffer with.
         const effective = resolveModelConfig(body.model);
         const requestMaxTokens = body.max_tokens ?? effective.max_tokens;
-        const requiredMaxSeq = Math.max(effective.max_seq, requestMaxTokens + 1024);
+        const visualHeadroom = requestImages.length > 0 ? 1024 : 0;
+        const requiredMaxSeq = Math.max(effective.max_seq, requestMaxTokens + 1024 + visualHeadroom);
 
         const needReload = current !== path
           || (currentMaxSeq !== null && requiredMaxSeq > currentMaxSeq);
@@ -1672,11 +1994,84 @@ async function serve(port: number, host: string) {
           if (loadResult.type === "error") {
             current = null;
             currentMaxSeq = null;
+            modelHasVL = false;
             safeRelease();
             return Response.json({ error: `model load failed: ${loadResult.message}` }, { status: 500 });
           }
           current = path;
           currentMaxSeq = loadMsg.params.max_seq;
+          modelHasVL = loadResult.vl === true;
+          currentArch = typeof loadResult.arch === "string" ? loadResult.arch : null;
+          currentCacheCapable = typeof loadResult.cache_capable === "boolean" ? loadResult.cache_capable : null;
+        }
+
+        // Now that currentArch reflects the model we're ACTUALLY sending
+        // to (post-reload), apply the arch-conditional prompt shaping.
+        //
+        // 1. Hermes `<tools>` block in systemPrompt: legacy daemon paths
+        //    (Qwen2 generate) only see tools through prompt text and rely
+        //    on this block. V4F (`generate_deepseek4`) builds its own
+        //    DSML tools preamble from the structured `tools` field, so
+        //    injecting Hermes on top gives the model two conflicting
+        //    tool-call format contracts (observed verbatim in
+        //    /tmp/hipfire-prompt-*.txt). Skip for V4F.
+        if (tools.length > 0 && currentArch !== "deepseek4") {
+          const toolsBlock = "# Tools\n\nYou have access to the following functions:\n\n<tools>\n"
+            + tools.map((t: any) => JSON.stringify(t)).join("\n")
+            + "\n</tools>\n\n"
+            + 'If you choose to call a function ONLY reply in the following format with NO suffix:\n\n'
+            + '<tool_call>\n{"name": "example_function", "arguments": {"param": "value"}}\n</tool_call>';
+          systemPrompt = systemPrompt ? systemPrompt + "\n\n" + toolsBlock : toolsBlock;
+        }
+
+        // 1b. Chunked-write nudge: steer the model away from emitting an
+        //     entire large file in ONE `write` tool call. At long-context
+        //     decode rates a ~30K-token single-shot write can't finish
+        //     within the per-turn / client deadline — it gets truncated
+        //     mid-output, the unclosed <tool_call> is dropped (finish=stop),
+        //     and the whole turn's work is lost (observed 2026-05-31: a Pi
+        //     "write the full implementation" turn terminated, then the
+        //     retry's write degraded + EOS'd at 939 tokens, unparseable).
+        //     Only relevant when a file-writing tool is exposed. Opt out
+        //     with HIPFIRE_CHUNK_WRITE_NUDGE=0.
+        const hasWriteTool = tools.some((t: any) => {
+          const n = String(t?.function?.name ?? t?.name ?? "").toLowerCase();
+          return n === "write" || n === "edit" || n === "create"
+            || n.includes("str_replace") || n.includes("write_file") || n.includes("create_file");
+        });
+        if (hasWriteTool && process.env.HIPFIRE_CHUNK_WRITE_NUDGE !== "0") {
+          const chunkNudge = "# Writing large files\n\n"
+            + "When creating or modifying a large file, do NOT emit the entire file in a single `write` "
+            + "call. A tool call that streams thousands of lines often can't be completed in one response "
+            + "and gets cut off mid-output — the truncated call is then discarded and the work is lost. "
+            + "Instead, build large files incrementally: write an initial skeleton or first focused section, "
+            + "then extend it with follow-up `edit` calls (or split the work into several smaller files). "
+            + "Keep each individual tool call bounded to a few hundred lines.";
+          systemPrompt = systemPrompt ? systemPrompt + "\n\n" + chunkNudge : chunkNudge;
+        }
+
+        // 2. `userPrompt` content: cache-capable daemon paths (V4F and
+        //    qwen3.5/3.6 with the prompt-cache active) read multi-turn
+        //    history from the structured `messages` field and treat
+        //    `prompt` as the live user input. Leaving `userPrompt` set
+        //    to the ChatML rebuild of the conversation causes the
+        //    daemon to render history twice — once in arch-canonical
+        //    tokens from `messages`, once in ChatML tokens from
+        //    `prompt`. Replace with just the trailing user message
+        //    (or "" when conversation ends with a tool/assistant turn —
+        //    daemon then continues from the assistant header directly).
+        //
+        //    Legacy arches (Qwen2 in particular) ignore the structured
+        //    `messages` field and ONLY read `prompt` — they NEED the
+        //    full ChatML rebuild for multi-turn to survive. Don't touch.
+        if (cacheCapable) {
+          const last = nonSystem.length > 0 ? nonSystem[nonSystem.length - 1] : null;
+          if (last && last.role === "user") {
+            const lastContent = extractContent(last.content);
+            userPrompt = lastContent.text;
+          } else {
+            userPrompt = "";
+          }
         }
 
         const reqId = `chatcmpl-${Date.now().toString(36)}`;
@@ -1717,9 +2112,82 @@ async function serve(port: number, host: string) {
         const enableThinking: boolean | null = typeof ctk.enable_thinking === "boolean" ? ctk.enable_thinking : null;
         const preserveThinking: boolean = ctk.preserve_thinking === true;
 
-        // Include usage 
+        // Include usage
         // https://developers.openai.com/api/reference/resources/chat/subresources/completions/streaming-events
         const includeUsage = (body.stream_options && body?.stream_options?.include_usage && body?.stream_options?.include_usage === true);
+
+        // Build the OpenAI-format `usage` object.
+        //
+        // Daemon emits three signals:
+        //   prompt_tokens   — total tokens in the input prompt (V4F only
+        //                     today; absent on qwen35 path, derived below)
+        //   prefill_tokens  — number of new tokens actually fed through
+        //                     the forward path this turn
+        //   cached_tokens   — LCP-hit count from the prefix cache
+        //
+        // Per OpenAI spec, `usage.prompt_tokens` is the TOTAL input
+        // size and `prompt_tokens_details.cached_tokens` is the
+        // already-cached portion of that total. So:
+        //   prompt_tokens   = cached + prefill   (when daemon doesn't emit it)
+        //   completion      = newly decoded tokens
+        //   prompt_tokens_details.cached_tokens = cached
+        //
+        // For Anthropic-compatible clients (Pi, etc.) we also emit
+        // `cache_creation_input_tokens` = prefill_tokens (the new
+        // tokens written through the forward path this turn, which
+        // populate the cache for the NEXT turn). This maps to Pi's
+        // `cacheWrite` field and pairs with `cacheRead` from
+        // `prompt_tokens_details.cached_tokens`.
+        const buildUsage = (msg: any, completion: number) => {
+          const prefillTokens: number = typeof msg.prefill_tokens === "number"
+            ? msg.prefill_tokens
+            : 0;
+          const cachedTokens: number = typeof msg.cached_tokens === "number"
+            ? msg.cached_tokens
+            : 0;
+          const promptTokens: number = typeof msg.prompt_tokens === "number"
+            ? msg.prompt_tokens
+            : cachedTokens + prefillTokens;
+          const usage: any = {
+            prompt_tokens: promptTokens,
+            completion_tokens: completion,
+            total_tokens: promptTokens + completion,
+            // Pi's openai-completions adapter reads BOTH cacheRead and
+            // cacheWrite from `prompt_tokens_details` (NOT the
+            // Anthropic-style top-level fields). Per
+            // packages/ai/src/providers/openai-completions.ts in
+            // earendil-works/pi:
+            //   cacheRead  ← prompt_tokens_details.cached_tokens
+            //                (or prompt_cache_hit_tokens)
+            //   cacheWrite ← prompt_tokens_details.cache_write_tokens
+            //   input      ← prompt_tokens − cacheRead − cacheWrite
+            // Emitting these nested fields is what populates Pi's
+            // `cacheWrite` column. Emit them unconditionally (0 when
+            // empty) so clients see a stable shape.
+            prompt_tokens_details: {
+              cached_tokens: cachedTokens,
+              cache_write_tokens: prefillTokens,
+            },
+          };
+          // Anthropic-shape top-level mirror (some other multi-provider
+          // clients read these). Harmless to emit alongside the OpenAI
+          // nested shape Pi uses.
+          //   cache_read_input_tokens     ≡ cached_tokens (LCP hit)
+          //   cache_creation_input_tokens ≡ new tokens prefilled this turn
+          usage.cache_read_input_tokens = cachedTokens;
+          usage.cache_creation_input_tokens = prefillTokens;
+          return usage;
+        };
+        // Per-request perf/spec-decode metrics for the streaming final chunk.
+        // `tau`/`cycles`/`dflash` surface DFlash spec-decode effectiveness (mean
+        // accepted tokens per verify cycle) for benchmarking/observability;
+        // they're absent on the AR path.
+        const buildTimings = (m: any) => ({
+          tokens: m.tokens, tok_s: m.tok_s, prefill_tokens: m.prefill_tokens,
+          prefill_ms: m.prefill_ms, prefill_tok_s: m.prefill_tok_s,
+          decode_tok_s: m.decode_tok_s, ttft_ms: m.ttft_ms,
+          tau: m.tau, cycles: m.cycles, dflash: m.dflash,
+        });
 
         // OpenAI o1/o3-style `reasoning.effort` (none / minimal / low /
         // medium / high / xhigh). Open WebUI, OpenCode, and pi-coding-agent
@@ -1740,9 +2208,15 @@ async function serve(port: number, host: string) {
           type: "generate", id: reqId, prompt: userPrompt,
           temperature: (body.temperature ?? effective.temperature) * TEMP_CORRECTION,
           max_tokens: requestMaxTokens,
-          repeat_penalty: body.repeat_penalty ?? (oaiPenaltySet ? 1.0 + oaiPenalty : effective.repeat_penalty),
+          // The daemon now applies OpenAI presence/frequency penalties natively
+          // (subtractive, over the full repeat window) — strictly better than the
+          // old #79 fold into the multiplicative repeat_penalty. Pass them raw.
+          repeat_penalty: body.repeat_penalty ?? effective.repeat_penalty,
+          presence_penalty: Math.max(0, Number(body.presence_penalty) || 0),
+          frequency_penalty: Math.max(0, Number(body.frequency_penalty) || 0),
           top_p: body.top_p ?? effective.top_p,
         };
+        void oaiPenalty; void oaiPenaltySet; // superseded by native presence/frequency
         // Mirror the `hipfire run` path's per-model max_think_tokens
         // propagation. Without this, models with thinking=on can consume
         // the entire max_tokens budget inside a single <think>...</think>
@@ -1782,8 +2256,29 @@ async function serve(port: number, host: string) {
         } else if ((body as any).reasoning?.effort === "none") {
           genParams.assistant_prefix = "closed_think";
           genParams.max_think_tokens = 1;
+        } else {
+          // Thinking is ON (config default, or explicit enable_thinking=true /
+          // reasoning.effort>=minimal). OPEN the <think> block so the model
+          // actually reasons instead of emitting an empty <think></think> and
+          // answering directly. Without this, generic OpenAI clients (which
+          // never send assistant_prefix) get no-think behaviour, which fails
+          // hard reasoning on thinking models like Qwen3.6. Safe for non-
+          // thinking models: the daemon's prompt frame falls back to Plain
+          // when the tokenizer has no `<think>` special token.
+          genParams.assistant_prefix = "open_think";
         }
         if (systemPrompt) genParams.system = systemPrompt;
+
+        if (requestImages.length === 1) {
+          if (!modelHasVL) {
+            safeRelease();
+            return Response.json(
+              { error: { message: "model has no vision encoder", type: "invalid_request_error" } },
+              { status: 400 },
+            );
+          }
+          genParams.image_base64 = requestImages[0];
+        }
 
         // Phase 2: structured tools + messages passed alongside the
         // legacy prompt/system text. Under HIPFIRE_JINJA_CHAT=1 the
@@ -1823,6 +2318,39 @@ async function serve(port: number, host: string) {
         // This is a stopgap. The proper fix is MQ4 calibration retraining with
         // tool-call samples weighted on structured tokens; tracked in
         // MANUAL_REVIEW.md against #111.
+        // Detect mid-tool-call truncation. The model emitted `<tool_call>`
+        // (one or more) but the count of `</tool_call>` closers is lower,
+        // meaning the JSON inside an open block was cut off when decode
+        // hit the `max_tokens` cap. The OpenAI-correct signal is
+        // `finish_reason: "length"` (truncation), but without an extra
+        // hint clients can't distinguish "model wrote a long answer that
+        // hit the cap" from "model was midway through a tool call". We
+        // attach a `truncation` object so Pi-style clients can offer the
+        // user a single-click retry with a larger `max_tokens` budget.
+        //
+        // Slack of 4 tokens absorbs daemon-side post-loop trailer emits
+        // (`<|im_end|>\n` etc. that get force-flushed after the decode
+        // loop terminates on cap).
+        function detectToolCallTruncation(
+          text: string,
+          decodedTokens: number,
+          maxTokensCap: number,
+        ): { reason: string; max_tokens_used: number; suggested_max_tokens: number } | null {
+          const opens = (text.match(/<tool_call>/g) || []).length;
+          const closes = (text.match(/<\/tool_call>/g) || []).length;
+          if (opens <= closes) return null;
+          if (decodedTokens < maxTokensCap - 4) return null;
+          return {
+            reason: "max_tokens_in_tool_call",
+            max_tokens_used: decodedTokens,
+            // 4× the requested budget, capped at 32k. Empirically a single
+            // `write` tool call containing a small file (~500 LoC) needs
+            // 2-4k tokens; a 4× bump from the standard 4096 default
+            // covers the typical case without unbounded blow-up.
+            suggested_max_tokens: Math.min(Math.max(maxTokensCap * 4, 4096), 32768),
+          };
+        }
+
         function parseToolCalls(text: string): { content: string | null; tool_calls: any[] | null } {
           if (!text.includes("<tool_call>")) return { content: text, tool_calls: null };
           const pattern = /<tool_call>\s*(.*?)\s*<\/tool_call>|<tool_call>\s*(.*)/gs;
@@ -1844,6 +2372,33 @@ async function serve(port: number, host: string) {
             while (raw.startsWith("<tool_call>")) {
               raw = raw.slice("<tool_call>".length).trimStart();
               nestedStripped++;
+            }
+            // Inner-block recovery: when the outer match captured a
+            // garbled prelude with a NESTED `<tool_call>...</tool_call>`
+            // inside it (e.g. qwen3.6:27b sometimes emits
+            // `<tool_call>\n<|im_start|>name: bash\n</think>\n\n<tool_call>\n{json}\n</tool_call>`),
+            // the outer regex matched the OUTER `</tool_call>` and we
+            // got the entire garbled prelude + the inner block as one
+            // payload. Strip up to the LAST `<tool_call>` opener and
+            // try parsing from there — recovers the model's intent
+            // when it self-corrected mid-stream.
+            const lastInnerOpen = raw.lastIndexOf("<tool_call>");
+            if (lastInnerOpen >= 0) {
+              const innerRaw = raw.slice(lastInnerOpen + "<tool_call>".length).trimStart();
+              const innerClose = innerRaw.indexOf("</tool_call>");
+              const candidate = (innerClose >= 0 ? innerRaw.slice(0, innerClose) : innerRaw).trim();
+              if (candidate) {
+                const innerParsed = parseOneToolCall(candidate);
+                if (innerParsed) {
+                  repaired++;
+                  tool_calls.push({
+                    id: `call_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
+                    type: "function",
+                    function: { name: innerParsed.name, arguments: JSON.stringify(innerParsed.arguments || {}) }
+                  });
+                  continue;
+                }
+              }
             }
             if (!raw) continue;
             const parsed = parseOneToolCall(raw);
@@ -1869,7 +2424,20 @@ async function serve(port: number, host: string) {
         // null when the payload is unrecoverable. `repaired === true` means we
         // had to coerce off-spec JSON / XML-tag shapes; valid OpenAI-spec input
         // sets repaired=false.
-        function parseOneToolCall(raw: string): { name: string; arguments: any; repaired: boolean } | null {
+        function parseOneToolCall(rawInput: string): { name: string; arguments: any; repaired: boolean } | null {
+          // Sanitize ChatML special-token leakage. qwen3.6:27b occasionally
+          // emits `<|im_start|>` / `<|im_end|>` / `<|endoftext|>` literally
+          // INSIDE the tool-call body (tokenizer quirk where the special-
+          // token boundary glues onto the JSON key). These tokens should
+          // never appear inside a tool call; strip them before any form
+          // probe so the cleaned payload has a chance at JSON.parse.
+          let raw = rawInput
+            .replace(/<\|im_start\|>/g, "")
+            .replace(/<\|im_end\|>/g, "")
+            .replace(/<\|endoftext\|>/g, "")
+            .replace(/<\|im_sep\|>/g, "")
+            .trim();
+          const sanitized = raw !== rawInput.trim();
           // Form 1: spec-compliant {"name": ..., "arguments": {...}}.
           try {
             const tc = JSON.parse(raw);
@@ -1958,6 +2526,63 @@ async function serve(port: number, host: string) {
             // dropped when only the name is recoverable.
             return { name: nm[1], arguments: {}, repaired: true };
           }
+          // Form 4: last-resort field-level extraction. Some models
+          // (qwen3.6:27b specifically) emit broken-JSON payloads where
+          // the outer `{` is missing and/or special tokens corrupt the
+          // structure (e.g. `<|im_start|>name": "write", "arguments":
+          // {"path": "..."}}`). Pull `name` and `arguments` via regex
+          // independently — if BOTH are present in any form, we can
+          // synthesize a valid tool call.
+          //
+          // Match `"name": "ident"` with the leading/trailing quote
+          // OPTIONAL on the key. qwen3.6:27b's failure mode is the
+          // special token REPLACING the opening `"` of the `name` key
+          // (`<|im_start|>name": "X"` after sanitization leaves
+          // `name": "X"` — note the unbalanced quotes around `name`).
+          // Restrict the captured identifier to JSON-style identifiers
+          // so we don't match arbitrary text after the literal `name`.
+          // `(?<![A-Za-z_])` word-boundary lookbehind so the regex
+          // doesn't match `name` inside other JSON keys like
+          // `firstname`, `displayname`, `parameter_name`. Without it
+          // a payload like `{"firstname":"X","name":"read"}` would
+          // capture "X" as the function name instead of "read". The
+          // daemon's `extract_tool_call_name_fallback` does the same
+          // check via a key-position pre-byte test (`daemon.rs`).
+          const nameMatch = raw.match(/(?<![A-Za-z_])["']?name["']?\s*:\s*["']([A-Za-z_][\w.-]*)["']/);
+          if (nameMatch) {
+            const fname = nameMatch[1];
+            // Try to locate the `"arguments":` key and grab the balanced
+            // object after it. If no such key, fall back to the FIRST
+            // balanced `{...}` in the payload (some shapes have args
+            // inlined as the top-level body).
+            const argsLeader = raw.match(/["']arguments["']\s*:\s*/);
+            let args: any = null;
+            if (argsLeader && argsLeader.index !== undefined) {
+              const tail = raw.slice(argsLeader.index + argsLeader[0].length);
+              args = extractFirstJsonObject(tail);
+            }
+            if (args === null) args = extractFirstJsonObject(raw);
+            if (args === null) {
+              // No strict-valid args object. If a brace-balanced object IS
+              // present, it's a model formatting glitch (trailing comma,
+              // unquoted key, …) — keep the call with empty args (legacy).
+              // Otherwise the call was truncated mid-args (max_tokens / grammar
+              // force-close): drop it so the emission surfaces as content +
+              // finish_reason rather than a phantom `write({})` that fails
+              // schema validation (the write-tool empty-args incident). Mirrors
+              // daemon.rs:extract_tool_calls_from_text.
+              if (jsonObjectIsComplete(raw)) return { name: fname, arguments: {}, repaired: true };
+              return null;
+            }
+            return { name: fname, arguments: args, repaired: true };
+          }
+          if (sanitized) {
+            // Last-ditch: we stripped tokens but couldn't find a name.
+            // Surface the sanitization on stderr so operators see why a
+            // visible `<tool_call>` block in the daemon stream didn't
+            // produce a structured call.
+            console.error(`[hipfire] tool_call: stripped ChatML special tokens but could not extract a name (raw=${rawInput.slice(0, 100).replace(/\n/g, "\\n")})`);
+          }
           return null;
         }
 
@@ -2007,6 +2632,30 @@ async function serve(port: number, host: string) {
           return null;
         }
 
+        // True iff a brace-balanced `{...}` exists in `s` — the object is
+        // COMPLETE (not truncated) even when it isn't strict JSON. Lets Form 4
+        // distinguish a model formatting glitch (trailing comma / unquoted key
+        // — keep the call) from a call cut off mid-args (drop it). Mirrors
+        // daemon.rs:tool_call_args_object_complete.
+        function jsonObjectIsComplete(s: string): boolean {
+          const start = s.indexOf("{");
+          if (start < 0) return false;
+          let depth = 0, inStr = false, escape = false;
+          for (let i = start; i < s.length; i++) {
+            const ch = s[i];
+            if (inStr) {
+              if (escape) { escape = false; continue; }
+              if (ch === "\\") { escape = true; continue; }
+              if (ch === '"') inStr = false;
+              continue;
+            }
+            if (ch === '"') { inStr = true; continue; }
+            if (ch === "{") depth++;
+            else if (ch === "}") { depth--; if (depth === 0) return true; }
+          }
+          return false;
+        }
+
         if (body.stream) {
           const enc = new TextEncoder();
           let completionTokens = 0;
@@ -2036,11 +2685,52 @@ async function serve(port: number, host: string) {
                 if (visibleChunkSent || streamCancelled) return;
                 try { ctrl.enqueue(enc.encode(": prefill\n\n")); } catch {}
               }, 10_000);
+              // Force-answer watchdog: if a thinking-heavy turn runs longer
+              // than the budget, ask the daemon to STOP THINKING and commit
+              // to the answer (it splices the think-close continuation) rather
+              // than letting the client give up and terminate the stream
+              // mid-think. One-shot. Disable with HIPFIRE_FORCE_ANSWER_SECS=0.
+              const forceAnswerSecs = parseInt(process.env.HIPFIRE_FORCE_ANSWER_SECS ?? "180", 10);
+              let forceAnswerSent = false;
+              const forceAnswerTimer = forceAnswerSecs > 0
+                ? setTimeout(async () => {
+                    if (forceAnswerSent || streamCancelled) return;
+                    forceAnswerSent = true;
+                    console.error(`[hipfire] force-answer after ${forceAnswerSecs}s (reqId=${reqId}) — asking daemon to close <think> and answer`);
+                    try { await e.send({ type: "force_answer", id: reqId }); } catch (err: any) {
+                      console.error(`[hipfire] force_answer send failed: ${err?.message || err}`);
+                    }
+                  }, forceAnswerSecs * 1000)
+                : null;
               try {
-                let inThink = false;
+                // open_think injects the opening <think> into the PROMPT, so the
+                // output begins inside the think span (no <think> token to detect
+                // at 2725). Start in-think so the leading reasoning streams as
+                // reasoning_content and is split off content at the first </think>.
+                let inThink = genParams.assistant_prefix === "open_think";
                 let stripNextLeadingNl = false;
+                // Track whether we've emitted any visible content yet. Used
+                // to detect an orphan `</think>` opener — when the daemon
+                // prefills `<think>\n\n</think>\n\n` for `enable_thinking=false`,
+                // the model often resumes by emitting ANOTHER `</think>\n\n`
+                // (training-distribution artifact, the model learned the
+                // close pattern follows the open). Without an orphan-strip
+                // check, that `</think>` leaks into delta.content and a
+                // client like pi-coding-agent stores it in conversation
+                // history verbatim — which then defeats the asst-turn
+                // cache fingerprint on the next request. (Lookup-side
+                // fingerprint also applies the same strip, so the cache
+                // still hits even if a stale client preserves the orphan.)
+                let firstAssistantChunk = true;
                 // When tools are present, accumulate full output for tool-call parsing
                 let accumulated = hasTool ? "" : null;
+                // V4F arm emits structured `tool_calls` events via the DSML
+                // StreamParser BEFORE the `done` event lands. We track that
+                // here so the done handler can finish with
+                // `finish_reason: "tool_calls"` instead of falling back to
+                // `"stop"` (OpenAI spec — Pi / OpenCode use this signal to
+                // decide whether the message ended with a callable action).
+                let structuredToolCallsEmitted = false;
                 for await (const msg of e.generate(genParams)) {
                   if (streamCancelled) continue; // drain remaining tokens, don't enqueue
                   // Long-prefill keep-alive. Gemma 4's per-token prefill on
@@ -2096,6 +2786,18 @@ async function serve(port: number, host: string) {
                     text = text.replace(/<\|im_end\|>/g, "");
                     if (!text) continue;
                     if (stripNextLeadingNl) { text = text.replace(/^\n+/, ""); stripNextLeadingNl = false; if (!text) continue; }
+                    if (firstAssistantChunk) {
+                      // Orphan `</think>` opener strip — see firstAssistantChunk
+                      // comment above. Only fires before any visible content
+                      // has been emitted, so a legitimate `</think>` literal
+                      // later in a code block isn't affected.
+                      const stripped = text.replace(/^\s*<\/think>\s*/, "");
+                      if (stripped !== text) {
+                        text = stripped;
+                        if (!text) continue;
+                      }
+                      firstAssistantChunk = false;
+                    }
                     if (accumulated !== null) {
                       accumulated += text; // buffer for tool-call parsing at end
                     } else {
@@ -2105,12 +2807,117 @@ async function serve(port: number, host: string) {
                       })}\n\n`));
                       visibleChunkSent = true;
                     }
+                  } else if (msg.type === "reasoning") {
+                    // V4F daemon arm emits structured `reasoning` events
+                    // from the DSML StreamParser; `<think>` / `</think>`
+                    // have already been stripped server-side. Forward as
+                    // OpenAI-compatible `reasoning_content` delta.
+                    const rtext = msg.text as string;
+                    if (rtext) {
+                      ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
+                        id: reqId, object: "chat.completion.chunk", created, model: modelName,
+                        choices: [{ index: 0, delta: { reasoning_content: rtext }, finish_reason: null }]
+                      })}\n\n`));
+                      visibleChunkSent = true;
+                    }
+                  } else if (msg.type === "tool_calls") {
+                    // Daemon-side structured tool_calls events. Two emitters:
+                    //   - V4F's DSML StreamParser (token-by-token)
+                    //   - qwen35 daemon (single event after decode, from
+                    //     `extract_tool_calls_from_text` over the full
+                    //     decoded text — same parser that hashes the
+                    //     asst-turn cache fingerprint, so what we emit
+                    //     here is byte-identical to what Pi echoes back
+                    //     and what we'll look up next turn).
+                    //
+                    // For qwen35 the text tokens streamed BEFORE this
+                    // event include the `<tool_call>{...}</tool_call>`
+                    // markup raw — buffered in `accumulated` but not yet
+                    // sent on the wire. We split the prose (text before
+                    // first `<tool_call>`) and emit it as a single
+                    // content chunk before the structured tool_calls
+                    // chunks, so the SSE order is: prose → tool_calls →
+                    // done (OpenAI canonical). V4F's stream already
+                    // stripped the markup token-side, so the split is a
+                    // no-op in practice for it.
+                    if (accumulated !== null && accumulated.length > 0) {
+                      const tcIdx = accumulated.indexOf("<tool_call>");
+                      const prose = (tcIdx >= 0 ? accumulated.slice(0, tcIdx) : accumulated).trim();
+                      if (prose) {
+                        ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
+                          id: reqId, object: "chat.completion.chunk", created, model: modelName,
+                          choices: [{ index: 0, delta: { content: prose }, finish_reason: null }]
+                        })}\n\n`));
+                        visibleChunkSent = true;
+                      }
+                      // Mark accumulated as already-flushed for the done
+                      // handler so it doesn't double-emit on the
+                      // structuredToolCallsEmitted path.
+                      accumulated = "";
+                    }
+                    const calls = Array.isArray(msg.calls) ? msg.calls : [];
+                    for (let i = 0; i < calls.length; i++) {
+                      const c = calls[i] as { name: string; arguments: unknown };
+                      const argStr = typeof c.arguments === "string"
+                        ? c.arguments
+                        : JSON.stringify(c.arguments);
+                      ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
+                        id: reqId, object: "chat.completion.chunk", created, model: modelName,
+                        choices: [{
+                          index: 0,
+                          delta: {
+                            tool_calls: [{
+                              index: i,
+                              id: `call_${reqId}_${i}`,
+                              type: "function",
+                              function: { name: c.name, arguments: argStr }
+                            }]
+                          },
+                          finish_reason: null
+                        }]
+                      })}\n\n`));
+                      visibleChunkSent = true;
+                      structuredToolCallsEmitted = true;
+                    }
                   } else if (msg.type === "done") {
                     // Every path below enqueues at least the [DONE] sentinel.
                     visibleChunkSent = true;
+                    // Daemon-authoritative finish_reason (V4F sets it
+                    // from the decode-loop exit condition). Falls back
+                    // to "stop" when an older daemon build didn't carry
+                    // the field, preserving legacy behaviour for the
+                    // Qwen35 / LLaMA / Qwen2 arches that don't yet emit
+                    // it. Only "stop" | "length" | "tool_calls" are
+                    // OpenAI-valid; clamp anything else to "stop".
+                    const allowedFR = new Set(["stop", "length", "tool_calls"]);
+                    const daemonFR: string | null = typeof (msg as any).finish_reason === "string" && allowedFR.has((msg as any).finish_reason)
+                      ? (msg as any).finish_reason
+                      : null;
+                    // V4F-style: structured tool_calls already emitted on the
+                    // wire. Skip the legacy text-buffer parser path and close
+                    // out with the OpenAI-correct `finish_reason: "tool_calls"`.
+                    if (structuredToolCallsEmitted) {
+                      ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
+                        id: reqId, object: "chat.completion.chunk", created, model: modelName,
+                        choices: [{ index: 0, delta: {}, finish_reason: daemonFR ?? "tool_calls" }],
+                        ...includeUsage && { usage: buildUsage(msg, completionTokens) },
+                        timings: buildTimings(msg),
+                      })}\n\n`));
+                      ctrl.enqueue(enc.encode("data: [DONE]\n\n"));
+                      ctrl.close();
+                      return;
+                    }
                     // When tools are present, parse accumulated text for tool calls
                     if (accumulated !== null) {
                       const parsed = parseToolCalls(accumulated);
+                      // Check for mid-tool-call truncation BEFORE falling back
+                      // to finish_reason="stop". If parseToolCalls returned no
+                      // tool_calls but the text contains an unclosed
+                      // `<tool_call>` block AND decode hit the cap, this is a
+                      // budget-truncation, not a natural stop.
+                      const truncation = !parsed.tool_calls
+                        ? detectToolCallTruncation(accumulated, (msg as any).tokens ?? 0, requestMaxTokens)
+                        : null;
                       if (parsed.tool_calls) {
                         if (parsed.content) {
                           ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
@@ -2126,28 +2933,38 @@ async function serve(port: number, host: string) {
                         }
                         ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
                           id: reqId, object: "chat.completion.chunk", created, model: modelName,
-                          choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }]
+                          choices: [{ index: 0, delta: {}, finish_reason: daemonFR ?? "tool_calls" }],
+                          ...includeUsage && { usage: buildUsage(msg, completionTokens) },
+                          timings: buildTimings(msg),
                         })}\n\n`));
                       } else {
-                        // No tool calls — flush accumulated content
                         if (accumulated) {
                           ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
                             id: reqId, object: "chat.completion.chunk", created, model: modelName,
                             choices: [{ index: 0, delta: { content: accumulated }, finish_reason: null }]
                           })}\n\n`));
                         }
-                        ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
+                        const finishReason = truncation
+                          ? "length"
+                          : (daemonFR ?? "stop");
+                        const finalChunk: any = {
                           id: reqId, object: "chat.completion.chunk", created, model: modelName,
-                          choices: [{ index: 0, delta: {}, finish_reason: "stop" }]
-                        })}\n\n`));
+                          choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
+                        };
+                        if (includeUsage) finalChunk.usage = buildUsage(msg, completionTokens);
+                        if (truncation) finalChunk.truncation = truncation;
+                        // Surface perf/spec-decode metrics on the tool-call final chunk too
+                        // (matches the plain-text branch) so benchmarks see timings on
+                        // tool-calling turns.
+                        finalChunk.timings = buildTimings(msg);
+                        ctrl.enqueue(enc.encode(`data: ${JSON.stringify(finalChunk)}\n\n`));
                       }
                     } else {
-                      const { tokens, tok_s, prefill_tokens, prefill_ms, prefill_tok_s, decode_tok_s, ttft_ms } = msg;
                       ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
                         id: reqId, object: "chat.completion.chunk", created, model: modelName,
-                        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-                        ...includeUsage && { usage: { prompt_tokens: msg.prefill_tokens, completion_tokens: completionTokens, total_tokens: msg.prefill_tokens + completionTokens } },
-                        timings: { tokens, tok_s, prefill_tokens, prefill_ms, prefill_tok_s, decode_tok_s, ttft_ms }
+                        choices: [{ index: 0, delta: {}, finish_reason: daemonFR ?? "stop" }],
+                        ...includeUsage && { usage: buildUsage(msg, completionTokens) },
+                        timings: buildTimings(msg)
                       })}\n\n`));
                     }
                     ctrl.enqueue(enc.encode("data: [DONE]\n\n"));
@@ -2172,25 +2989,144 @@ async function serve(port: number, host: string) {
                 try { ctrl.close(); } catch {}
               } finally {
                 clearInterval(heartbeat);
+                if (forceAnswerTimer) clearTimeout(forceAnswerTimer);
                 e.generating = false;
                 safeRelease();
               }
             },
-            cancel() { streamCancelled = true; } // lock released in finally after generation drains
+            // Streaming branch cancel. Set the local flag so the for-await
+            // loop drains daemon events without writing more SSE chunks,
+            // AND send `{type:"abort","id":"<reqId>"}` to the daemon so its
+            // prefill chunk loop bails at the next checkpoint. Same protocol
+            // as the non-stream branch — see project_daemon_abort_protocol
+            // memory + cli/index.ts:3034. Without this, Pi/opencode/etc.
+            // dropping a streaming connection mid-prefill leaves the daemon
+            // burning the full 23K-token re-prefill while no client is
+            // listening, locking out the next request for several minutes.
+            async cancel() {
+              console.error(`[hipfire] stream client cancelled (reqId=${reqId}) — sending abort to daemon`);
+              streamCancelled = true;
+              try {
+                await e.send({ type: "abort", id: reqId });
+                console.error(`[hipfire] abort sent (reqId=${reqId})`);
+              } catch (err: any) {
+                console.error(`[hipfire] stream abort send failed: ${err?.message || err}`);
+              }
+            }
           }), { headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" } });
         }
 
+        // Non-stream chat-completion with heartbeat. The OpenAI-style
+        // non-streaming response is a single JSON body, but Bun's
+        // server-side connection idleTimeout is capped at 255s — and
+        // on 27B with a 30K+-token agent context the daemon's prefill
+        // (one synchronous device call per chunk, zero events until
+        // first sampled token) sits silent for 3–5 minutes. The Bun
+        // socket then idle-closes and the client (Pi, opencode, etc.)
+        // sees "terminated".
+        //
+        // Fix: deliver the response body via a `ReadableStream` and
+        // emit a single space byte every 10s before the JSON is ready.
+        // JSON RFC 8259 §2 allows whitespace anywhere between value
+        // tokens, so a leading-space prefix parses identically on any
+        // lenient JSON client. Each byte enqueued resets Bun's idle
+        // timer. Errors thrown inside the worker land in the catch
+        // and emit a JSON error body (status stays 200 because the
+        // header has already been sent — clients should check for the
+        // `error` field, matching the existing streaming-error
+        // convention).
+        const nsEnc = new TextEncoder();
+        // `nsClientAborted` is set by the ReadableStream's `cancel()`
+        // callback when the client closes the socket (curl `-m` timeout,
+        // Pi / opencode giving up, etc.). The worker checks this flag in
+        // its event loop and stops processing tokens / building the
+        // response — but it MUST keep draining `e.generate` until the
+        // daemon's `done` event lands. Skipping the drain leaves the
+        // EngineConnection with stale events queued for the NEXT
+        // request, which would corrupt that request's response.
+        // Same pattern as the streaming branch (cli/index.ts:2518).
+        let nsClientAborted = false;
+        const nsResponse = new Response(new ReadableStream({
+          async start(ctrl) {
+            let bodyDelivered = false;
+            const heartbeat = setInterval(() => {
+              if (bodyDelivered) return;
+              try { ctrl.enqueue(nsEnc.encode(" ")); } catch {}
+            }, 10_000);
+            try {
         let content = "";
         let completionTokens = 0;
         let promptTokens = 0;
+        let cachedTokens = 0;
         let daemonError: string | null = null;
         e.generating = true;
+        // V4F arm emits structured `tool_calls` events from the DSML
+        // StreamParser. Capture them here so the non-streaming chat-
+        // completion response can carry an OpenAI-format `tool_calls`
+        // array on the assistant message. Without this, the non-stream
+        // path falls back to `parseToolCalls(content)` on the
+        // (typically empty) accumulated text and returns
+        // `finish_reason: "stop"` with a missing `tool_calls` field.
+        let structuredToolCalls: any[] | null = null;
+        // Name-shadowing avoidance: the outer scope has `reasoning`
+        // bound to the request-level reasoning *config* (effort, etc.).
+        // Use `reasoningContent` for the accumulated `<think>…</think>`
+        // body that surfaces under `message.reasoning_content` below.
+        let reasoningContent = "";
+        let daemonFinishReason: string | null = null;
         for await (const msg of e.generate(genParams)) {
+          if (nsClientAborted) continue; // drain remaining daemon events, don't accumulate
           if (msg.type === "token") { content += msg.text; completionTokens++; }
-          else if (msg.type === "done") { promptTokens = msg.prefill_tokens ?? 0; }
+          else if (msg.type === "reasoning") {
+            // V4F's StreamParser splits `<think>…</think>` content out
+            // as `reasoning` events. Accumulate so the non-stream chat
+            // completion response can surface it under
+            // `message.reasoning_content` — without this the reasoning
+            // text was silently dropped on every think-mode V4F turn.
+            if (typeof msg.text === "string") reasoningContent += msg.text;
+          }
+          else if (msg.type === "done") {
+            // `prompt_tokens` is the full client-visible prompt size
+            // (V4F emits it). When absent, derive as `cached + prefill`
+            // — i.e. the total of cached-hit tokens plus the new tokens
+            // actually pushed through the forward path this turn. The
+            // legacy "just use prefill_tokens" fallback was wrong on
+            // cache hits, producing `prompt_tokens < cached_tokens`
+            // which contradicts the OpenAI usage spec.
+            cachedTokens = typeof msg.cached_tokens === "number"
+              ? msg.cached_tokens
+              : 0;
+            const _prefill = typeof msg.prefill_tokens === "number"
+              ? msg.prefill_tokens
+              : 0;
+            promptTokens = typeof msg.prompt_tokens === "number"
+              ? msg.prompt_tokens
+              : cachedTokens + _prefill;
+            // V4F daemon emits an authoritative finish_reason. Only
+            // accept the three OpenAI-valid values; anything else falls
+            // back to the legacy inference below.
+            if (msg.finish_reason === "stop" || msg.finish_reason === "length" || msg.finish_reason === "tool_calls") {
+              daemonFinishReason = msg.finish_reason;
+            }
+          }
           else if (msg.type === "error") { daemonError = msg.message || "generation failed"; }
-          // prefill_progress is a no-op on the non-streaming path (client is
-          // waiting for the final JSON anyway).
+          else if (msg.type === "tool_calls") {
+            const calls = Array.isArray((msg as any).calls) ? (msg as any).calls : [];
+            if (calls.length > 0) {
+              if (structuredToolCalls === null) structuredToolCalls = [];
+              for (let i = 0; i < calls.length; i++) {
+                const c = calls[i] as { name: string; arguments: unknown };
+                const argStr = typeof c.arguments === "string"
+                  ? c.arguments
+                  : JSON.stringify(c.arguments);
+                structuredToolCalls.push({
+                  id: `call_${reqId}_${structuredToolCalls.length}`,
+                  type: "function",
+                  function: { name: c.name, arguments: argStr }
+                });
+              }
+            }
+          }
         }
         e.generating = false;
 
@@ -2200,9 +3136,16 @@ async function serve(port: number, host: string) {
         // too-large request can't distinguish failure from a zero-token reply.
         if (daemonError) {
           safeRelease();
+          let status = 500;
+          const err = daemonError.toLowerCase();
+          if (err.includes("maximum size") || err.includes("exceeds maximum")) status = 413;
+          else if (err.includes("no vision encoder") || err.includes("unsupported image format")
+            || err.includes("image dimensions") || err.includes("failed to decode base64")
+            || err.includes("failed to decode image") || err.includes("exceeds loaded kv budget"))
+            status = 400;
           return Response.json(
             { error: { message: daemonError, type: "invalid_request_error" } },
-            { status: 400 }
+            { status }
           );
         }
 
@@ -2214,13 +3157,7 @@ async function serve(port: number, host: string) {
         // representation including reasoning. <|im_end|> stripping always
         // applies (it would break clients that re-encode message history).
         const strippedContent = content;
-        if (preserveThinking) {
-          content = content.replace(/<\|im_end\|>/g, "").trim();
-        } else {
-          content = content.replace(/<think>[\s\S]*?<\/think>\s*/g, "")
-            .replace(/<think>[\s\S]*$/, "") // unclosed think block
-            .replace(/<\|im_end\|>/g, "").trim();
-        }
+        content = stripVisibleThinking(content, preserveThinking, genParams.assistant_prefix === "open_think");
 
         // Diagnostic: detect empty-after-unclosed-think-strip.
         let thinkWarning: string | null = null;
@@ -2229,25 +3166,133 @@ async function serve(port: number, host: string) {
           console.error(`[hipfire] ${reqId}: ${thinkWarning} — ${completionTokens} tokens consumed, all inside unclosed <think> block`);
         }
 
-        // Check for tool calls in response
-        const parsed = parseToolCalls(content);
-        const choice: any = { index: 0, finish_reason: parsed.tool_calls ? "tool_calls" : "stop" };
-        if (parsed.tool_calls) {
-          choice.message = { role: "assistant", content: parsed.content, tool_calls: parsed.tool_calls };
+        // Tool calls. V4F and qwen35 daemon arms yield them as
+        // structured `tool_calls` events (captured above into
+        // `structuredToolCalls`). Legacy arches embed them as text
+        // the parser extracts. Prefer the structured source when it
+        // emitted anything.
+        const choice: any = { index: 0 };
+        if (structuredToolCalls && structuredToolCalls.length > 0) {
+          // For qwen35 the `content` variable holds the full raw token
+          // stream including the `<tool_call>{...}</tool_call>` markup
+          // (daemon doesn't strip those token-side). Split prose from
+          // markup so `message.content` doesn't double-deliver the
+          // tool_call to the client. V4F already stripped markup
+          // token-side, so the split is a no-op for that arch.
+          const tcIdx = content.indexOf("<tool_call>");
+          const prose = tcIdx >= 0 ? content.slice(0, tcIdx).trim() : content.trim();
+          choice.finish_reason = daemonFinishReason ?? "tool_calls";
+          choice.message = {
+            role: "assistant",
+            content: prose || null,
+            tool_calls: structuredToolCalls,
+          };
+          if (reasoningContent) choice.message.reasoning_content = reasoningContent;
         } else {
-          choice.message = { role: "assistant", content };
+          const parsed = parseToolCalls(content);
+          // Prefer the daemon's authoritative finish_reason (V4F).
+          // Fall back to the legacy inference: "tool_calls" if the
+          // text parser found inline tool calls, otherwise "stop" —
+          // but if the daemon told us "length" (max_tokens hit), use
+          // that even when there's no tool call, so clients can
+          // detect truncated replies.
+          const nonStreamTruncation = !parsed.tool_calls
+            ? detectToolCallTruncation(content, completionTokens, requestMaxTokens)
+            : null;
+          choice.finish_reason = nonStreamTruncation
+            ? "length"
+            : (daemonFinishReason ?? (parsed.tool_calls ? "tool_calls" : "stop"));
+          if (parsed.tool_calls) {
+            choice.message = { role: "assistant", content: parsed.content, tool_calls: parsed.tool_calls };
+          } else {
+            choice.message = { role: "assistant", content };
+          }
+          if (reasoningContent) choice.message.reasoning_content = reasoningContent;
+          // Stash for response-builder below.
+          (choice as any)._truncation = nonStreamTruncation;
         }
 
         safeRelease();
         const responseBody: any = {
           id: reqId, object: "chat.completion", created, model: modelName,
           choices: [choice],
-          usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens }
+          usage: (() => {
+            const cacheWriteTokens = Math.max(0, promptTokens - cachedTokens);
+            // Pi's openai-completions provider
+            // (packages/ai/src/providers/openai-completions.ts in
+            // earendil-works/pi) reads BOTH cacheRead and cacheWrite
+            // from `prompt_tokens_details`:
+            //   cacheRead  ← prompt_tokens_details.cached_tokens
+            //   cacheWrite ← prompt_tokens_details.cache_write_tokens
+            //   input      ← prompt_tokens − cacheRead − cacheWrite
+            // Emit both nested fields so Pi's display shows non-zero
+            // cacheWrite alongside cacheRead on cache hits.
+            const u: any = {
+              prompt_tokens: promptTokens,
+              completion_tokens: completionTokens,
+              total_tokens: promptTokens + completionTokens,
+              prompt_tokens_details: {
+                cached_tokens: cachedTokens,
+                cache_write_tokens: cacheWriteTokens,
+              },
+            };
+            // Anthropic-shape top-level mirror for non-Pi multi-provider
+            // clients.
+            u.cache_read_input_tokens = cachedTokens;
+            u.cache_creation_input_tokens = cacheWriteTokens;
+            return u;
+          })(),
         };
         if (thinkWarning) {
           responseBody.x_hipfire_warning = thinkWarning;
         }
-        return Response.json(responseBody);
+        const nonStreamTrunc = (choice as any)._truncation;
+        if (nonStreamTrunc) {
+          delete (choice as any)._truncation;
+          responseBody.truncation = nonStreamTrunc;
+        }
+              bodyDelivered = true;
+              ctrl.enqueue(nsEnc.encode(JSON.stringify(responseBody)));
+              ctrl.close();
+            } catch (err: any) {
+              bodyDelivered = true;
+              safeRelease();
+              try {
+                ctrl.enqueue(nsEnc.encode(JSON.stringify({ error: err?.message || "internal error" })));
+              } catch {}
+              try { ctrl.close(); } catch {}
+            } finally {
+              clearInterval(heartbeat);
+            }
+          },
+          // Fires when the HTTP client closes the connection (curl
+          // hit its `-m` cap, Pi / opencode gave up after their own
+          // timeout, etc.).
+          //
+          // Two actions happen here:
+          //   1. Send `{type:"abort","id":"<reqId>"}` to the daemon.
+          //      The daemon's background stdin reader picks this up
+          //      asynchronously and signals the prefill chunk loop
+          //      to bail at the next chunk boundary (~5 s latency
+          //      on gfx1151 at 50 tps). The daemon emits `aborted`
+          //      + `done` events to terminate the generation.
+          //   2. Set `nsClientAborted = true` so the for-await loop
+          //      drains remaining daemon events (the aborted/done)
+          //      WITHOUT accumulating them into the response. This
+          //      keeps the EngineConnection's event queue clean for
+          //      the next request.
+          async cancel() {
+            console.error(`[hipfire] non-stream client cancelled (reqId=${reqId}) — sending abort to daemon`);
+            nsClientAborted = true;
+            try {
+              await e.send({ type: "abort", id: reqId });
+              console.error(`[hipfire] abort sent (reqId=${reqId})`);
+            } catch (err: any) {
+              console.error(`[hipfire] abort send failed: ${err?.message || err}`);
+            }
+          }
+        }), { headers: { "Content-Type": "application/json" } });
+        return nsResponse;
       } catch (err: any) {
         safeRelease();
         return Response.json({ error: err?.message || "internal error" }, { status: 500 });
@@ -2271,6 +3316,15 @@ function findQuantizeBinary(): string | null {
     join(HIPFIRE_DIR, "bin", `hipfire-quantize${exe}`),
   ];
   return candidates.find(p => existsSync(p)) || null;
+}
+
+function findTriAttnValidateBinary(): string | null {
+  const exe = process.platform === "win32" ? ".exe" : "";
+  // Dev: workspace root/target/release/examples/
+  const devCandidates = [resolve(__dirname, `../target/release/examples/triattn_validate${exe}`)];
+  // Installed: ~/.hipfire/bin/ (no examples/ subdir — update copies directly)
+  const installedCandidates = [join(HIPFIRE_DIR, "bin", `triattn_validate${exe}`)];
+  return devCandidates.find(p => existsSync(p)) || installedCandidates.find(p => existsSync(p)) || null;
 }
 
 interface QuantizeOpts {
@@ -2551,7 +3605,7 @@ export function findModel(name: string): string | null {
   const matchesName = (f: string) => f === name || f === searchName
     || f.includes(name) || f.includes(searchName);
   const hasValidExt = (f: string) => f.endsWith(".mq4") || f.endsWith(".mq6")
-    || f.endsWith(".hf4") || f.endsWith(".hf6") || f.endsWith(".hfq");
+    || f.endsWith(".hf4") || f.endsWith(".hf6") || f.endsWith(".hfq") || f.endsWith(".mq2lloyd");
 
   // Preference order when no quant hint: .mq4 → .hf4 → .hf6 → .mq6 → .hfq
   // (MQ6 only if explicitly asked; HF6 ditto — both are larger files.)
@@ -2559,8 +3613,9 @@ export function findModel(name: string): string | null {
     if (f.endsWith(".mq4")) return 0;
     if (f.endsWith(".hf4")) return 1;
     if (f.endsWith(".hfq")) return 2; // legacy HF4 naming
-    if (f.endsWith(".mq6")) return 3;
-    if (f.endsWith(".hf6")) return 4;
+    if (f.endsWith(".mq2lloyd")) return 3;
+    if (f.endsWith(".mq6")) return 4;
+    if (f.endsWith(".hf6")) return 5;
     return 99;
   };
 
@@ -2614,7 +3669,7 @@ function listLocal() {
     let entries: string[];
     try { entries = readdirSync(dir); } catch { continue; }
     for (const f of entries) {
-      if ((f.endsWith(".hf4") || f.endsWith(".hf6") || f.endsWith(".hfq") || f.endsWith(".mq3") || f.endsWith(".mq4") || f.endsWith(".mq6")) && !seen.has(f)) {
+      if ((f.endsWith(".hf4") || f.endsWith(".hf6") || f.endsWith(".hfq") || f.endsWith(".mq3") || f.endsWith(".mq4") || f.endsWith(".mq6") || f.endsWith(".mq2lloyd")) && !seen.has(f)) {
         seen.add(f);
         // statSync may throw on dangling symlinks or files removed mid-scan;
         // skip those individually instead of aborting the rest of the loop
@@ -3357,8 +4412,13 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
   const meta: Record<string, FieldMeta> = {
     kv_cache: {
       label: "kv_cache",
-      desc: "KV cache quantization (more bits = higher quality, more VRAM)",
-      options: ["auto", "q8", "asym4", "asym3", "asym2"],
+      desc: "KV cache quant (fwht default: FWHT-rotated, more accurate than asym at equal VRAM; q8 = reference)",
+      options: ["auto", "q8", "fwht4", "fwht3", "fwht2", "asym4", "asym3", "asym2"],
+    },
+    kv_adaptive: {
+      label: "kv_adaptive",
+      desc: "Adaptive KV downshift pattern. Requires fwht K; advanced picks K/V floor tiers explicitly.",
+      options: KV_ADAPTIVE_OPTIONS,
     },
     flash_mode: {
       label: "flash_mode",
@@ -3404,6 +4464,11 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
       label: "max_think_tokens",
       desc: "Budget for reasoning inside <think>...</think> (0 = unlimited). Truncates if exceeded.",
       range: [0, 32768], step: 128,
+    },
+    max_total_think_tokens: {
+      label: "max_total_think_tokens",
+      desc: "Re-arm-proof TOTAL <think> budget across the turn (0 = off). At the cap, force-close + block <think> re-open; hard-EOS past it. Bounds models that re-open <think> and out-think client timeouts.",
+      range: [0, 1000000], step: 256,
     },
     host: {
       label: "host",
@@ -3532,6 +4597,11 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
       label: "prefill_drafter",
       desc: "Path to PFlash drafter HFQ (e.g. ~/.hipfire/models/qwen3-0.6b.hf4). Tokenizer must match the target's. Empty = disabled.",
     },
+    prefill_drafter_device: {
+      label: "prefill_drafter_device",
+      desc: "HIP device for the PFlash drafter. -1 = same as target (default). Set to a sibling device index for hetero compress.",
+      range: [-1, 15], step: 1,
+    },
     prefill_profile: {
       label: "prefill_profile",
       desc: "Emit per-stage PFlash timing logs (score / select / gather). Off in production.",
@@ -3541,6 +4611,16 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
       label: "prefill_sparse_threshold",
       desc: "Phase 3 sparse-attention threshold (plumbing only; the kernel hasn't shipped). Source-token counts below this would fall back to dense drafter forward. Default 32768.",
       range: [0, 524288], step: 1024,
+    },
+    mtp_mode: {
+      label: "mtp_mode",
+      desc: "Multi-token prediction speculative decode. off = disabled, on = always, auto = arch heuristic.",
+      options: ["off", "on", "auto"],
+    },
+    mtp_k: {
+      label: "mtp_k",
+      desc: "Number of draft tokens per multi-token-prediction spec-decode window (1-10).",
+      range: [1, 10], step: 1,
     },
   };
 
@@ -4109,6 +5189,86 @@ function listConfig(cfg: HipfireConfig): void {
   console.log(`Reset:       hipfire config reset [key]`);
 }
 
+// ─── Shared helpers ─────────────────────────────────────
+
+/** Find a binary in PATH or known extra directories. Returns absolute path or null.**/
+function findDep(binary: string, extraDirs: string[]): string | null {
+  // 1. Already in PATH (use `which` to avoid shell interpolation)
+  const inPath = Bun.spawnSync(["which", binary], { stdout: "pipe", stderr: "pipe" });
+  const found = (inPath.stdout?.toString() ?? "").trim();
+  if (inPath.exitCode === 0 && found) return found;
+  // 2. Distro-specific known locations
+  for (const dir of extraDirs) {
+    const path = join(dir, binary);
+    if (existsSync(path)) return path;
+  }
+  return null;
+}
+
+function stripVisibleThinking(content: string, preserveThinking: boolean = false, startedInThink: boolean = false): string {
+  if (preserveThinking) return content.replace(/<\|im_end\|>/g, "").trim();
+  // `open_think` injects the opening <think> into the PROMPT, so the output
+  // begins INSIDE the think span and only a dangling </think> appears — none of
+  // the strips below (which key on a `<think>` opener) would fire, leaking the
+  // reasoning + a stray </think> into content. Prepend a synthetic opener so
+  // the closed case (strip the pair, keep the answer) and the unclosed case
+  // (strip <think>..end) are handled identically to a normal think span.
+  if (startedInThink && !content.includes("<think>")) content = "<think>" + content;
+  return content
+    .replace(/<think>[\s\S]*?<\/think>\s*/g, "")
+    .replace(/<think>[\s\S]*$/, "")
+    .replace(/^\s*<\/think>\s*/, "")
+    .replace(/<\|im_end\|>/g, "")
+    .trim();
+}
+
+function pruneCliRuntimePayload(cliDir: string): void {
+  for (const name of ["node_modules", ".gitignore", "tsconfig.json", "README.md", "bun.lock"]) {
+    rmSync(join(cliDir, name), { recursive: true, force: true });
+  }
+  for (const name of readdirSync(cliDir)) {
+    if (/\.test\.ts$/.test(name) || /^test_.*\.ts$/.test(name) || /^bench_.*\.ts$/.test(name)) {
+      unlinkSync(join(cliDir, name));
+    }
+  }
+}
+
+function syncCliRuntimePayload(repoDir: string): void {
+  const cliSrcDir = join(repoDir, "cli");
+  const cliDstDir = join(HIPFIRE_DIR, "cli");
+  const required = ["registry.json", "index.ts"];
+  for (const file of required) {
+    if (!existsSync(join(cliSrcDir, file))) {
+      console.error(`\nUpdate aborted: cli/${file} missing in repo checkout at`);
+      console.error(`  ${repoDir}`);
+      console.error("Repo may be on a pre-migration commit or in a dirty state. Verify with:");
+      console.error(`  git -C ${repoDir} status && git -C ${repoDir} log -1 --stat`);
+      process.exit(1);
+    }
+  }
+
+  mkdirSync(HIPFIRE_DIR, { recursive: true });
+  const stamp = `${process.pid}-${Date.now()}`;
+  const tmpDir = join(HIPFIRE_DIR, `.cli-update-${stamp}`);
+  const backupDir = join(HIPFIRE_DIR, `.cli-prev-${stamp}`);
+  rmSync(tmpDir, { recursive: true, force: true });
+  rmSync(backupDir, { recursive: true, force: true });
+
+  try {
+    cpSync(cliSrcDir, tmpDir, { recursive: true, force: true });
+    pruneCliRuntimePayload(tmpDir);
+    if (existsSync(cliDstDir)) renameSync(cliDstDir, backupDir);
+    renameSync(tmpDir, cliDstDir);
+    rmSync(backupDir, { recursive: true, force: true });
+  } catch (err) {
+    rmSync(tmpDir, { recursive: true, force: true });
+    if (!existsSync(cliDstDir) && existsSync(backupDir)) {
+      renameSync(backupDir, cliDstDir);
+    }
+    throw err;
+  }
+}
+
 // ─── Main ───────────────────────────────────────────────
 
 const [cmd, ...rest] = process.argv.slice(2);
@@ -4431,18 +5591,6 @@ switch (cmd) {
     // interactive shell loads those bindirs via profile snippets. We probe
     // well-known locations, augment process.env.PATH with any found dirs,
     // and error fast with an install hint if a required dep is missing.
-    const findDep = (binary: string, extraDirs: string[]): string | null => {
-      // 1. Already in PATH
-      const inPath = Bun.spawnSync(["sh", "-c", `command -v ${binary}`], { stdout: "pipe", stderr: "pipe" });
-      const found = (inPath.stdout?.toString() ?? "").trim();
-      if (inPath.exitCode === 0 && found) return found;
-      // 2. Distro-specific known locations
-      for (const dir of extraDirs) {
-        const path = join(dir, binary);
-        if (existsSync(path)) return path;
-      }
-      return null;
-    };
     const depsNeeded = [
       { name: "git",   dirs: ["/usr/bin", "/usr/local/bin", "/opt/homebrew/bin"],
         hint: "Install git via your distro's package manager." },
@@ -4547,31 +5695,19 @@ switch (cmd) {
     // config commands keep working. Previously the copy happened after the
     // cargo build, so a build failure left the CLI frozen at its install-time
     // version — users saw "unknown model" for entries added post-install.
-    const { copyFileSync } = await import("fs");
     const exe = process.platform === "win32" ? ".exe" : "";
     const binDir = join(HIPFIRE_DIR, "bin");
-    // Order: registry.json BEFORE index.ts. The new index.ts imports the JSON
-    // at startup; if we copied index.ts first and the JSON copy then failed
-    // (missing in repoDir, IO error, partial git pull), the install would be
-    // stranded — new TS that can't resolve its own data file. Copying JSON
-    // first means a partial failure leaves the CLI in a recoverable state:
-    // either old TS + old JSON, or old TS + new JSON (still loads OK).
-    const registrySrc = join(repoDir, "cli/registry.json");
-    const indexSrc    = join(repoDir, "cli/index.ts");
-    if (!existsSync(registrySrc) || !existsSync(indexSrc)) {
-      console.error("\nUpdate aborted: cli/registry.json or cli/index.ts missing in repo checkout at");
-      console.error(`  ${repoDir}`);
-      console.error("Repo may be on a pre-migration commit or in a dirty state. Verify with:");
-      console.error(`  git -C ${repoDir} status && git -C ${repoDir} log -1 --stat`);
-      process.exit(1);
-    }
-    copyFileSync(registrySrc, join(HIPFIRE_DIR, "cli/registry.json"));
-    copyFileSync(indexSrc,    join(HIPFIRE_DIR, "cli/index.ts"));
+    // Keep index.ts and its sibling runtime modules in lockstep. This mirrors
+    // scripts/install.{sh,ps1}: copy the whole cli/ tree, prune dev/test files,
+    // then swap the staged payload into place. A legacy updater can still copy
+    // only this new index.ts once; keeping index.ts startup-self-contained lets
+    // the user run `hipfire update` again to repair the full payload.
+    syncCliRuntimePayload(repoDir);
     console.error("  CLI updated ✓");
     // Rebuild
     console.error("Rebuilding daemon (this may take a few minutes)...");
     const build = Bun.spawnSync(
-      [CARGO_BIN, "build", "--release", "--features", "deltanet", "--example", "daemon", "--example", "infer", "--example", "run", "-p", "hipfire-runtime"],
+      [CARGO_BIN, "build", "--release", "--features", "deltanet", "--example", "daemon", "--example", "infer", "--example", "run", "--example", "triattn_validate", "-p", "hipfire-runtime"],
       { cwd: repoDir, stdio: ["inherit", "inherit", "inherit"], env: { ...process.env } }
     );
     if (build.exitCode !== 0) {
@@ -4594,7 +5730,7 @@ switch (cmd) {
     }
     // Recopy binaries
     // Example binaries live under target/release/examples/
-    for (const bin of ["daemon", "infer", "run"]) {
+    for (const bin of ["daemon", "infer", "run", "triattn_validate"]) {
       const src = join(repoDir, `target/release/examples/${bin}${exe}`);
       const dst = join(binDir, `${bin}${exe}`);
       if (existsSync(src)) { copyFileSync(src, dst); }
@@ -5056,6 +6192,182 @@ depending on model size. HF downloads cache at ~/.hipfire/hf-cache/.`);
     });
     break;
   }
+  case "sidecar-gen": {
+    const tag = rest[0];
+    if (!tag || tag === "-h" || tag === "--help") {
+      console.error(`Usage: hipfire sidecar-gen <model> [flags]
+
+Generate a TriAttention calibration sidecar (.triattn.bin) for the given model.
+The sidecar enables automatic KV-cache eviction and is required for CASK
+generation on large-context models (e.g. 27B with >16K max_position_embeddings).
+
+The sidecar file is saved next to the model file (same directory as the .mq4/.hf4)
+so the daemon auto-discovers it.
+
+Model:
+  hipfire sidecar-gen qwen3.5:9b              # use a local model by tag
+  hipfire sidecar-gen ~/.hipfire/models/...    # or pass a direct path
+
+Flags:
+  --corpus PATH          Path to a text file for calibration corpus (default: builtin seed prompts)
+  --max-tokens N         Max tokens to process during calibration (default: 4000)
+  --chunk-len N          Chunk length in tokens (default: 256)
+  --gpu-calib            Use GPU kernel triattn_accumulate (faster on MI300X / RDNA3+)
+  --cpu-calib            Force CPU calibration path
+  -o, --output PATH      Output sidecar file path (default: <model>.triattn.bin next to model)
+  --skip-validation      Skip Phase 2 validation — faster for sidecar generation only
+
+Examples:
+  hipfire sidecar-gen qwen3.5:9b
+  hipfire sidecar-gen ./my-model.mq4 --corpus wikipedia.txt --max-tokens 100000
+  hipfire sidecar-gen ~/.hipfire/models/qwen3.6-27b.mq4 -o /tmp/sidecar.bin`);
+      process.exit(tag ? 0 : 1);
+    }
+    let corpusPath: string | undefined;
+    let maxTokens = 4000;
+    let chunkLen = 256;
+    let gpuCalib = true; // GPU calibration is default (Phase 2, 2026-04-28)
+    let output: string | undefined;
+    let skipValidation = false; // sidecar generation doesn't need Phase 2 validation
+    for (let i = 1; i < rest.length; i++) {
+      const a = rest[i];
+      if (a === "--corpus") {
+        corpusPath = rest[++i];
+        if (!corpusPath) { console.error("--corpus requires a value"); process.exit(1); }
+      } else if (a === "--max-tokens") {
+        maxTokens = parseInt(rest[++i]);
+        if (isNaN(maxTokens) || maxTokens < 1 || maxTokens > 1_000_000) { console.error("--max-tokens must be between 1 and 1,000,000"); process.exit(1); }
+      } else if (a === "--chunk-len") {
+        chunkLen = parseInt(rest[++i]);
+        if (isNaN(chunkLen) || chunkLen < 1 || chunkLen > 16384) { console.error("--chunk-len must be between 1 and 16,384"); process.exit(1); }
+      } else if (a === "--gpu-calib") {
+        gpuCalib = true;
+      } else if (a === "--cpu-calib") {
+        gpuCalib = false;
+      } else if (a === "-o" || a === "--output") {
+        output = rest[++i];
+        if (!output) { console.error("--output requires a value"); process.exit(1); }
+      } else if (a === "--skip-validation") {
+        skipValidation = true;
+      } else {
+        console.error(`Unknown argument: ${a}\nRun 'hipfire sidecar-gen --help' for usage.`);
+        process.exit(1);
+      }
+    }
+
+    // Resolve model — same resolution as other commands (tag → local path).
+    let resolved = findModel(tag);
+    if (!resolved) {
+      console.error(`Model not found: ${tag}`);
+      console.error("Run 'hipfire list' to see available models.");
+      process.exit(1);
+    }
+
+    // Determine output path — default is <model>.triattn.bin next to the model file.
+    const sidecarPath = output ?? `${resolved}.triattn.bin`;
+
+    console.error(`Generating TriAttention calibration sidecar for: ${tag}`);
+    console.error(`  Model:        ${resolved}`);
+    console.error(`  Output:       ${sidecarPath}`);
+    console.error(`  Max tokens:   ${maxTokens}`);
+    console.error(`  Chunk len:    ${chunkLen}`);
+    console.error(`  Calibration:  ${gpuCalib ? "GPU" : "CPU"}`);
+
+    // Find triattn_validate binary — from installed location or fall back to cargo run.
+    const bin = findTriAttnValidateBinary();
+    if (bin) {
+      // Binary is available directly (installed). Run it synchronously.
+      console.error(`  Using: ${bin}`);
+      const args = [resolved, "--sidecar", sidecarPath, "--max-tokens", String(maxTokens), "--chunk-len", String(chunkLen)];
+      if (corpusPath) args.push("--corpus", corpusPath);
+      if (!gpuCalib) args.push("--cpu-calib");
+      if (skipValidation) args.push("--val-prompt", "");
+      const proc = Bun.spawnSync([bin, ...args], { stdio: ["inherit", "inherit", "inherit"] });
+      if ((proc.exitCode ?? 1) !== 0) {
+        console.error(`triattn_validate failed (exit ${proc.exitCode})`);
+        process.exit(1);
+      }
+    } else {
+      // No installed binary — fall back to cargo run --example.
+      // This has cold-start overhead from compilation if not already built.
+      // Try the development source first, then ~/.hipfire/src (installed via update).
+      const devSrc = resolve(__dirname, "../crates/hipfire-runtime/examples/triattn_validate.rs");
+      const hipfireSrc = join(HIPFIRE_DIR, "src/crates/hipfire-runtime/examples/triattn_validate.rs");
+      const srcExists = existsSync(devSrc) || existsSync(hipfireSrc);
+
+      if (!srcExists) {
+        console.error("triattn_validate binary not found and source not available.");
+        console.error("  Build: cargo build --release --features deltanet -p hipfire-runtime --example triattn_validate");
+        console.error("  Or update: hipfire update (which builds the example during rebuild)");
+        process.exit(1);
+      }
+
+      // Determine if we should use the dev checkout or the installed source.
+      // Build from the workspace root so Cargo writes the example under
+      // <workspace>/target/release/examples/, matching the binPath below.
+      const workspaceRoot = existsSync(devSrc) ? resolve(__dirname, "..") : join(HIPFIRE_DIR, "src");
+      if (!existsSync(join(workspaceRoot, "Cargo.toml"))) {
+        console.error(`Could not find hipfire workspace root at ${workspaceRoot}`);
+        process.exit(1);
+      }
+      console.error("  Using cargo run --example (cold start — consider running 'hipfire update' to install the binary)");
+
+      // Parse deps for PATH augmentation (same as update command does).
+      // findDep is defined at module level above.
+      const depsNeeded = ["cargo", "hipcc"];
+      const augmentDirs = new Set<string>();
+      for (const dep of depsNeeded) {
+        const extraDirs = dep === "cargo"
+          ? [join(process.env.HOME || "", ".cargo/bin"), "/usr/bin"]
+          : ["/opt/rocm/bin", "/opt/rocm-6.0.0/bin", "/opt/rocm-5.7.0/bin", "/usr/bin"];
+        const p = findDep(dep, extraDirs);
+        if (p) augmentDirs.add(p.substring(0, p.lastIndexOf("/")));
+      }
+      // Also add bun dir for its subtree helpers.
+      const bunPath = findDep("bun", [join(process.env.HOME || "", ".bun/bin"), "/usr/bin"]);
+      if (bunPath) augmentDirs.add(bunPath.substring(0, bunPath.lastIndexOf("/")));
+      if (augmentDirs.size) {
+        const curr = (process.env.PATH || "").split(":").filter(Boolean);
+        const fresh = [...augmentDirs].filter(d => !curr.includes(d));
+        if (fresh.length) process.env.PATH = [...fresh, ...curr].join(":");
+      }
+
+      // Build the example first.
+      console.error("Building triattn_validate...");
+      const build = Bun.spawnSync(
+        ["cargo", "build", "--release", "--features", "deltanet", "-p", "hipfire-runtime", "--example", "triattn_validate"],
+        { cwd: workspaceRoot, stdio: ["inherit", "inherit", "inherit"] },
+      );
+      if (build.exitCode !== 0) {
+        console.error("Failed to build triattn_validate. Check for ROCm/compilation errors above.");
+        process.exit(1);
+      }
+
+      // Run the built example — bin is at workspace_root/target/release/examples/triattn_validate
+      const exe = process.platform === "win32" ? ".exe" : "";
+      const binPath = join(workspaceRoot, `target/release/examples/triattn_validate${exe}`);
+      console.error("  Running triattn_validate...");
+      const args = [binPath, resolved, "--sidecar", sidecarPath, "--max-tokens", String(maxTokens), "--chunk-len", String(chunkLen)];
+      if (corpusPath) args.push("--corpus", corpusPath);
+      if (!gpuCalib) args.push("--cpu-calib");
+      if (skipValidation) args.push("--val-prompt", "");
+      const proc = Bun.spawnSync(args, { stdio: ["inherit", "inherit", "inherit"] });
+      if ((proc.exitCode ?? 1) !== 0) {
+        console.error(`triattn_validate failed (exit ${proc.exitCode})`);
+        process.exit(1);
+      }
+    }
+
+    // Verify the output file exists.
+    if (!existsSync(sidecarPath)) {
+      console.error(`Output file not found: ${sidecarPath}`);
+      process.exit(1);
+    }
+    const sz = (statSync(sidecarPath).size / 1e6).toFixed(1);
+    console.error("\nDone. Sidecar saved:");
+    console.error(`  ${sidecarPath} (${sz} MB)`);
+    break;
+  }
   case "config": {
     // `hipfire config`                                  → global TUI
     // `hipfire config list|get|set|reset [...]`          → global scripting
@@ -5180,7 +6492,8 @@ depending on model size. HF downloads cache at ~/.hipfire/hf-cache/.`);
       if (typeof defaultVal === "number" && isNaN(parsed as number)) { console.error(`${key} requires a number`); process.exit(1); }
       if (!validateConfigValue(key, parsed)) {
         const hints: Record<string, string> = {
-          kv_cache: "one of: auto, q8, asym4, asym3, asym2 (turbo/turbo2/turbo3/turbo4 aliases also accepted)",
+          kv_cache: "one of: auto, q8, fwht4, fwht3, fwht2, asym4, asym3, asym2 (turbo/turbo2/turbo3/turbo4 are legacy asym aliases)",
+          kv_adaptive: "one of: off, conservative, balanced, aggressive, advanced:k=<fwht4|fwht3|fwht2>,v=<lloyd4|lloyd3|lloyd2>",
           flash_mode: "one of: auto, always, never (applies to Q8 path; asym modes are flash-only)",
           temperature: "number between 0 and 2",
           top_p: "number in (0, 1]",
@@ -5336,6 +6649,7 @@ depending on model size. HF downloads cache at ~/.hipfire/hf-cache/.`);
   diag                  Diagnostics — GPU, VRAM, HIP version, kernels, models
   ps                    Show running hipfire processes (serve, quantize, uploads)
   rm <model>            Delete model
+  sidecar-gen <model>   Generate TriAttention calibration sidecar (.triattn.bin)
   update                Pull latest code, rebuild, update kernels
 
 Models (MQ4 default: FWHT-rotated 4-bit, quality-gated):

@@ -1,0 +1,13 @@
+Here's a JSON translation file. Translate to German:
+
+"settings_modbus": {
+        "description": "Modbus is a low-level protocol for data retrieval.",
+        "enable": "Enable Modbus TCP Server",
+        "enable_label": "Activate the Modbus TCP server to allow Modbus clients to connect to $t(theme:product) and read data. Please ensure that no unauthorized access over the network is possible, since Modbus is inherently insecure, unencrypted and without any access control.",
+        "header": "Modbus Server",
+        "port": "TCP port",
+        "port_label": "TCP port of Modbus server - defaults to 502",
+        "only_second_ethernet": "Restrict to second Ethernet",
+        "only_second_ethernet_label": "Restrict the Modbus server to listening only on the second Ethernet interface",
+        "section": "Modbus TCP-Server"
+    },

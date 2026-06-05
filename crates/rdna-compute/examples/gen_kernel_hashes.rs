@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Generate .hash sidecar files for pre-compiled kernel blobs.
 //! Reads kernel sources from kernels/src/*.hip and hashes them with
 //! the same DefaultHasher(source + arch) algorithm as compiler.rs.
@@ -67,7 +71,7 @@ fn main() {
     kernel_sources.sort_by(|a, b| a.0.cmp(&b.0));
     rdna2_variant_sources.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let archs = ["gfx906", "gfx1010", "gfx1030", "gfx1100", "gfx1200", "gfx1201"];
+    let archs = ["gfx906", "gfx1010", "gfx1030", "gfx1100", "gfx1151", "gfx1200", "gfx1201"];
 
     let mut written = 0;
     let mut skipped = 0;

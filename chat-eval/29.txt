@@ -1,0 +1,28 @@
+I have this systemd-networkd configuration of which I expect to have both a static IPv4 and another IPv4 assigned by DHCP. In reality I only get ste static IPv4. What's wrong?
+```
+[Match]
+Name=eth0
+
+[Network]
+MulticastDNS=yes
+DNS=192.168.32.254
+DHCP=ipv4
+LinkLocalAddressing=ipv4-fallback
+IPv6AcceptRA=no
+
+[Address]
+Label=eth0:0
+Address=192.168.32.16/24
+
+[Route]
+Metric=1025
+Gateway=192.168.32.254
+```
+----
+How can I keep the statically configured default route as a fallback default route in case the DHCP server never replies?
+----
+How is this different from my initial configuration which did not work? Is it only the addition of
+[DHCP]
+RouteMetric=1024
+?
+

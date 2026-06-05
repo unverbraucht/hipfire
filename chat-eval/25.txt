@@ -1,0 +1,1 @@
+Can I run docker registry as both a private registry and pull-through cache using the same registry instance?

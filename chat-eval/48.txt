@@ -1,0 +1,3 @@
+I want to install a npm package globally into the folder /opt/om7sense/lib/nodejs
+----
+When would I need --unsafe-perm?

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Kernel efficiency profiler for RDNA GPUs.
 //! Measures how close each compiled kernel is to theoretical hardware limits.
 
@@ -59,6 +63,14 @@ fn arch_spec(arch: &str) -> ArchSpec {
             generation: "RDNA3", simds_per_cu: 2, max_waves_per_simd: 16,
             vgprs_per_simd: 1536, lds_per_cu: 65536,
             l2_cache_mb: 6.0, infinity_cache_mb: 96.0, default_bus_width: 384,
+        },
+        // RDNA3.5 — Strix Halo APUs. L2 verified at 2 MB via rocminfo on Radeon
+        // 8060S (Cache Info: L2 2048 KB). No discrete Infinity Cache; LPDDR5x is
+        // shared with the CPU at ~256 GB/s peak (~200 GB/s effective).
+        "gfx1150" | "gfx1151" | "gfx1152" => ArchSpec {
+            generation: "RDNA3.5", simds_per_cu: 2, max_waves_per_simd: 16,
+            vgprs_per_simd: 1536, lds_per_cu: 65536,
+            l2_cache_mb: 2.0, infinity_cache_mb: 0.0, default_bus_width: 256,
         },
         // RDNA4
         "gfx1200" | "gfx1201" => ArchSpec {

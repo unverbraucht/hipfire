@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # speed-gate.sh — MQ4 prefill/decode speed regression gate.
 #
 # Runs bench_qwen35_mq4 on each available MQ4 model and compares
@@ -135,7 +140,7 @@ ensure_build() {
 
 # DFlash LRU-code gate. Echoes "tok_s tau" or one of: MISSING_TARGET,
 # MISSING_DRAFT, MISSING_PROMPT, MISSING_BIN, CRASH.
-# Canonical bench: 27B-3.5 LRU code @ max=120, asym3 KV, no chatml, no
+# Canonical bench: 27B-3.5 LRU code @ max=256, Q8 KV, no chatml, no
 # adaptive-b. Default flags include prompt_normalize=true (engine default
 # since 2026-04-26). Best-of-2 (within 5% jitter on hot-cache).
 bench_dflash_27b_lru() {
@@ -164,7 +169,7 @@ bench_dflash_27b_lru() {
         out=$(HIPFIRE_DPM_WARMUP_SECS=10 "$DFLASH_EXE" \
             --target "$target" --draft "$draft" \
             --prompt "$prompt" \
-            --max 120 --no-chatml --kv-mode asym3 2>&1)
+            --max 256 --no-chatml --kv-mode q8 2>&1)
         local t tau
         t=$(echo "$out" | sed -nE 's/.*emitted: [0-9]+ tokens in [0-9.]+s\s+\(([0-9.]+) tok\/s\).*/\1/p' | tail -1)
         tau=$(echo "$out" | sed -nE 's/.*τ=([0-9.]+).*/\1/p' | tail -1)
@@ -202,7 +207,7 @@ _bench_dflash_merge_sort_core() {
         out=$(HIPFIRE_DPM_WARMUP_SECS=10 "$DFLASH_EXE" \
             --target "$target" --draft "$draft" \
             --prompt "$prompt" \
-            --max 256 --no-chatml --kv-mode asym3 2>&1)
+            --max 256 --no-chatml --kv-mode q8 2>&1)
         local t tau ttft
         t=$(echo "$out" | sed -nE 's/^decode_tok_s: ([0-9.]+).*/\1/p' | tail -1)
         tau=$(echo "$out" | sed -nE 's/^decode_tau: ([0-9.]+).*/\1/p' | tail -1)
@@ -408,7 +413,7 @@ if [ "$UPDATE" -eq 1 ]; then
     done
 
     # DFlash canonical gate (added 2026-04-26 per perf-regression-recovery).
-    # 27B-3.5 LRU code @ max=120, default flags (prompt_normalize=true since
+    # 27B-3.5 LRU code @ max=256, Q8 KV, default flags (prompt_normalize=true since
     # 2026-04-26). Catches the regression class that PR #32 dead-wmma-kernels
     # missed because it only affected DFlash verify, not AR prefill.
     printf "  27B-3.5 DFlash LRU code  "
@@ -537,7 +542,7 @@ for size in "${SIZES[@]}"; do
     fi
 done
 
-# DFlash canonical gate — 27B-3.5 LRU code, max=120, default flags.
+# DFlash canonical gate — 27B-3.5 LRU code, max=256, Q8 KV.
 # Added 2026-04-26 after PR #32 dead-wmma-kernels passed AR-only speed-gate
 # while regressing 27B DFlash by 40%. AR-only gates are insufficient for
 # perf protection. Skipped in --fast mode (DFlash bench takes ~5s × 3 runs).

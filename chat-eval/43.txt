@@ -1,0 +1,1 @@
+In SQL I have a column of a table containing strings that start with "group/" then contain a random amount of text and then end in a hyphen followed by a number. I need an UPDATE TABLE command that removes the text. For example "group/ABC-DEF3-15" should become "group/15"

@@ -1,27 +1,39 @@
-//! Regression test for the vision-encoder channel ordering fix (issue #23).
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 nickfinease
+// hipfire — see LICENSE and NOTICE in the project root.
+
+//! Regression test for the vision-encoder CHW channel ordering.
 //!
-//! Empirical finding: the patch_embed weights in the Qwen3.5-VL HFQ4 export
-//! expect input CHW tensors in [R, B, G] order rather than [R, G, B]. Feeding
-//! pure-color PNGs through the encoder with temp=0 greedy decoding confirmed
-//! this — pre-fix, red worked, green→"Blue", blue→"Green"; post-fix all three
-//! are identified correctly.
+//! Previously (pre-2026-05-23) this file asserted a deliberate `[R, B, G]`
+//! swap that compensated for a different bug (the per-patch `(T,C,h,w)` vs
+//! HF's `(C,T,h,w)` transpose in `extract_patches`). Fixing both bugs at the
+//! same time required asserting the straight `[R, G, B]` layout — verified
+//! byte-identical against HF's `Qwen2VLImageProcessorFast` on `barney_cigar.jpg`
+//! (`benchmarks/vision/diff_dumps.py`).
 //!
-//! This test does not exercise the GPU; it locks the preprocessing contract
-//! that `load_and_preprocess` produces channel 0 = R, channel 1 = B (source
-//! green pixel's blue byte is NOT used; source blue byte is), channel 2 = G.
-//! If someone removes the swap, these assertions fail before any vision
-//! inference runs.
-//!
-//! See `crates/hipfire-arch-qwen35-vl/src/image.rs` for the swap itself.
+//! This test only locks the preprocessing contract on a single pixel — it
+//! does NOT exercise the GPU. It will catch a channel permutation but cannot
+//! detect the patch-ordering or per-patch layout bugs on its own: see
+//! `extract_patches` for the per-patch layout assertion, and the bench at
+//! `benchmarks/vision/comparison-2026-05-23.md` for the end-to-end check.
 
 use std::path::PathBuf;
 
 use hipfire_arch_qwen35_vl::image::load_and_preprocess;
 use image::{ImageBuffer, Rgb};
 
-/// Write a 32x32 solid-color PNG to a temp path and return the path.
+/// Write a 32x32 solid-color PNG to a per-process temp path and return it.
+/// PID-scoped so parallel `cargo test --test-threads N` workers (or two CI
+/// jobs sharing `/tmp`) cannot collide on the same file.
 fn write_solid_png(name: &str, r: u8, g: u8, b: u8) -> PathBuf {
-    let dir = std::env::temp_dir().join("hipfire-channel-order-tests");
+    let dir = std::env::temp_dir().join(format!(
+        "hipfire-channel-order-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0),
+    ));
     std::fs::create_dir_all(&dir).expect("create temp dir");
     let path = dir.join(format!("{name}.png"));
     let img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_pixel(32, 32, Rgb([r, g, b]));
@@ -41,80 +53,179 @@ fn channel_at_origin(out: &[f32], h: usize, w: usize, channel: usize) -> f32 {
 }
 
 #[test]
-fn pure_red_preserves_red_channel() {
-    // Red = (255, 0, 0). patch_size=16 is what Qwen3.5-VL uses.
+fn pure_red_lands_in_channel_0() {
     let path = write_solid_png("red", 255, 0, 0);
-    let (out, h, w) = load_and_preprocess(&path, 16, 2);
-    // Channel layout post-fix: [R, B, G].
+    let (out, h, w) = load_and_preprocess(&path, 16, 2).expect("load_and_preprocess failed");
     assert!(
         (channel_at_origin(&out, h, w, 0) - norm(255)).abs() < 1e-5,
-        "R channel should carry 255"
+        "R in channel 0"
     );
     assert!(
         (channel_at_origin(&out, h, w, 1) - norm(0)).abs() < 1e-5,
-        "B channel slot should carry B (0) from red pixel"
+        "G in channel 1 (=0)"
     );
     assert!(
         (channel_at_origin(&out, h, w, 2) - norm(0)).abs() < 1e-5,
-        "G channel slot should carry G (0) from red pixel"
+        "B in channel 2 (=0)"
     );
 }
 
 #[test]
-fn pure_green_routes_g_byte_to_channel_2() {
-    // Green = (0, 255, 0). Pre-fix this was going to channel 1 and the model
-    // saw it as blue. Post-fix the G byte lands in channel 2.
+fn pure_green_lands_in_channel_1() {
     let path = write_solid_png("green", 0, 255, 0);
-    let (out, h, w) = load_and_preprocess(&path, 16, 2);
+    let (out, h, w) = load_and_preprocess(&path, 16, 2).expect("load_and_preprocess failed");
     assert!(
         (channel_at_origin(&out, h, w, 0) - norm(0)).abs() < 1e-5,
-        "R channel should be 0 for pure green"
-    );
-    assert!(
-        (channel_at_origin(&out, h, w, 1) - norm(0)).abs() < 1e-5,
-        "channel 1 should carry B (0) from green pixel — NOT G"
-    );
-    assert!(
-        (channel_at_origin(&out, h, w, 2) - norm(255)).abs() < 1e-5,
-        "channel 2 should carry G (255) from green pixel"
-    );
-}
-
-#[test]
-fn pure_blue_routes_b_byte_to_channel_1() {
-    // Blue = (0, 0, 255). Pre-fix this was going to channel 2 and the model
-    // saw it as green. Post-fix the B byte lands in channel 1.
-    let path = write_solid_png("blue", 0, 0, 255);
-    let (out, h, w) = load_and_preprocess(&path, 16, 2);
-    assert!(
-        (channel_at_origin(&out, h, w, 0) - norm(0)).abs() < 1e-5,
-        "R channel should be 0 for pure blue"
+        "R in channel 0 (=0)"
     );
     assert!(
         (channel_at_origin(&out, h, w, 1) - norm(255)).abs() < 1e-5,
-        "channel 1 should carry B (255) from blue pixel"
+        "G in channel 1"
     );
     assert!(
         (channel_at_origin(&out, h, w, 2) - norm(0)).abs() < 1e-5,
-        "channel 2 should carry G (0) from blue pixel — NOT B"
+        "B in channel 2 (=0)"
     );
 }
 
 #[test]
-fn mixed_pixel_round_trips_all_three_bytes() {
-    // Distinctive per-channel values so a transposition bug would be obvious.
+fn pure_blue_lands_in_channel_2() {
+    let path = write_solid_png("blue", 0, 0, 255);
+    let (out, h, w) = load_and_preprocess(&path, 16, 2).expect("load_and_preprocess failed");
+    assert!(
+        (channel_at_origin(&out, h, w, 0) - norm(0)).abs() < 1e-5,
+        "R in channel 0 (=0)"
+    );
+    assert!(
+        (channel_at_origin(&out, h, w, 1) - norm(0)).abs() < 1e-5,
+        "G in channel 1 (=0)"
+    );
+    assert!(
+        (channel_at_origin(&out, h, w, 2) - norm(255)).abs() < 1e-5,
+        "B in channel 2"
+    );
+}
+
+#[test]
+fn mixed_pixel_keeps_rgb_order() {
+    // Distinctive per-channel values so any transposition shows up clearly.
     let path = write_solid_png("mixed", 10, 200, 50);
-    let (out, h, w) = load_and_preprocess(&path, 16, 2);
+    let (out, h, w) = load_and_preprocess(&path, 16, 2).expect("load_and_preprocess failed");
     assert!(
         (channel_at_origin(&out, h, w, 0) - norm(10)).abs() < 1e-5,
-        "R (10) should land in channel 0"
+        "R (10) in channel 0"
     );
     assert!(
-        (channel_at_origin(&out, h, w, 1) - norm(50)).abs() < 1e-5,
-        "B (50) should land in channel 1 post-fix"
+        (channel_at_origin(&out, h, w, 1) - norm(200)).abs() < 1e-5,
+        "G (200) in channel 1"
     );
     assert!(
-        (channel_at_origin(&out, h, w, 2) - norm(200)).abs() < 1e-5,
-        "G (200) should land in channel 2 post-fix"
+        (channel_at_origin(&out, h, w, 2) - norm(50)).abs() < 1e-5,
+        "B (50) in channel 2"
     );
+}
+
+/// Write a 256×256 PNG with different colors in each quadrant, returning
+/// its path. 256×256 is a multiple of factor=32 (patch_size=16 ×
+/// spatial_merge_size=2) and above min_pixels=3136, so smart_resize
+/// keeps it at 256×256 unchanged.
+/// Each quadrant uses distinct per-channel values that form a
+/// unique "fingerprint" — so a spatial transpose (H↔V flip), a channel
+/// swap, or any combination will corrupt at least one fingerprint.
+fn write_quadrant_png(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "hipfire-channel-order-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0),
+    ));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join(format!("{name}.png"));
+    let mut img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::new(256, 256);
+    // Quadrant colors chosen so each R,G,B triple is unique and no
+    // per-channel value appears in the same position across quadrants.
+    let colors = [
+        (200, 30, 100), // top-left
+        (50, 180, 15),  // top-right
+        (10, 70, 240),  // bottom-left
+        (150, 5, 60),   // bottom-right
+    ];
+    for (y, row) in img.rows_mut().enumerate() {
+        for (x, pixel) in row.enumerate() {
+            let qi = if y < 128 { 0 } else { 2 } + if x < 128 { 0 } else { 1 };
+            let (r, g, b) = colors[qi];
+            *pixel = Rgb([r, g, b]);
+        }
+    }
+    img.save(&path).expect("write png");
+    path
+}
+
+#[test]
+fn quadrant_pixels_keep_rgb_spatial_order() {
+    // Verifies channel AND spatial ordering simultaneously: each quadrant
+    // of the input image has a unique (R,G,B) fingerprint, and we check
+    // that the correct fingerprint lands at the correct (y,x) position
+    // in each CHW channel plane.
+    let path = write_quadrant_png("quadrant");
+    let (out, h, w) = load_and_preprocess(&path, 16, 2).expect("load_and_preprocess failed");
+
+    // 256×256 with patch_size=16, spatial_merge=2 → factor=32.
+    // smart_resize keeps it at 256×256 (already a multiple of 32,
+    // and 65536 > min_pixels=3136).
+    assert_eq!(h, 256, "expected height 256, got {}", h);
+    assert_eq!(w, 256, "expected width 256, got {}", w);
+
+    // Check a pixel in each quadrant of the CHW output.
+    let colors = [
+        (200u8, 30u8, 100u8), // TL
+        (50u8, 180u8, 15u8),  // TR
+        (10u8, 70u8, 240u8),  // BL
+        (150u8, 5u8, 60u8),   // BR
+    ];
+    let positions = [
+        (64, 64),   // TL interior
+        (64, 192),  // TR interior
+        (192, 64),  // BL interior
+        (192, 192), // BR interior
+    ];
+    // Note: CHW layout is [C, H, W], so pixel at (y, x) in channel c is:
+    //   out[c * h * w + y * w + x]
+    for (qi, &(py, px)) in positions.iter().enumerate() {
+        let (r, g, b) = colors[qi];
+        let pixel_offset = py * w + px;
+        let channel_stride = h * w;
+        let r_val = out[pixel_offset];
+        let g_val = out[channel_stride + pixel_offset];
+        let b_val = out[2 * channel_stride + pixel_offset];
+        assert!(
+            (r_val - norm(r)).abs() < 1e-4,
+            "Q{} ({},{}) R: expected {} got {}",
+            qi,
+            py,
+            px,
+            norm(r),
+            r_val
+        );
+        assert!(
+            (g_val - norm(g)).abs() < 1e-4,
+            "Q{} ({},{}) G: expected {} got {}",
+            qi,
+            py,
+            px,
+            norm(g),
+            g_val
+        );
+        assert!(
+            (b_val - norm(b)).abs() < 1e-4,
+            "Q{} ({},{}) B: expected {} got {}",
+            qi,
+            py,
+            px,
+            norm(b),
+            b_val
+        );
+    }
 }

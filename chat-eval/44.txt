@@ -1,0 +1,1 @@
+I have a chart.js time axis. I want it to always show all ticks on the (time) X axis even if I have no data points there.

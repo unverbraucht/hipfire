@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Qwen3.5 (DeltaNet) inference — matches ollama quality settings.
 //! Usage: infer_qwen35 <model.hfq> [--guards on|off] [prompt text...]
 //!
@@ -76,7 +80,7 @@ fn main() {
     eprintln!("Config: dim={}, layers={}, heads={}, vocab={}", config.dim, config.n_layers, config.n_heads, config.vocab_size);
 
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
-        .unwrap_or_else(|| {
+        .unwrap_or_else(|_| {
             let gguf = hipfire_runtime::gguf::GgufFile::open(Path::new("/home/kaden/llama.cpp/models/Qwen3-0.6B-Q8_0.gguf")).expect("need GGUF for tokenizer");
             hipfire_runtime::tokenizer::Tokenizer::from_gguf(&gguf).expect("tokenizer failed")
         });
@@ -209,7 +213,7 @@ fn main() {
     // for n-gram loops via LoopGuard. Set up here so the loop body can
     // route bytes/tokens through them when use_guards is true.
     let mut filter = EosFilter::new(EosFilterConfig::default());
-    let loop_guard = LoopGuard::from_env();
+    let loop_guard = LoopGuard::from_config(hipfire_runtime::config::get());
     let mut bytes_fed_to_filter = 0usize;
     let mut streamed_tokens: Vec<u32> = Vec::new();
 
@@ -231,6 +235,8 @@ fn main() {
             top_p: sc.top_p,
             repeat_penalty: sc.repeat_penalty,
             repeat_window: repeat_buf_cap.min(sc.repeat_window),
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
             blocked_tokens: Vec::new(),
         };
         sampler::sample(
@@ -323,6 +329,8 @@ fn main() {
                 top_p: sc.top_p,
                 repeat_penalty: sc.repeat_penalty,
                 repeat_window: repeat_buf_cap.min(sc.repeat_window),
+                presence_penalty: 0.0,
+                frequency_penalty: 0.0,
                 blocked_tokens: Vec::new(),
             };
             sampler::sample(

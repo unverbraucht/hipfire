@@ -4,34 +4,51 @@ The protocol for measuring kernel-level tok/s honestly. Read this
 before claiming any win in a commit message; the gates assume you've
 followed it.
 
+## Warm the cache and DPM state first
+
+The single biggest cause of "noisy" benches is **measuring a cold
+process before the kernel JIT cache and DPM state have warmed up**.
+A first run after `cargo build` is 3-7× slower than steady state
+because hipcc compiles kernels on first dispatch and the GPU
+clocks haven't ramped. **That's not "DPM noise" — that's measurement
+error.** Warm first, then measure.
+
+Warmup options (any of these is sufficient):
+- `HIPFIRE_DPM_WARMUP_SECS=10` env var on the bench binary
+  (built into `bench_qwen35_mq4`, `dflash_spec_demo`, daemon)
+- A throwaway warmup run with the same prompt before the timed run
+- Use `scripts/probe_commits.sh` (handles warmup automatically)
+
 ## The within-session noise band
 
-On gfx1100 (7900 XTX) the within-session A/B noise band on a fresh
-process is **±10–15%** depending on DPM state, thermal headroom, and
-firmware version. This is BIG. A "+8%" win measured by changing some
-code in one shell session and re-running is **inside the noise**.
+Once warm, the within-session A/B noise band on gfx1100 (7900 XTX)
+is **±1–3%** on a fresh process. **A 3%+ delta is real signal worth
+investigating, not noise to wave off.** Earlier versions of this doc
+quoted ±10-15% — that figure conflated cold-start overhead with
+true noise and let real regressions slip through. Don't repeat the
+mistake: if you see a 3% delta, it's a real change. Bisect it.
 
-Sources of within-session drift, ranked by impact:
+Sources of REAL drift, ranked by impact (all distinct from the
+cold-start overhead above):
 
 1. **Stale build cache**. The speed-gate's `ensure_build()` is a
    no-op when the bench binary already exists. A "stash and re-bench"
    flow leaves the post-change binary in place, so both runs measure
    the same code. Always `rm target/release/examples/<bench>` before
    re-running.
-2. **DPM state**. The GPU clocks ramp up over the first ~5 seconds of
-   sustained load; benchmarks that include warmup catch this, ones
-   that don't measure cold clocks for the first run and hot clocks
-   for subsequent runs. Use `cat /sys/class/drm/card*/device/pp_dpm_sclk`
-   to inspect.
-3. **Firmware shadowing**. `/lib/firmware/updates/amdgpu` overrides
+2. **Firmware shadowing**. `/lib/firmware/updates/amdgpu` overrides
    the kernel's bundled firmware; if the dkms-installed firmware
    doesn't match the kernel-installed firmware, you get a SMU IF
    mismatch and ~50% prefill cratering. Fix:
    `sudo mv /lib/firmware/updates/amdgpu /lib/firmware/updates/amdgpu.bak
    && sudo reboot`. Symptoms in `dmesg | tail -40`.
-4. **Thermal throttle**. After 10+ minutes of sustained DFlash runs
+3. **Thermal throttle**. After 10+ minutes of sustained DFlash runs
    with the case closed, the 7900 XTX throttles. Check
    `cat /sys/class/drm/card*/device/hwmon/hwmon*/temp*_input`.
+4. **DPM state ON COLD START** (mitigated by warmup). The GPU clocks
+   ramp up over the first ~5 seconds of sustained load. This is the
+   confound the old "±10-15%" claim was actually measuring. Solved by
+   warmup; not a steady-state noise source.
 
 ## Cross-process verification
 
@@ -233,6 +250,71 @@ The engine collapses `\n{3,}` → `\n\n` at prompt entry by default
 (`prompt_normalize=true`). This eliminates the whitespace-variance
 source for normal use, but bench scripts that bypass the engine entry
 point still need the prompt-md5 discipline.
+
+## Resident-bench mode (avoid per-row 17 GB model reload)
+
+Bench scripts that shell out to `dflash_spec_demo` once per row pay
+the full target+drafter H2D on every invocation. On a 27 B mq4 pair
+that's ~56 s of model load to measure ~1.5 s of decode — a 24-row A/B
+battery is ~25 min wallclock for ~36 s of GPU compute, and
+`amdgpu_top` mostly shows the H2D rather than the kernel under test.
+
+Use `--prompts-file <path>` instead of `--prompt`: the binary loads
+target+drafter once and runs each manifest row against the resident
+pair, with full state reset between rows. Manifest is JSON-lines:
+
+```
+{"label":"humaneval-0","prompt":"...","max":16}
+{"label":"lru-cache","prompt":"...","max":16}
+```
+
+Each row's stderr output is bracketed by `@@@ ROW <i>: <label> @@@`
+and `@@@ ROW <i> END @@@` markers so a downstream parser can split
+the multi-row stream. Single `--prompt` mode is unchanged
+(byte-identical output, no separators).
+
+**Prompt-fixture discipline still applies** (§"Prompt structure
+matters"): assemble the manifest at runtime from committed `.txt`
+fixtures rather than inlining prompts in heredocs. Either `jq` or
+`python3 -c` works — the only requirement is byte-stable output:
+
+```bash
+# jq form
+jq -nR --arg p "$(cat benchmarks/prompts/humaneval_0_has_close_elements.txt)" \
+   '{label:"humaneval-0", prompt:$p, max:16}' >  manifest.jsonl
+jq -nR --arg p "$(cat benchmarks/prompts/lru_cache_pep8_strict.txt)" \
+   '{label:"lru-cache",  prompt:$p, max:16}' >> manifest.jsonl
+
+# python3 form (no jq dependency; see scripts/dflash_bench_resident_smoke.sh)
+python3 -c '
+import json, sys
+for label, path in [("humaneval-0","benchmarks/prompts/humaneval_0_has_close_elements.txt"),
+                    ("lru-cache", "benchmarks/prompts/lru_cache_pep8_strict.txt")]:
+    print(json.dumps({"label":label, "prompt":open(path).read(), "max":16}))
+' > manifest.jsonl
+
+dflash_spec_demo --target T --draft D --prompts-file manifest.jsonl …
+```
+
+Or commit the JSONL fixture directly (see
+`benchmarks/prompts/longcode_pflash.jsonl` for the shape).
+
+Caveats:
+- `--prompts-file` rejects `--cask-sidecar` — `EvictionCtx.eviction_count`
+  has no per-row reset, and a cumulative count is silently misleading
+  in the FlashCASK report. Run CASK benches as separate per-row
+  invocations.
+- `--prompts-file` rejects `--pflash` for now; PFlash drafter loading
+  and compression state are single-prompt only. Run PFlash benches as
+  separate invocations until a per-row reset path exists.
+- Cross-row validation: pass the same prompt twice with `--temp 0`;
+  the two `DFlash tokens: [...]` lines must match byte-for-byte.
+  `scripts/dflash_bench_resident_smoke.sh` is the reference check.
+- Per-process flags (e.g. `HIPFIRE_MMQ_MIN_BATCH` cutover, ddtree
+  budget/topk, kv-mode) still vary across invocations, not within.
+  Group manifest rows by these flags and run one invocation per group.
+
+See issue #173 for the full design.
 
 ## DFlash speed gate
 

@@ -1,0 +1,8 @@
+ISA-wise, what's the difference between RDNA1 and RDNA2?
+----
+Where does navi 12 fall into these archs?
+----
+Give me benchmark indications for the RDNA2 GPUs
+----
+And regarding inference? Take llama.cpp numbers for the same model if you can find them
+

@@ -1,0 +1,22 @@
+How can I configure pi agent (https://pi.dev/) to log all openai api requests and responses as jsonl?
+----
+The log-openai.ts you created never logs response bodies, just request bodies.
+
+Here's the analysis from claude code:
+● Eyeball verdict: the approach is right, but this file won't work as-is — two issues
+  1. Response bodies weren't captured. The file has 9 request bodies + 5 response_headers, and zero response bodies. The actual model generations — the OUTPUT tokens we need — aren't in
+  here. The only assistant output recoverable is what's echoed back into later requests' message histories (prior turns), which means you always lose the final turn of each conversation
+  plus any reasoning_content/text content that wasn't replayed.
+  2. Wrong shape for the builder (fixable): it's raw traffic ({id, ts, direction, payload}) with outputs nested under payload, not the flat assistant-output JSONL
+  build_mtp_vocab_sidecar.py expects. A small adapter handles that.
+  What's actually recoverable from this file: 4 unique assistant turns, ~191 tokens, all tool_calls (bash/read), zero text content. That's basically one short agent trajectory.
+  The good news
+  - The model is Lorbus/Qwen3.6-27B-int4-AutoRound — genuine Qwen3.6-27B, distribution-compatible (int4 shifts argmax slightly, fine for v1 frequency).
+  - The recovered turns are exactly the agentic JSON shape we want — {"name":"bash","arguments":{"command":"..."}}, read with paths. Great structural-token coverage (function names, JSON
+   keys, escaped paths). This is the right source; you just need a lot more of it, with the outputs actually captured.
+  Two fixes needed
+  1. Capture response bodies, not just headers. That's where the generations (and reasoning_content, and the final turn) live. If responses stream (SSE), accumulate the delta chunks into
+   the full message before logging. This is the real fix — without it, you're missing most of the signal.
+  2. Volume. A top-16K/32K cvs head wants ~millions of output tokens → hundreds-to-thousands of agent sessions, not one. Worth supplementing with the self-distill/public-dataset path
+  while real traffic accumulates.
+

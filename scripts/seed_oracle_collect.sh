@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # Task #93 Phase B seed-prediction oracle data collection.
 #
 # Runs DFlash spec-decode across three prompt genres (code, prose, instruct)
@@ -80,7 +85,7 @@ run_one() {
     out=$("$EXE" \
         --target "$TARGET_27B" --draft "$DRAFT_27B" \
         --prompt "$prompt" --max "$max" --ctx 2048 \
-        --kv-mode asym3 2>&1)
+        --kv-mode q8 2>&1)
     printf '%s\n' "$out" | python3 -c "$PARSE_PY" "$label"
 }
 

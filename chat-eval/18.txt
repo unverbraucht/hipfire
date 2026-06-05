@@ -1,0 +1,1 @@
+I have an app that accesses Google calendar. Currently I register for oauth access in the Google API console for my Google workspace. I want to make this app available to all kinds of Google accounts, normal and different workspace. How do I register a kind of public app?

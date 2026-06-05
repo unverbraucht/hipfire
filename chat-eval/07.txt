@@ -1,0 +1,4 @@
+Look at the hipfire inference engine and it's mq quantization scheme. Show me research that shows findings on the quality of this scheme.
+----
+Explain how perplexity and kld fit together. Which metric is useful for what aspect of quantization quality estimation, and what other aspects matter
+

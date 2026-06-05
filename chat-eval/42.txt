@@ -1,0 +1,5 @@
+I want to implement Perfect Forward Secrecy in my TLS enabled application. Do certificate and keys have to be of a certain kind to do this?
+----
+What are the storage requirements for a reasonably secure RSA certificate and key?
+----
+What are the storage requirements for a reasonably secure ECDSA certificate and key?

@@ -1,0 +1,2 @@
+Research for external water temperature sensors that are affordable. Ideally wireless, battery powered and frost proof. Goal: measure water temperature of a lake from a nearby hut
+

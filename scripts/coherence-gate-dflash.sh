@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # Coherence battery — DFlash + DDTree variant.
 #
 # Sibling to coherence-gate.sh (which only exercises target-only AR decode
@@ -58,10 +63,25 @@ fi
 
 EXE="./target/release/examples/dflash_spec_demo"
 MODELS_DIR="${HIPFIRE_MODELS_DIR:-$HOME/.hipfire/models}"
-TARGET_27B="$MODELS_DIR/qwen3.5-27b.mq4"
-DRAFT_27B="$MODELS_DIR/qwen35-27b-dflash.mq4"
-if [ ! -f "$DRAFT_27B" ] && [ -f "$MODELS_DIR/qwen35-27b-dflash-mq4.hfq" ]; then
-    DRAFT_27B="$MODELS_DIR/qwen35-27b-dflash-mq4.hfq"
+# Target/draft resolution. Honor explicit env overrides; otherwise probe the
+# qwen3.5 names (historical) then the qwen3.6 names (current) — dflash spec
+# decode works on either generation, the gate just needs a target+draft pair.
+# The hardcoded qwen3.5-only paths used to leave the gate SKIPPED on machines
+# that only ship the qwen3.6 27B (e.g. this one), which is why DFlash changes
+# couldn't be attractor-validated.
+TARGET_27B="${HIPFIRE_DFLASH_TARGET:-}"
+DRAFT_27B="${HIPFIRE_DFLASH_DRAFT:-}"
+if [ -z "$TARGET_27B" ]; then
+    for cand in qwen3.5-27b.mq4 qwen3.6-27b.mq4; do
+        if [ -f "$MODELS_DIR/$cand" ]; then TARGET_27B="$MODELS_DIR/$cand"; break; fi
+    done
+    [ -z "$TARGET_27B" ] && TARGET_27B="$MODELS_DIR/qwen3.5-27b.mq4"
+fi
+if [ -z "$DRAFT_27B" ]; then
+    for cand in qwen35-27b-dflash.mq4 qwen35-27b-dflash-mq4.hfq qwen36-27b-dflash-mq4.hfq qwen36-27b-dflash-mq4.hf4; do
+        if [ -f "$MODELS_DIR/$cand" ]; then DRAFT_27B="$MODELS_DIR/$cand"; break; fi
+    done
+    [ -z "$DRAFT_27B" ] && DRAFT_27B="$MODELS_DIR/qwen35-27b-dflash.mq4"
 fi
 OUT="${HIPFIRE_COHERENCE_OUT:-/tmp/coherence-dflash-$(date +%Y%m%d-%H%M%S).md}"
 CASE_TIMEOUT="${HIPFIRE_COHERENCE_TIMEOUT:-240}"
@@ -151,6 +171,7 @@ hard_errors=0
     echo "- branch: $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
     echo "- date:   $(date -Iseconds)"
     echo "- mode:   $( [ "$FAST" -eq 1 ] && echo fast || ( [ "$FULL" -eq 1 ] && echo full || echo short ) )"
+    echo "- kv_mode: q8"
     echo "- target: $TARGET_27B"
     echo "- draft:  $DRAFT_27B"
     echo
@@ -264,7 +285,7 @@ for entry in "${tests[@]}"; do
     timeout "$CASE_TIMEOUT" "$EXE" \
         --target "$TARGET_27B" --draft "$DRAFT_27B" \
         --prompt "$prompt" --max "$max_tok" --ctx 2048 \
-        --kv-mode asym3 --no-chatml \
+        --kv-mode q8 --no-chatml \
         "${extra[@]}" \
         > "$out_file" 2>&1
     ec=$?

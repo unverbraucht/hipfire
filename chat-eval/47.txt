@@ -1,0 +1,14 @@
+Translate this dutch to english:
+
+Helaas heeft de update meer kapot gemaakt dan voor oplossingen heeft gezorgd.
+ 
+De PDU’s zijn nu na ongeveer 2 uur niet meer benaderbaar vanaf Enertree en op de switch zie ik ook dat de PDU’s geen verbinding meer hebben.
+Het enige wat dan nog werkt is de gateway module van PDU’s loshalen en opnieuw insteken.
+ 
+Helaas hebben we vanaf het moment van levering van de PDU’s al problemen met het Enertree platform en werkt het zeker niet stabiel.
+We kunnen er eigenlijk helemaal niets mee op dit moment.
+ 
+Wat kunnen we hier aan doen? We kunnen de producten niet in productie nemen zolang het niet stabiel werkt.
+ 
+We hopen z.s.m. op een oplossing.
+ b817fec9afe5&tenantId=d1a08089-634d-4d71-9ee8-79409e3d78eb

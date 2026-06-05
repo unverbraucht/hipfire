@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # Tree-graph capture A/B — DDTree b12-k2 with/without HIPFIRE_VERIFY_GRAPH_TREE.
 # 3 runs each × (code, prose, instruct).
 set -u
@@ -72,13 +77,13 @@ run_one() {
             out=$("$EXE" \
                 --target "$TARGET_27B" --draft "$DRAFT_27B" \
                 --prompt "$prompt" --max "$MAX_TOKENS" --ctx 2048 \
-                --kv-mode asym3 --no-chatml \
+                --kv-mode q8 --no-chatml \
                 --ddtree-batched --ddtree-budget 12 --ddtree-topk 2 2>&1)
         else
             out=$(env "$env_var=1" "$EXE" \
                 --target "$TARGET_27B" --draft "$DRAFT_27B" \
                 --prompt "$prompt" --max "$MAX_TOKENS" --ctx 2048 \
-                --kv-mode asym3 --no-chatml \
+                --kv-mode q8 --no-chatml \
                 --ddtree-batched --ddtree-budget 12 --ddtree-topk 2 2>&1)
         fi
         blob+="$out"$'\x1e'

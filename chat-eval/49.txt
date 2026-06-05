@@ -1,0 +1,118 @@
+I need an application running in a Linux CLI that presents a curses based menu to the user in which he can configure network interface configurations for systemd-networkd. It can be written in either bash or nodejs.
+It should scan /etc/systemd/network/ for all *.network files and offer to edit or analyze each of them. The files are named 10-eth0.network, 10-eth1.network and so on. It should read the file first to understand the current configuration. It should prefill the edit UI with the current configuration. The following attributes of a connection should be configurable:
+- setting a static IPv4 including netmask
+- enabling or disabling DHCPv4
+- setting a static IPv4 gateway
+- settting a static IPv6 address including prefix length
+- enabling or disabling DHCPv6
+- enabling or disabling IPv6 Link Local Autoconfig
+- enabling or disabling IPv6 RA
+- setting a list of nameservers
+Saving a configuration should update the config file and restart the network through `networkctl reload`.
+
+Here are some example configurations for eth0:
+
+This is DHCPv4 enabled, IPv6 Link Local Autoconfiguration and IPv6 RA enabled:
+```
+            [Match]
+            Name=eth0
+
+            [Network]
+MulticastDNS=yes
+            DHCP=ipv4
+            LinkLocalAddressing=fallback
+```
+
+This is a static IPv4 configured (DHCPv4 is disabled), IPv6 Link Local Autoconfiguration and IPv6 RA enabled:
+```
+[Match]
+Name=eth0
+
+[Network]
+MulticastDNS=yes
+Address=192.168.3.123/24
+Gateway=192.168.3.1
+DNS=192.168.3.1
+```
+
+This is DHCPv4 and DHCPv6 enabled, IPv6 RA enabled:
+```
+[Match]
+Name=eth0
+
+[Network]
+MulticastDNS=yes
+DHCP=yes
+LinkLocalAddressing=fallback
+```
+
+This is a special case: both static IPv4 and either DHCPv4 or DHCPv6 are enabled, so we need an extra [Address] block for the static IPv4. 
+```
+[Match]
+Name=eth0
+            
+[Network]
+MulticastDNS=yes
+DNS=192.168.178.40
+DHCP=ipv6
+LinkLocalAddressing=ipv6
+            
+[Address]
+Label=eth0:0
+Address=192.168.178.1/24
+            
+[Route]
+Metric=1025
+Gateway=192.168.178.254
+```
+
+This is DHCPv4 enabled, IPv6 Link Local Autoconfiguration disabled (that's why it's set to ipv4-fallback) but IPv6 RA disabled:
+```
+[Match]
+Name=eth0
+
+[Network]
+MulticastDNS=yes
+DHCP=ipv4
+IPv6AcceptRA=no
+LinkLocalAddressing=ipv4-fallback
+```
+
+This is static IPv4 configured, DHCPv4 disabled, static IPv6 configured, IPv6 RA disabled, IPv6 Link Local Autoconfiguration enabled:
+```
+[Match]
+Name=eth0
+
+[Network]
+MulticastDNS=yes
+Address=192.168.12.123/24
+Gateway=192.168.12.2
+DNS=192.168.12.3
+Address=2001:db8::123/64
+Gateway=2001:db8::1
+DNS=2001:db8::2
+IPv6AcceptRA=no
+```
+
+This is DHCPv4 enabled, static IPv4 not set, IPv6 disabled, IPv6 Link Local Autoconfig disabled, IPv6 RA disabled, a static IPv6 set. Also here we have a second [Address] block because both a static IP and DHCP are enabled at the same time:
+```
+[Match]
+Name=eth0
+
+[Network]
+MulticastDNS=yes
+DHCP=ipv4
+LinkLocalAddressing=ipv4-fallback
+IPv6AcceptRA=no
+
+[Address]
+Label=eth0:0
+Address=2001:db8::123/60
+
+[Route]
+Metric=1025
+Gateway=2001:db8::1
+```
+
+The analyze functionality should show the status of the respective network interface. It is enough to show the output of `networkctl status INTERFACE` in the output.
+

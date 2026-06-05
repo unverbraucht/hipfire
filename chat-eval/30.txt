@@ -1,0 +1,1 @@
+I'm using the reverse proxy for synology to forward a https service from my router to an internal host, serving as a HTTPS enabling reverse proxy. Every second page load shows a 404 error page from synology web station

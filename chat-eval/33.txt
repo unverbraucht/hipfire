@@ -1,0 +1,6 @@
+Running a 4 bit gguf quant of a LLM model compared to an awq quant, what should deliver faster inference on vllm?
+----
+And how is it on llama.cpp
+----
+for AMD gpus
+

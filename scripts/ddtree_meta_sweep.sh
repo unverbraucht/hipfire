@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # DDTree meta-verifier pruner sweep — tests HIPFIRE_DDTREE_LOGW_CUTOFF
 # against the b12-k2 baseline on prose/instruct (where DDTree wins
 # currently). Cutoff stops heap expansion when next candidate's cumulative
@@ -97,7 +102,7 @@ run_one() {
         out=$(env "${env_prefix[@]}" "$EXE" \
             --target "$TARGET_27B" --draft "$DRAFT_27B" \
             --prompt "$prompt" --max "$MAX_TOKENS" --ctx 2048 \
-            --kv-mode asym3 --no-chatml \
+            --kv-mode q8 --no-chatml \
             --ddtree-batched --ddtree-budget 12 --ddtree-topk 2 2>&1)
         blob+="$out"$'\x1e'
     done

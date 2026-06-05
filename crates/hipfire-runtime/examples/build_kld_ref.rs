@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kevin Read
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! build_kld_ref — KLD reference producer for the hipfire quant-quality eval.
 //!
 //! Spawns `llama-perplexity --kl-divergence-base <fifo>`, reads its full-vocab
@@ -120,6 +124,7 @@ fn main() {
         .args(["-f", &args.slice.display().to_string()])
         .args(["-c", &args.n_ctx.to_string()])
         .args(["-b", &args.n_batch.to_string()])
+        .args(["-ngl", &std::env::var("HIPFIRE_KLD_NGL").unwrap_or_else(|_| "99".to_string())])
         .args(["--kl-divergence-base", &fifo_path.display().to_string()])
         .arg("--no-mmap")
         .stderr(Stdio::inherit())

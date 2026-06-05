@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Grégory D
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # Path C smoke gate — runs `spec_step_ddtree_path_c` (Phase 1 and Phase 2)
 # end-to-end through `dflash_spec_demo`, applies the Path A/B token-attractor
 # detector, and reports per-mode pass/fail.
@@ -276,7 +281,7 @@ for entry in "${TESTS[@]}"; do
     timeout 240 env "${graph_env[@]}" "$EXE" \
         --target "$TARGET" --draft "$DRAFT" \
         --prompt "$prompt" --max "$max_tok" --ctx 2048 \
-        --kv-mode asym3 --no-chatml \
+        --kv-mode q8 --no-chatml \
         --ddtree-path-c "$phase" --ddtree-budget 12 --ddtree-topk 2 \
         > "$out_file" 2>&1
     ec=$?

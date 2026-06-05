@@ -1,0 +1,135 @@
+I have the following esphome config for a smart screen. I want to update my weather shown there from the weather in my home assistant config. Here is the weather data in my weather service in my home assistant entity:
+```
+state:
+  translated: Clear, night
+  raw: clear-night
+  last_changed: "2026-03-22T17:26:20.104Z"
+  last_updated: "2026-03-22T20:26:20.095Z"
+attributes:
+  temperature: 4.4
+  dew_point: -3.4
+  temperature_unit: °C
+  humidity: 57
+  cloud_coverage: 2.3
+  uv_index: 0
+  pressure: 1012.7
+  pressure_unit: hPa
+  wind_bearing: 95.3
+  wind_speed: 12.2
+  wind_speed_unit: km/h
+  visibility_unit: km
+  precipitation_unit: mm
+  attribution: >-
+    Weather forecast from met.no, delivered by the Norwegian Meteorological
+    Institute.
+  friendly_name: Forecast Home
+  supported_features: 3
+```
+
+Here are the relevant esphome api services concerned with the weather:
+```
+api:
+  services:
+    - service: set_weather_icon_by_name
+      variables:
+        condition: string
+        red: int
+        green: int
+        blue: int
+      then:
+        - lambda: |-
+            // 1. Animation starten
+            id(start_icon_rotation).execute(); 
+
+            // 2. Bestehende Logik
+            const char* icon_char = "B"; 
+            if (condition == "sunny") icon_char = "B";
+            else if (condition == "clear-night") icon_char = "I";
+            else if (condition == "partlycloudy") icon_char = "H";
+            else if (condition == "cloudy") icon_char = "N";
+            else if (condition == "fog") icon_char = "M";
+            else if (condition == "rainy") icon_char = "R";
+            else if (condition == "pouring") icon_char = "X";
+            else if (condition == "snowy") icon_char = "W";
+            else if (condition == "lightning-rainy") icon_char = "S";
+            else if (condition == "windy") icon_char = "F";
+            else if (condition == "snowy-rainy") icon_char = "U";
+            
+            lv_obj_set_style_text_font(id(lv_weather_icon), id(weather_icons_48), LV_PART_MAIN);
+            lv_label_set_text(id(lv_weather_icon), icon_char);
+            lv_obj_set_style_text_color(id(lv_weather_icon), lv_color_make(red, green, blue), LV_PART_MAIN);
+            lv_obj_add_flag(id(lv_weather_waiting), LV_OBJ_FLAG_HIDDEN);
+
+    - service: set_weather_line
+      variables:
+        message: string
+        line: int
+      then:
+        - lambda: |-
+            if (line == 4) {
+              lv_label_set_text(id(lv_weather_line_4), message.c_str());
+              lv_obj_add_flag(id(lv_weather_waiting), LV_OBJ_FLAG_HIDDEN);
+              // HIER: Animation stoppen und Icon verstecken
+              id(stop_icon_rotation).execute(); // <--- HIER STOPPEN
+            } else if (line == 1) {
+              lv_label_set_text(id(lv_temp_text), message.c_str());
+              lv_obj_add_flag(id(lv_weather_waiting), LV_OBJ_FLAG_HIDDEN);
+            } else if (line == 3) {
+              lv_label_set_text(id(lv_regen_text), message.c_str());
+            }
+text:
+  - platform: template
+    name: "Weather Text 1"
+    id: ${device_id}_weather_text_1
+    mode: text
+    optimistic: true
+    on_value:
+      then:
+        - lambda: lv_label_set_text(id(lv_temp_text), x.c_str());
+
+  - platform: template
+    name: "Weather Text 2"
+    id: ${device_id}_weather_text_2
+    mode: text
+    optimistic: true
+    on_value:
+      then:
+        - logger.log:
+            format: "Zeile 2: %s"
+            args: ['x.c_str()']
+
+  - platform: template
+    name: "Weather Text 3"
+    id: ${device_id}_weather_text_3
+    mode: text
+    optimistic: true
+    on_value:
+      then:
+        - lambda: lv_label_set_text(id(lv_regen_text), x.c_str());
+
+  - platform: template
+    name: "Weather Text 4"
+    id: ${device_id}_weather_text_4
+    mode: text
+    optimistic: true
+    on_value:
+      then:
+        - lambda: lv_label_set_text(id(lv_weather_line_4), x.c_str());
+
+script:
+  - id: ${device_id}_update_weather_text
+    mode: queued
+    parameters:
+      message: string
+      line: int
+    then:
+      - lambda: |-
+          if (line == 1) {
+            lv_obj_add_flag(id(lv_weather_waiting), LV_OBJ_FLAG_HIDDEN);
+            lv_label_set_text(id(lv_temp_text), message.c_str());
+          } else if (line == 3) {
+            lv_label_set_text(id(lv_regen_text), message.c_str());
+          } else if (line == 4) {
+            lv_label_set_text(id(lv_weather_line_4), message.c_str());
+          }
+```

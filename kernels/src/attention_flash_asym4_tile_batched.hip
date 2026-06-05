@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 // Batched flash attention tile for asym4: K at 4-bit rotated, V at Q8_0.
 // Processes sub_batch_size positions via blockIdx.z.
 // 2-pass K for head_dim=256 (128-dim per pass).
@@ -33,6 +37,7 @@ __global__ void attention_flash_asym4_tile_batched(
     int batch_offset,
     int block_start,                           // ignored when tree_bias == nullptr
     int block_cols,                            // ignored when tree_bias == nullptr
+    int v_mode,                                // 8 = Q8_0 V (only mode for asym4)
     // Sliding-window lookback (Gemma 4). 0 = no window / full causal.
     int window_size
 ) {

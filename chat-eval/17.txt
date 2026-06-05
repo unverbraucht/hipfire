@@ -1,0 +1,1 @@
+On esp home running as home assistant add-on, is there a way to build a firmware binary and then download it via ssh or through file access?

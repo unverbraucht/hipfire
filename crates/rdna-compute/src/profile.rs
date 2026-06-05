@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Per-kernel bandwidth profiling.
 //!
 //! Wraps GPU kernel launches with hipEvent timing + analytical byte counts,
@@ -147,16 +151,104 @@ pub fn gemv_hfq4g256_bytes(m: usize, k: usize) -> usize {
     hfq4g256_weight_bytes(m, k) + k * 4 + m * 4
 }
 
+/// HFQ4-G128 weight footprint: 72 B per 128-element group (4 B scale +
+/// 4 B zero + 64 B packed 4-bit weights).
+pub fn hfq4g128_weight_bytes(m: usize, k: usize) -> usize {
+    let groups = k / 128;
+    m * groups * 72
+}
+
+/// Bytes for a single-row HFQ4-G128 GEMV: weight + input vector + output vector.
+pub fn gemv_hfq4g128_bytes(m: usize, k: usize) -> usize {
+    hfq4g128_weight_bytes(m, k) + k * 4 + m * 4
+}
+
+/// HFQ3-G256 weight footprint: 104 B per 256-element group (4 B scale +
+/// 4 B zero + 96 B packed 3-bit weights).
+pub fn hfq3g256_weight_bytes(m: usize, k: usize) -> usize {
+    let groups = k / 256;
+    m * groups * 104
+}
+
+/// Bytes for a single-row HFQ3-G256 GEMV: weight + input vector + output vector.
+pub fn gemv_hfq3g256_bytes(m: usize, k: usize) -> usize {
+    hfq3g256_weight_bytes(m, k) + k * 4 + m * 4
+}
+
+/// PARO4-G128 native payload footprint plus one input and output vector.
+pub fn gemv_paro4g128_bytes(m: usize, k: usize) -> usize {
+    let groups = k / 128;
+    let m_pack = m / 8;
+    let qweight = k * m_pack * 4;
+    let qzeros = groups * m_pack * 4;
+    let scales = groups * m * 2;
+    let pairs = 8 * k * 2;
+    let theta = 8 * (k / 2) * 2;
+    let channel_scales = k * 2;
+    qweight + qzeros + scales + pairs + theta + channel_scales + k * 4 + m * 4
+}
+
+/// PARO4-G128 activation rotation: reads x plus Paro pair/theta/channel-scale
+/// metadata and writes one rotated FP32 activation vector.
+pub fn paro4g128_rotate_bytes(_m: usize, k: usize) -> usize {
+    let pairs = 8 * k * 2;
+    let theta = 8 * (k / 2) * 2;
+    let channel_scales = k * 2;
+    k * 4 + pairs + theta + channel_scales + k * 4
+}
+
+/// PARO4-G128T activation rotation with precomputed f32 sin/cos pairs.
+pub fn paro4g128t_rotate_bytes(_m: usize, k: usize) -> usize {
+    let pairs = 8 * k * 2;
+    let sincos = 8 * (k / 2) * 2 * 4;
+    let channel_scales = k * 2;
+    k * 4 + pairs + sincos + channel_scales + k * 4
+}
+
+/// PARO4-G128 GEMV after activation rotation has been materialized.
+pub fn gemv_paro4g128_prerotated_bytes(m: usize, k: usize) -> usize {
+    let groups = k / 128;
+    let m_pack = m / 8;
+    let qweight = k * m_pack * 4;
+    let qzeros = groups * m_pack * 4;
+    let scales = groups * m * 2;
+    qweight + qzeros + scales + k * 4 + m * 4
+}
+
 /// MQ3-Lloyd GEMV bytes: weight (112 B / group) + x + y.
 pub fn gemv_mq3g256_lloyd_bytes(m: usize, k: usize) -> usize {
     let groups = k / 256;
     m * groups * 112 + k * 4 + m * 4
 }
 
+/// MQ4-Lloyd GEMV bytes: weight (160 B / group) + x + y.
+pub fn gemv_mq4g256_lloyd_bytes(m: usize, k: usize) -> usize {
+    let groups = k / 256;
+    m * groups * 160 + k * 4 + m * 4
+}
+
 /// Bytes for a B-way batched HFQ4-G256 GEMM (weight read once, B input/output
 /// vectors).
 pub fn gemm_hfq4g256_bytes(m: usize, k: usize, batch: usize) -> usize {
     hfq4g256_weight_bytes(m, k) + batch * (k + m) * 4
+}
+
+/// Bytes for a B-way batched HFQ3-G256 GEMM. HFQ3 sibling of
+/// `gemm_hfq4g256_bytes`. Used by the gfx10 MQ3 batched-prefill
+/// dispatchers (qkv / qkvza / gate_up / residual).
+pub fn gemm_hfq3g256_bytes(m: usize, k: usize, batch: usize) -> usize {
+    hfq3g256_weight_bytes(m, k) + batch * (k + m) * 4
+}
+
+/// HFQ6-G256 weight footprint: 200 B/group × K/256 groups per row.
+pub fn hfq6g256_weight_bytes(m: usize, k: usize) -> usize {
+    let groups = k / 256;
+    m * groups * 200
+}
+
+/// Bytes for a single-row HFQ6-G256 GEMV: weight + input vector + output vector.
+pub fn gemv_hfq6g256_bytes(m: usize, k: usize) -> usize {
+    hfq6g256_weight_bytes(m, k) + k * 4 + m * 4
 }
 
 /// HFP4-G32 weight footprint: 16-B row header + (K/32)*17-B blocks per row.

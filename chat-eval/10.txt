@@ -1,0 +1,10 @@
+I have this information from an italian asta house real estate ad: Immobili ubicati al primo e secondo piano, ricadenti in parte sull’edificio di Via G.Verdi n.30 e in parte
+  su quello di Via F. Schininà n.170, individuati rispettivamente al catasto dei fabbricati al foglio 279, p.lla 6601 sub 2, cat.A5 di 1,5 vani ( ex foglio 268 part.lla 1081 sub 2), di
+  mq.34,00 e part.lla 6602 sub 2 Ct. A5 di 2,5 vani ( ex foglio 268 part.lla 1080sub 2) di mq 61,00
+
+Looking at https://pvp.giustizia.it/pvp/ - is there any way I can look up the asta listing using this information?
+----
+I have the following long lega text ("ordinanza") from an italian real estate auction. Looking at understanding ownership, catastral data, risks of purchase - is this document any help? https://resource-pvp.giustizia.it/allegati/4538027/ordinanza_signed_redacted.pdf?versionId=9d4e3f04-50d5-4596-aa0d-6dd306a5997e
+----
+What's catastral category C2 in italy? The building is described as a warehouse, can this be used for residential purposes?
+

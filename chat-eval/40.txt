@@ -1,0 +1,2 @@
+I have an embedded device and a software platform managing this device. They communicate over HTTPS. Each have a pre-installed certificate and key signed by the same CA. I want to implement a process where upon first communication the software creates a key and certificate pair and signs the certificate with it's own. This key and certificate should be transmitted to the device and then used for HTTPS for future communication. What are the pitfalls and downsides of this approach? What needs to be done to maximize security and reliability?
+

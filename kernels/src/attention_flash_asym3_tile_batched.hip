@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 // Batched flash attention tile for asym3: K at 3-bit rotated, V at Q8_0.
 // Processes sub_batch_size positions in one launch via blockIdx.z.
 // Partials layout: [sub_batch × n_heads × max_tiles × (2+head_dim)].
@@ -38,6 +42,7 @@ __global__ void attention_flash_asym3_tile_batched(
     int batch_offset,
     int block_start,                           // ignored when tree_bias == nullptr
     int block_cols,                            // ignored when tree_bias == nullptr
+    int v_mode,                                // 8 = Q8_0 V (only mode for asym3)
     // Sliding-window lookback (Gemma 4). 0 = no window / full causal.
     // Tree-mode + sliding is not currently used; the predicate below ignores
     // window_size whenever tree_mode is active so DDTree paths are unaffected.

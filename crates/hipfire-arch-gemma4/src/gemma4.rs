@@ -466,7 +466,7 @@ fn load_gemma4_weight(hfq: &HfqFile, gpu: &mut Gpu, name: &str, m: usize, k: usi
                 std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
             };
             let buf = gpu.upload_raw(bytes, &[m, k])?;
-            return Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0, awq_scale: None });
+            return Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0, awq_scale: None, paro: None });
         }
         3  => DType::Q8_0,
         4  => DType::Q4K,
@@ -493,7 +493,7 @@ fn load_gemma4_weight(hfq: &HfqFile, gpu: &mut Gpu, name: &str, m: usize, k: usi
         )),
     };
     let buf = gpu.upload_raw(data, &[data.len()])?;
-    Ok(WeightTensor { buf, gpu_dtype: dtype, m, k, row_stride: 0, awq_scale: None })
+    Ok(WeightTensor { buf, gpu_dtype: dtype, m, k, row_stride: 0, awq_scale: None, paro: None })
 }
 
 /// Load the MoE branch weights for a single Gemma 4 MoE layer (26B-A4B).
@@ -593,11 +593,11 @@ fn load_moe_layer_extras(hfq: &HfqFile, gpu: &mut Gpu, p: &str, config: &Gemma4C
         experts.push(MoeExpertWeights {
             gate_up_proj: WeightTensor {
                 buf: gu_view, gpu_dtype: gate_up_dtype,
-                m: 2 * mi, k: dim, row_stride: 0, awq_scale: None,
+                m: 2 * mi, k: dim, row_stride: 0, awq_scale: None, paro: None,
             },
             down_proj: WeightTensor {
                 buf: dn_view, gpu_dtype: down_dtype,
-                m: dim, k: mi, row_stride: 0, awq_scale: None,
+                m: dim, k: mi, row_stride: 0, awq_scale: None, paro: None,
             },
         });
     }
@@ -700,7 +700,7 @@ pub fn load_weights(hfq: &mut HfqFile, config: &Gemma4Config, gpu: &mut Gpu)
             shape: embed_tokens.shape.clone(),
             dtype,
         };
-        WeightTensor { buf: alias_tensor, gpu_dtype: dtype, m: config.vocab_size, k: config.dim, row_stride: 0, awq_scale: None }
+        WeightTensor { buf: alias_tensor, gpu_dtype: dtype, m: config.vocab_size, k: config.dim, row_stride: 0, awq_scale: None, paro: None }
     };
 
     eprintln!("gemma4: loading final norm...");
@@ -1604,22 +1604,22 @@ pub fn forward_scratch(
         && kv_sliding.compact_offset == 0
         && kv_full.compact_offset == 0;
 
-    if use_graph && gpu.graph_exec.is_some() {
+    if use_graph && gpu.graphs.graph_exec.is_some() {
         // ── Replay path. Update pos_buf via stream_write_value32 (graph-
         //    replay-safe, no host→device copy). The captured graph reads
         //    pos_buf at kernel-launch time, so a fresh `pos` propagates
         //    without recapture. ──
         let stream = gpu.active_stream.as_ref().unwrap();
         gpu.hip.stream_write_value32(stream, &scratch.pos_buf, pos as u32, 0)?;
-        gpu.graph_launch()?;
-    } else if use_graph && gpu.graph_exec.is_none() {
+        gpu.graphs.graph_launch(&gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap())?;
+    } else if use_graph && gpu.graphs.graph_exec.is_none() {
         let pos_i32 = pos as i32;
-        if !gpu.ar_forward_warmed_up {
+        if !gpu.graphs.ar_forward_warmed_up {
             // ── Warmup: direct dispatch so any JIT kernel compiles or lazy
             //    scratch allocations happen OUTSIDE a capture region.
             //    Capturing on the first call hits "hipMalloc not permitted
             //    under stream capture". Same pattern as Qwen35. ──
-            gpu.ar_forward_warmed_up = true;
+            gpu.graphs.ar_forward_warmed_up = true;
             gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
             forward_scratch_inner(gpu, weights, config, pos, kv_sliding, kv_full, scratch)?;
         } else {
@@ -1628,15 +1628,15 @@ pub fn forward_scratch(
                 gpu.active_stream = Some(gpu.hip.stream_create()?);
             }
             gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
-            gpu.begin_graph_capture()?;
+            gpu.graphs.begin_graph_capture(&gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap())?;
             forward_scratch_inner(gpu, weights, config, pos, kv_sliding, kv_full, scratch)?;
-            gpu.end_graph_capture()?;
+            gpu.graphs.end_graph_capture(&gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap())?;
             // hipStreamCaptureModeGlobal RECORDS — kernels don't execute
             // during capture. Replay once so THIS pos's forward actually
             // runs (KV write, logits update).
-            gpu.graph_launch()?;
+            gpu.graphs.graph_launch(&gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap())?;
             eprintln!("[gemma4 hipGraph] captured {} blobs, instantiated",
-                gpu.capture_blobs.len());
+                gpu.graphs.capture_blobs.len());
         }
     } else {
         // ── Direct path (no graph) ──

@@ -1,0 +1,4 @@
+For LLM inference, is it in principle possible to run prefill on one GPU and decode on another in a multi GPU system? What should be the limitations and downsides?
+----
+Contrast this with running a draft model like dflash or pflash on hetero architecture.
+

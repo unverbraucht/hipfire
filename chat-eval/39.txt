@@ -1,0 +1,1 @@
+I have an Ubuntu system installed from CSM / MBR. I want to use it in an uefi system. Can the partitions and bootloader be converted?

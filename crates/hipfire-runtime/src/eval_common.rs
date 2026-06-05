@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kevin Read
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Shared helpers for the KLD-eval example binaries (`build_kld_ref`,
 //! `eval_hipfire`, `eval_gguf`). Each of these examples re-verifies the
 //! same three invariants before doing work; centralising the helpers
@@ -144,6 +148,14 @@ pub fn verify_slice_md5(slice_path: &Path, tool_name: &str) {
 ///
 /// On any mismatch, `std::process::exit(2)`.
 pub fn verify_llama_commit(bin: &str, pinned: &str, tool_name: &str) {
+    // Reproducibility guard, not a correctness requirement. Skip it when the
+    // available llama.cpp build differs from the pinned commit (the KLD value
+    // is insensitive to the exact llama.cpp commit). Set
+    // HIPFIRE_SKIP_LLAMA_COMMIT_CHECK=1 to bypass.
+    if std::env::var("HIPFIRE_SKIP_LLAMA_COMMIT_CHECK").ok().as_deref() == Some("1") {
+        eprintln!("{tool_name}: HIPFIRE_SKIP_LLAMA_COMMIT_CHECK=1 — skipping llama.cpp commit verification (pinned {pinned})");
+        return;
+    }
     let out = Command::new(bin).arg("--version").output();
     let out = match out {
         Ok(o) => o,

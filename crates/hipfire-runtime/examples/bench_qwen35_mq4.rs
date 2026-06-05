@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Focused perf benchmark for Qwen3.5 MQ4 forward pass.
 //!
 //! Separates prefill from generation, strips first-run kernel JIT overhead
@@ -49,20 +53,49 @@ fn main() {
     eprintln!("Model: {model_path}");
     eprintln!("Phases: prefill={prefill_len} prefill_runs={prefill_runs} warmup={warmup_len} gen={gen_len}");
 
-    let mut hfq = HfqFile::open(Path::new(model_path)).expect("open model");
-    let config = qwen35::config_from_hfq(&hfq).expect("read config");
-    eprintln!(
-        "Config: dim={} layers={} heads={} kv_heads={} vocab={}",
-        config.dim, config.n_layers, config.n_heads, config.n_kv_heads, config.vocab_size
-    );
-    let model_bytes = std::fs::metadata(model_path).map(|m| m.len()).unwrap_or(0);
-    eprintln!("Model size: {:.3} GiB ({} bytes)", model_bytes as f64 / (1024.0 * 1024.0 * 1024.0), model_bytes);
-
+    let model_path_buf = Path::new(model_path);
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
     eprintln!("GPU: {}", gpu.arch);
 
+    // Auto-route safetensors directories (ParoQuant / AWQ / HF native) —
+    // mirrors daemon.rs:1500-1504 and eval_hipfire's load path. HFQ files
+    // take the canonical HFQ path below.
     let t_load = Instant::now();
-    let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load weights");
+    let (config, weights, model_bytes) = if model_path_buf.is_dir() {
+        use hipfire_runtime::safetensors_source::SafetensorsSource;
+        let source = SafetensorsSource::open(model_path_buf).expect("safetensors open");
+        let config = qwen35::config_from_safetensors(&source)
+            .expect("config_from_safetensors");
+        eprintln!(
+            "Config: dim={} layers={} heads={} kv_heads={} vocab={}",
+            config.dim, config.n_layers, config.n_heads, config.n_kv_heads, config.vocab_size
+        );
+        let bytes = std::fs::read_dir(model_path_buf)
+            .ok()
+            .map(|rd| rd.filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().is_some_and(|x| x == "safetensors"))
+                .filter_map(|e| std::fs::metadata(e.path()).ok())
+                .map(|m| m.len()).sum::<u64>())
+            .unwrap_or(0);
+        eprintln!("Model size: {:.3} GiB ({} bytes, safetensors)",
+            bytes as f64 / (1024.0 * 1024.0 * 1024.0), bytes);
+        eprintln!("  loading via safetensors (ParoQuant path)");
+        let weights = qwen35::load_weights_paroquant(&source, &config, &mut gpu)
+            .expect("load_weights_paroquant");
+        (config, weights, bytes)
+    } else {
+        let mut hfq = HfqFile::open(model_path_buf).expect("open model");
+        let config = qwen35::config_from_hfq(&hfq).expect("read config");
+        eprintln!(
+            "Config: dim={} layers={} heads={} kv_heads={} vocab={}",
+            config.dim, config.n_layers, config.n_heads, config.n_kv_heads, config.vocab_size
+        );
+        let bytes = std::fs::metadata(model_path).map(|m| m.len()).unwrap_or(0);
+        eprintln!("Model size: {:.3} GiB ({} bytes)",
+            bytes as f64 / (1024.0 * 1024.0 * 1024.0), bytes);
+        let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load weights");
+        (config, weights, bytes)
+    };
     eprintln!("Weights loaded in {:.2}s", t_load.elapsed().as_secs_f64());
 
     let kv_seq = (prefill_len + warmup_len + gen_len + 16).max(512);
@@ -111,6 +144,11 @@ fn main() {
     // takes the batched LA kernel path for MQ4 models and the FA gather/scatter
     // fallback for FA layers.
     let do_profile = std::env::var("HIPFIRE_PROFILE").ok().as_deref() == Some("1");
+    // When HIPFIRE_ROCPROF_CSV=<path> is set AND profiling is active,
+    // cross-check internal profile against rocprofv3 _kernel_stats.csv.
+    // Stored here so the report is visible in both the logging block and
+    // the atlas emission block below.
+    let mut prefill_rocprof_report: Option<rdna_compute::profile_rocprof::ProfileReport> = None;
     // When profiling, do an unprofile warm-up prefill first to JIT all kernels,
     // then reset state and profile the second pass.
     if do_profile {
@@ -134,28 +172,103 @@ fn main() {
     }
     eprintln!("\n=== prefill ({prefill_len} tokens) ===");
     let mut prefill_samples_ms = Vec::with_capacity(prefill_runs);
-    for run in 0..prefill_runs {
-        if run > 0 {
-            dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
-            kv_cache = match kv_mode.as_str() {
-                "q8" => KvCache::new_gpu_q8(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap(),
-                "asym4" | "turbo4" => KvCache::new_gpu_asym4(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap(),
-                "asym3" | "turbo3" | "turbo" => KvCache::new_gpu_asym3(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap(),
-                "asym2" | "turbo2" => KvCache::new_gpu_asym2(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap(),
-                _ => KvCache::new_gpu_q8(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap(),
-            };
+
+    // HIPFIRE_GRAPH_PREFILL=1: route the timed prefill loop through
+    // hipGraph capture/replay. Reuses the DFlash verify_graph_cache
+    // (single-slot keyed by b = prompt_tokens.len()). Run 0 warms,
+    // run 1 captures + launches, runs 2+ replay. dn_state + kv_cache
+    // are NOT re-created between runs (would invalidate baked-in
+    // tensor pointers); state drift is accepted for perf measurement.
+    let use_graph_prefill = std::env::var("HIPFIRE_GRAPH_PREFILL")
+        .ok().as_deref() == Some("1");
+
+    if use_graph_prefill {
+        let pbs = scratch.prefill_batch.as_ref()
+            .expect("HIPFIRE_GRAPH_PREFILL=1 requires PrefillBatchScratch");
+        let b = prompt_tokens.len();
+        if b > pbs.max_batch {
+            panic!("HIPFIRE_GRAPH_PREFILL=1: prompt b={} exceeds pbs.max_batch={}",
+                b, pbs.max_batch);
         }
-        let t_prefill = Instant::now();
-        qwen35::forward_prefill_batch(
-            &mut gpu, &weights, &config, &prompt_tokens, 0,
-            &mut kv_cache, &mut dn_state, &scratch,
-            None, None, None, None,
-        ).expect("prefill forward failed");
-        gpu.hip.device_synchronize().expect("sync after prefill");
-        let ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
-        prefill_samples_ms.push(ms);
-        if prefill_runs > 1 {
-            eprintln!("  run {:>2}: {:.1}ms  {:.1} tok/s", run + 1, ms, prefill_len as f64 / (ms / 1000.0));
+        // Pre-upload tokens + positions ONCE — kernels read them from
+        // device buffers, so subsequent replays use the same content.
+        qwen35::upload_prefill_batch_inputs(&mut gpu, pbs, &prompt_tokens, 0)
+            .expect("upload prefill batch inputs");
+        if gpu.active_stream.is_none() {
+            gpu.active_stream = Some(gpu.hip.stream_create().expect("stream"));
+        }
+        eprintln!("  [graph-prefill] b={}, max_batch={}", b, pbs.max_batch);
+
+        for run in 0..prefill_runs {
+            let mode;
+            let t_prefill = Instant::now();
+            if gpu.graphs.verify_has_graph(b) {
+                mode = "replay";
+                gpu.graphs.verify_graph_launch(
+                    &gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap(), b,
+                ).expect("graph replay");
+            } else if gpu.graphs.verify_needs_warmup(b) {
+                mode = "warmup";
+                gpu.graphs.verify_mark_warmup_done(b);
+                qwen35::forward_prefill_batch_single_chunk_captured(
+                    &mut gpu, &weights, &config, &prompt_tokens, 0,
+                    &mut kv_cache, &mut dn_state, &scratch, pbs,
+                    None, None, None, None,
+                ).expect("warmup prefill");
+            } else {
+                mode = "capture";
+                gpu.graphs.begin_verify_graph_capture(
+                    &gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap(), b,
+                ).expect("begin capture");
+                let r = qwen35::forward_prefill_batch_single_chunk_captured(
+                    &mut gpu, &weights, &config, &prompt_tokens, 0,
+                    &mut kv_cache, &mut dn_state, &scratch, pbs,
+                    None, None, None, None,
+                );
+                if r.is_ok() {
+                    let blob_count = gpu.graphs.capture_blobs.len();
+                    gpu.graphs.end_verify_graph_capture(
+                        &gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap(),
+                    ).expect("end capture");
+                    gpu.graphs.verify_graph_launch(
+                        &gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap(), b,
+                    ).expect("launch after capture");
+                    eprintln!("  [graph-prefill] captured b={} ({} kernarg blobs)", b, blob_count);
+                } else {
+                    panic!("capture pass failed: {:?}", r);
+                }
+            }
+            gpu.hip.device_synchronize().expect("sync");
+            let ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
+            prefill_samples_ms.push(ms);
+            if prefill_runs > 1 {
+                eprintln!("  run {:>2} ({}): {:.1}ms  {:.1} tok/s", run + 1, mode, ms, prefill_len as f64 / (ms / 1000.0));
+            }
+        }
+    } else {
+        for run in 0..prefill_runs {
+            if run > 0 {
+                dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
+                kv_cache = match kv_mode.as_str() {
+                    "q8" => KvCache::new_gpu_q8(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap(),
+                    "asym4" | "turbo4" => KvCache::new_gpu_asym4(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap(),
+                    "asym3" | "turbo3" | "turbo" => KvCache::new_gpu_asym3(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap(),
+                    "asym2" | "turbo2" => KvCache::new_gpu_asym2(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap(),
+                    _ => KvCache::new_gpu_q8(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap(),
+                };
+            }
+            let t_prefill = Instant::now();
+            qwen35::forward_prefill_batch(
+                &mut gpu, &weights, &config, &prompt_tokens, 0,
+                &mut kv_cache, &mut dn_state, &scratch,
+                None, None, None, None,
+            ).expect("prefill forward failed");
+            gpu.hip.device_synchronize().expect("sync after prefill");
+            let ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
+            prefill_samples_ms.push(ms);
+            if prefill_runs > 1 {
+                eprintln!("  run {:>2}: {:.1}ms  {:.1} tok/s", run + 1, ms, prefill_len as f64 / (ms / 1000.0));
+            }
         }
     }
     let prefill_ms = *prefill_samples_ms.last().unwrap();
@@ -163,9 +276,23 @@ fn main() {
     // None when profiling is disabled (HIPFIRE_PROFILE != 1).
     let mut prefill_kernel_ms: Option<f64> = None;
     if do_profile {
-        if let Some(entries) = rdna_compute::profile::stop() {
+        let rocprof_csv_env = std::env::var("HIPFIRE_ROCPROF_CSV").ok();
+        let report = if let Some(ref csv_path_str) = rocprof_csv_env {
+            let csv_path = std::path::Path::new(csv_path_str.as_str());
+            let r = rdna_compute::profile_rocprof::stop_with_rocprof(csv_path);
+            if r.is_none() {
+                eprintln!("WARN: HIPFIRE_ROCPROF_CSV set but internal profiler was not active");
+            }
+            r
+        } else {
+            rdna_compute::profile::stop().map(|entries| {
+                rdna_compute::profile_rocprof::compute_coverage(&entries, &[])
+            })
+        };
+        if let Some(ref report) = report {
+            let entries = &report.internal;
             let mut by_kernel: std::collections::HashMap<&str, (f64, usize, usize)> = Default::default();
-            for e in &entries {
+            for e in entries {
                 let (time, count, bytes) = by_kernel.entry(e.kernel).or_default();
                 *time += e.time_us;
                 *count += 1;
@@ -186,7 +313,28 @@ fn main() {
             }
             eprintln!("  {:45} {:5}   {:.1}ms", "TOTAL (serialized)", "", total_us / 1000.0);
             prefill_kernel_ms = Some(total_us / 1000.0);
+            // rocprof cross-check output (only when CSV was loaded).
+            if !report.rocprof.is_empty() {
+                eprintln!("\n=== ROCPROF COVERAGE ({:.1}%) ===", report.coverage_pct);
+                eprintln!("  rocprof total:   {:.1}ms  ({} kernels seen)",
+                    report.rocprof_total_us / 1000.0, report.rocprof.len());
+                eprintln!("  internal total:  {:.1}ms  ({} kernels tracked)",
+                    report.internal_total_us / 1000.0, entries.len());
+                eprintln!("  blindspot total: {:.1}ms  ({} un-tracked kernels)",
+                    report.blindspot_total_us / 1000.0, report.blindspots.len());
+                if !report.blindspots.is_empty() {
+                    eprintln!("  BLINDSPOTS (rocprof saw; internal profile missed):");
+                    for bs in &report.blindspots {
+                        eprintln!("    {:55} {:5}x  {:.1}ms  {:.1}%",
+                            bs.name, bs.calls, bs.duration_us / 1000.0, bs.percent);
+                    }
+                    if report.coverage_pct < 90.0 {
+                        eprintln!("  WARNING: coverage {:.1}% < 90% -- investigate blindspot kernels", report.coverage_pct);
+                    }
+                }
+            }
         }
+        prefill_rocprof_report = report;
     }
     let prefill_tok_s = prefill_len as f64 / (prefill_ms / 1000.0);
     if prefill_samples_ms.len() > 1 {
@@ -231,6 +379,37 @@ fn main() {
             row.set_metric_f64("startup_overhead_ms", prefill_ms - kernel_ms);
             if prefill_ms > 0.0 {
                 row.set_metric_f64("cold_overhead_pct", (prefill_ms - kernel_ms) / prefill_ms * 100.0);
+            }
+        }
+        // Attach rocprofv3 coverage report when available.
+        if let Some(ref report) = prefill_rocprof_report {
+            if !report.rocprof.is_empty() {
+                let mut rocprof_sorted: Vec<hipfire_atlas::AtlasRocprofKernel> =
+                    report.rocprof.iter().map(|k| hipfire_atlas::AtlasRocprofKernel {
+                        name: k.name.clone(),
+                        calls: k.calls,
+                        duration_us: k.duration_us,
+                        percent: k.percent,
+                    }).collect();
+                rocprof_sorted.sort_by(|a, b| {
+                    b.duration_us.partial_cmp(&a.duration_us).unwrap()
+                });
+                let blindspots_atlas: Vec<hipfire_atlas::AtlasRocprofKernel> =
+                    report.blindspots.iter().map(|k| hipfire_atlas::AtlasRocprofKernel {
+                        name: k.name.clone(),
+                        calls: k.calls,
+                        duration_us: k.duration_us,
+                        percent: k.percent,
+                    }).collect();
+                let atlas_report = hipfire_atlas::AtlasProfileReport {
+                    internal_total_us: report.internal_total_us,
+                    rocprof_total_us: report.rocprof_total_us,
+                    coverage_pct: report.coverage_pct,
+                    blindspot_total_us: report.blindspot_total_us,
+                    blindspots: blindspots_atlas,
+                    rocprof_all: rocprof_sorted,
+                };
+                row.set_profile_report(&atlas_report);
             }
         }
         if let Err(e) = row.append_to_jsonl(atlas_path) {
