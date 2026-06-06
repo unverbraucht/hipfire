@@ -4021,7 +4021,7 @@ impl Qwen35Scratch {
             // buffer's actual capacity at call time and auto-chunks larger
             // prefill batches into multiple sub-launches. So a lower
             // batch_mult here trades ~linear extra dispatch overhead on
-            // prefill (PREFILL_MAX_BATCH=256 → ceil(256/batch_mult) calls per
+            // prefill (PREFILL_MAX_BATCH varies by arch → ceil(batch/batch_mult) calls per
             // FA layer) for ~linearly less VRAM at long context.
             //
             // The per-position size scales with kv_max_seq (= physical_cap
@@ -4135,7 +4135,7 @@ impl Qwen35Scratch {
                     .ok()
                     .and_then(|v| v.parse::<usize>().ok())
                     .filter(|&v| v >= 2)
-                    .unwrap_or(PREFILL_MAX_BATCH);
+                    .unwrap_or(prefill_max_batch_for_arch(&gpu.arch));
                 s.prefill_batch = Some(PrefillBatchScratch::new(gpu, config, max_batch)?);
             }
             Ok(s)
@@ -4697,7 +4697,26 @@ impl PrefillBatchScratch {
 /// callers sizing `HiddenStateRingBuffer` staging can match the chunk
 /// upper bound (staging that's smaller than a chunk will assert-fail
 /// on prompt seeding of long prompts).
-pub const PREFILL_MAX_BATCH: usize = 256;
+pub const PREFILL_MAX_BATCH_DEFAULT: usize = 256;
+/// Prefill batch size validated to improve throughput on gfx906 (+9.3% at
+/// pp2048, B=1024 vs B=256). Other archs retain 256 until tested.
+pub const PREFILL_MAX_BATCH_GFX906: usize = 1024;
+
+/// Backward-compatible alias — callers outside this crate that need a
+/// conservatively-sized upper bound (e.g. flash_partials, hidden-state
+/// ring-buffer sizing) should use this. For the actual runtime batch size
+/// prefer `prefill_max_batch_for_arch`.
+pub const PREFILL_MAX_BATCH: usize = PREFILL_MAX_BATCH_GFX906;
+
+/// Return the default prefill max batch size for the given GPU arch.
+#[inline]
+pub fn prefill_max_batch_for_arch(arch: &str) -> usize {
+    if arch.starts_with("gfx906") || arch.starts_with("gfx908") || arch.starts_with("gfx90a") {
+        PREFILL_MAX_BATCH_GFX906
+    } else {
+        PREFILL_MAX_BATCH_DEFAULT
+    }
+}
 
 const MOE_GROUPED_BLOCK_M: usize = 16;
 
@@ -5110,7 +5129,7 @@ pub fn forward_prefill_batch_with_pbs_opts(
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&v| v >= MIN_BATCH)
-        .unwrap_or(PREFILL_MAX_BATCH);
+        .unwrap_or(prefill_max_batch_for_arch(&gpu.arch));
 
     let n = tokens.len();
     if n == 0 {
@@ -11043,7 +11062,7 @@ pub fn forward_prefill_batch_multi_with_caps(
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&v| v >= 2)
-        .unwrap_or(PREFILL_MAX_BATCH);
+        .unwrap_or(prefill_max_batch_for_arch(&gpus.devices[0].arch));
 
     let force_fallback = std::env::var("HIPFIRE_PREFILL_BATCHED").ok().as_deref() == Some("0");
 
