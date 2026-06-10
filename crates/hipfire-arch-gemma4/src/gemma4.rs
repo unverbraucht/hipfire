@@ -2773,29 +2773,28 @@ fn forward_prefill_batch_v2(
                     dbg_dump(gpu, "[v2] L0 after rope_k", &scratch.pb_k, kv_dim);
                 }
 
-                // Per-token KV write + attention (batched projections, per-token
-                // attention). The batched q8 attention path has a bug that
-                // corrupts KV when cache_capacity > 0 (ring-buffer mode), so
-                // we run attention per-token through the proven decode-path
-                // Step::Attend with batch_size=1. This is only 1.7% of GPU
-                // time per the rocprof profile, so the overhead is minimal.
+                // KV write + attention. Two ring regimes (A.2):
+                //  • No-wrap (start_pos + n_batch <= sliding_window): every
+                //    token in this chunk maps to a DISTINCT ring slot, so a
+                //    batched write-all-then-attend-all is ring-safe — at
+                //    seq_len <= window both cache_capacity (t % cap == t) and
+                //    window_size (t_lo == 0) are no-ops. One batched flash
+                //    launch instead of N per-token (mirrors the full-layer A.1
+                //    path). Covers ALL prompts <= sliding_window and the first
+                //    `sliding_window` tokens of longer prompts.
+                //  • Wrapped (start_pos + n_batch > sliding_window): a later
+                //    token in the chunk overwrites a ring slot an earlier token
+                //    still needs (window == cap forces size-1 safe batches), so
+                //    fall back to the proven per-token decode-path loop. This is
+                //    the "corrupts KV when cache_capacity > 0" hazard — avoided,
+                //    not fixed, since it is a write/attend ordering constraint a
+                //    masking change cannot resolve.
                 let sliding_cap = config.sliding_window as u32;
-                for i in 0..n_batch {
-                    let pos = start_pos + i;
-                    if let Some(stream) = gpu.active_stream.as_ref() {
-                        gpu.hip.stream_write_value32(stream, &scratch.pos_buf, pos as u32, 0)?;
-                    } else {
-                        gpu.hip.memcpy_htod(&scratch.pos_buf, &(pos as i32).to_ne_bytes())?;
-                    }
-                    if let Some(_s) = gpu.active_stream.as_ref() {
-                        gpu.hip.memcpy_dtod_async_at(&scratch.q.buf, 0, &scratch.pb_q.buf, i * q_dim_bytes, q_dim_bytes, _s)?;
-                        gpu.hip.memcpy_dtod_async_at(&scratch.k.buf, 0, &scratch.pb_k.buf, i * kv_dim_bytes, kv_dim_bytes, _s)?;
-                        gpu.hip.memcpy_dtod_async_at(&scratch.v.buf, 0, &scratch.pb_v.buf, i * kv_dim_bytes, kv_dim_bytes, _s)?;
-                    } else {
-                        gpu.hip.memcpy_dtod_at(&scratch.q.buf, 0, &scratch.pb_q.buf, i * q_dim_bytes, q_dim_bytes)?;
-                        gpu.hip.memcpy_dtod_at(&scratch.k.buf, 0, &scratch.pb_k.buf, i * kv_dim_bytes, kv_dim_bytes)?;
-                        gpu.hip.memcpy_dtod_at(&scratch.v.buf, 0, &scratch.pb_v.buf, i * kv_dim_bytes, kv_dim_bytes)?;
-                    }
+                // HIPFIRE_GEMMA4_NO_SLIDING_BATCH=1 forces the per-token path
+                // (A.2 isolation toggle); otherwise batch the no-wrap regime.
+                let can_batch_sliding = start_pos + n_batch <= sliding_cap as usize
+                    && std::env::var("HIPFIRE_GEMMA4_NO_SLIDING_BATCH").is_err();
+                if can_batch_sliding {
                     let tier_inputs = KvTierInputs {
                         quant_asym4: kv_sliding.quant_asym4,
                         quant_asym3: kv_sliding.quant_asym3,
@@ -2805,10 +2804,10 @@ fn forward_prefill_batch_v2(
                         quant_hfq4: false,
                         quant_q4: false,
                         v_mode_bits: kv_sliding.v_mode_bits(),
-                        pos,
+                        pos: start_pos + n_batch - 1,
                         flash_mode: 2,
                         capture_mode: gpu.graphs.capture_mode,
-                        batch_size: 1,
+                        batch_size: n_batch,
                         is_tree: false,
                         is_boundary: false,
                         cache_capacity: sliding_cap,
@@ -2818,45 +2817,114 @@ fn forward_prefill_batch_v2(
                     let plan = KvTierPlan::derive(tier_inputs)
                         .map_err(|e| hip_bridge::HipError::new(0, &format!("{:?}", e)))?;
                     let io = AttnParams {
-                        q: &scratch.q,
-                        k: &scratch.k,
-                        v: &scratch.v,
+                        q: &scratch.pb_q,
+                        k: &scratch.pb_k,
+                        v: &scratch.pb_v,
                         k_cache: &kv_sliding.k_gpu[sliding_kv_idx],
                         v_cache: &kv_sliding.v_gpu[sliding_kv_idx],
                         k_scales: None,
                         v_scales: None,
                         pos_buf: &scratch.pos_buf,
-                        pos,
-                        positions: None,
+                        pos: start_pos + n_batch - 1,
+                        positions: Some(&scratch.pb_positions),
                         n_heads,
                         n_kv_heads: n_kv,
                         head_dim,
                         physical_cap: kv_sliding.max_seq,
                         cache_capacity: plan.cache_capacity,
                         window_size: plan.window_size,
-                        batch_size: 1,
-                        max_ctx_len: 0,
-                        flash_partials: Some(&scratch.flash_partials),
+                        batch_size: n_batch,
+                        max_ctx_len: start_pos + n_batch,
+                        flash_partials: Some(&scratch.pb_flash_partials),
                         givens_cos: kv_sliding.givens_cos.as_ref(),
                         givens_sin: kv_sliding.givens_sin.as_ref(),
                         tree_bias: None,
                         block_start: 0,
                         block_cols: 0,
-                        output: &scratch.attn_out,
+                        output: &scratch.pb_attn_q,
                     };
                     let ctx = DispatchCtx::new(gpu);
                     execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])?;
-                    // Copy attention output back to batched buffer.
-                    if let Some(_s) = gpu.active_stream.as_ref() {
-                        gpu.hip.memcpy_dtod_async_at(&scratch.pb_q.buf, i * q_dim_bytes, &scratch.attn_out.buf, 0, q_dim_bytes, _s)?;
-                    } else {
-                        gpu.hip.memcpy_dtod_at(&scratch.pb_q.buf, i * q_dim_bytes, &scratch.attn_out.buf, 0, q_dim_bytes)?;
+                } else {
+                    // Wrapped regime: ring-safe only one position at a time.
+                    for i in 0..n_batch {
+                        let pos = start_pos + i;
+                        if let Some(stream) = gpu.active_stream.as_ref() {
+                            gpu.hip.stream_write_value32(stream, &scratch.pos_buf, pos as u32, 0)?;
+                        } else {
+                            gpu.hip.memcpy_htod(&scratch.pos_buf, &(pos as i32).to_ne_bytes())?;
+                        }
+                        if let Some(_s) = gpu.active_stream.as_ref() {
+                            gpu.hip.memcpy_dtod_async_at(&scratch.q.buf, 0, &scratch.pb_q.buf, i * q_dim_bytes, q_dim_bytes, _s)?;
+                            gpu.hip.memcpy_dtod_async_at(&scratch.k.buf, 0, &scratch.pb_k.buf, i * kv_dim_bytes, kv_dim_bytes, _s)?;
+                            gpu.hip.memcpy_dtod_async_at(&scratch.v.buf, 0, &scratch.pb_v.buf, i * kv_dim_bytes, kv_dim_bytes, _s)?;
+                        } else {
+                            gpu.hip.memcpy_dtod_at(&scratch.q.buf, 0, &scratch.pb_q.buf, i * q_dim_bytes, q_dim_bytes)?;
+                            gpu.hip.memcpy_dtod_at(&scratch.k.buf, 0, &scratch.pb_k.buf, i * kv_dim_bytes, kv_dim_bytes)?;
+                            gpu.hip.memcpy_dtod_at(&scratch.v.buf, 0, &scratch.pb_v.buf, i * kv_dim_bytes, kv_dim_bytes)?;
+                        }
+                        let tier_inputs = KvTierInputs {
+                            quant_asym4: kv_sliding.quant_asym4,
+                            quant_asym3: kv_sliding.quant_asym3,
+                            quant_asym2: kv_sliding.quant_asym2,
+                            quant_q8: kv_sliding.quant_q8,
+                            quant_fwht: kv_sliding.quant_fwht,
+                            quant_hfq4: false,
+                            quant_q4: false,
+                            v_mode_bits: kv_sliding.v_mode_bits(),
+                            pos,
+                            flash_mode: 2,
+                            capture_mode: gpu.graphs.capture_mode,
+                            batch_size: 1,
+                            is_tree: false,
+                            is_boundary: false,
+                            cache_capacity: sliding_cap,
+                            head_dim,
+                            window_size: sliding_cap,
+                        };
+                        let plan = KvTierPlan::derive(tier_inputs)
+                            .map_err(|e| hip_bridge::HipError::new(0, &format!("{:?}", e)))?;
+                        let io = AttnParams {
+                            q: &scratch.q,
+                            k: &scratch.k,
+                            v: &scratch.v,
+                            k_cache: &kv_sliding.k_gpu[sliding_kv_idx],
+                            v_cache: &kv_sliding.v_gpu[sliding_kv_idx],
+                            k_scales: None,
+                            v_scales: None,
+                            pos_buf: &scratch.pos_buf,
+                            pos,
+                            positions: None,
+                            n_heads,
+                            n_kv_heads: n_kv,
+                            head_dim,
+                            physical_cap: kv_sliding.max_seq,
+                            cache_capacity: plan.cache_capacity,
+                            window_size: plan.window_size,
+                            batch_size: 1,
+                            max_ctx_len: 0,
+                            flash_partials: Some(&scratch.flash_partials),
+                            givens_cos: kv_sliding.givens_cos.as_ref(),
+                            givens_sin: kv_sliding.givens_sin.as_ref(),
+                            tree_bias: None,
+                            block_start: 0,
+                            block_cols: 0,
+                            output: &scratch.attn_out,
+                        };
+                        let ctx = DispatchCtx::new(gpu);
+                        execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])?;
+                        // Copy attention output back to batched buffer.
+                        if let Some(_s) = gpu.active_stream.as_ref() {
+                            gpu.hip.memcpy_dtod_async_at(&scratch.pb_attn_q.buf, i * q_dim_bytes, &scratch.attn_out.buf, 0, q_dim_bytes, _s)?;
+                        } else {
+                            gpu.hip.memcpy_dtod_at(&scratch.pb_attn_q.buf, i * q_dim_bytes, &scratch.attn_out.buf, 0, q_dim_bytes)?;
+                        }
                     }
                 }
                 sliding_kv_idx += 1;
-                if _dump_on { dbg_dump(gpu, "[v2] L0 after attention (pb_q)", &scratch.pb_q, q_dim); }
+                if _dump_on { dbg_dump(gpu, "[v2] L0 after attention (pb_attn_q)", &scratch.pb_attn_q, q_dim); }
 
-                run_prefill_gemm(gpu, &lw.o_proj, &scratch.pb_q, &scratch.pb_attn_out, n_batch)?;
+                run_prefill_gemm(gpu, &lw.o_proj, &scratch.pb_attn_q, &scratch.pb_attn_out, n_batch)?;
                 if _dump_on { dbg_dump(gpu, "[v2] L0 after o_proj", &scratch.pb_attn_out, dim); }
                 gpu.rmsnorm_batched(&scratch.pb_attn_out, &lw.post_attention_layernorm,
                     &scratch.pb_attn_out, n_batch, dim, config.norm_eps)?;

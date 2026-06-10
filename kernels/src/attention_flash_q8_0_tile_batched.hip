@@ -39,7 +39,9 @@ __global__ void attention_flash_q8_0_tile_batched(
     int max_tiles,
     int batch_offset,
     int block_start,                           // ignored when tree_bias == nullptr
-    int block_cols                             // ignored when tree_bias == nullptr
+    int block_cols,                            // ignored when tree_bias == nullptr
+    int window_size,                           // 0 = full causal
+    int cache_capacity                         // 0 = no ring wrap
 ) {
     const int h = blockIdx.x;
     const int tile_id = blockIdx.y;
@@ -54,6 +56,19 @@ __global__ void attention_flash_q8_0_tile_batched(
     if (tile_start >= seq_len) return;
     const int tile_end = min(tile_start + tile_size, seq_len);
     const int tile_len = tile_end - tile_start;
+    // Sliding-window: keys older than `seq_len - window_size` are masked out.
+    // Whole-tile early exit when the entire tile predates the window.
+    const bool sliding = (window_size > 0) && !tree_mode;
+    const int t_lo = sliding ? max(0, seq_len - window_size) : 0;
+    if (sliding && tile_end <= t_lo) {
+        float* p = partials + ((long long)local_bid * n_heads + h) * max_tiles * (2 + head_dim)
+                            + tile_id * (2 + head_dim);
+        if (tid == 0) { p[0] = -1e30f; p[1] = 0.0f; }
+        const int d0_z = tid * 8;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) p[2 + d0_z + i] = 0.0f;
+        return;
+    }
 
     const int kv_group = n_heads / n_kv_heads;
     const int kv_h = h / kv_group;
@@ -79,20 +94,24 @@ __global__ void attention_flash_q8_0_tile_batched(
     // Phase A: Q·K (Q8_0 dequant — 8 dims, spanning bi = d0/32, bj = d0%32).
     for (int t_local = 0; t_local < tile_len; t_local++) {
         int t = tile_start + t_local;
+        const bool out_of_window = sliding && (t < t_lo);
         float partial = 0.0f;
-        #pragma unroll
-        for (int i = 0; i < 8; i++) {
-            const int d = d0 + i;
-            const int bi = d / 32;
-            const int bj = d % 32;
-            const unsigned char* kb = k_cache + (size_t)t * row_stride + (kv_head_blk + bi) * 34;
-            float ks = (float)*((const _Float16*)kb);
-            partial += mq[i] * (ks * (float)((signed char)kb[2 + bj]));
+        if (!out_of_window) {
+            const int k_slot = (cache_capacity > 0) ? (t % cache_capacity) : t;
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                const int d = d0 + i;
+                const int bi = d / 32;
+                const int bj = d % 32;
+                const unsigned char* kb = k_cache + (size_t)k_slot * row_stride + (kv_head_blk + bi) * 34;
+                float ks = (float)*((const _Float16*)kb);
+                partial += mq[i] * (ks * (float)((signed char)kb[2 + bj]));
+            }
         }
         for (int off = 16; off > 0; off >>= 1)
             partial += __shfl_xor(partial, off);
         if (tid == 0) {
-            float s = partial * scale_attn;
+            float s = out_of_window ? -1e30f : (partial * scale_attn);
             if (tree_mode && t >= block_start)
                 s += tree_bias[global_bid * block_cols + (t - block_start)];
             scores[t_local] = s;
@@ -125,7 +144,8 @@ __global__ void attention_flash_q8_0_tile_batched(
     for (int t_local = 0; t_local < tile_len; t_local++) {
         float w = scores[t_local];
         int t = tile_start + t_local;
-        const unsigned char* vb = v_cache + (size_t)t * row_stride;
+        const int v_slot = (cache_capacity > 0) ? (t % cache_capacity) : t;
+        const unsigned char* vb = v_cache + (size_t)v_slot * row_stride;
         #pragma unroll
         for (int i = 0; i < 8; i++) {
             const int d = d0 + i;

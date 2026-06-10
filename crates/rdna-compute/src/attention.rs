@@ -2837,6 +2837,10 @@ impl Gpu {
                     params.push(&vm as *const _ as *mut c_void);
                     params.push(&ws as *const _ as *mut c_void);
                     params.push(&cc as *const _ as *mut c_void);
+                } else if eff_tile_func == "attention_flash_q8_0_tile_batched" {
+                    // q8 V is always Q8_0 (no v_mode arg); takes window/cap tail.
+                    params.push(&ws as *const _ as *mut c_void);
+                    params.push(&cc as *const _ as *mut c_void);
                 } else if !use_wmma_grid {
                     params.push(&vm as *const _ as *mut c_void);
                 }
@@ -2880,6 +2884,9 @@ impl Gpu {
                             b.push_i32(cc);
                         } else if eff_tile_func == "attention_flash_asym3_tile_batched" {
                             b.push_i32(vm);
+                            b.push_i32(ws);
+                            b.push_i32(cc);
+                        } else if eff_tile_func == "attention_flash_q8_0_tile_batched" {
                             b.push_i32(ws);
                             b.push_i32(cc);
                         } else if !use_wmma_grid {
