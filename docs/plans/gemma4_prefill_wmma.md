@@ -185,7 +185,7 @@ Expected: 5–10× improvement on projection-dominated path. Actual speedup depe
 
 ## 6 · Out of scope
 
-- **Batched attention for prefill** — per-token attention is correct with q8 ring-buffer and fast enough (1.7%) for B≤128
+- ~~**Batched attention for prefill**~~ — **NO LONGER out of scope** (as of 2026-06-09 this is Milestone 2 / §8, the load-bearing long-context lever; A.1/A.2 are the in-progress, currently-broken attempts — see "Implementation Log & Current Status" below). Note the original "per-token is correct and fast enough (1.7%)" framing was based on the 20-tok profile; at 1279 tok per-token attention is the ~15s wall-clock floor.
 - **MoE prefill batching** — per-token expert loop is adequate; indexed kernels handle decode
 - **v1/v2 batched prefill debug** — preserved on `feat/gemma4-batched-prefill-jukefr` for reference
 - **Default-ON WMMA** — requires relaxed coherence criteria (byte-identical → within epsilon)
@@ -193,7 +193,7 @@ Expected: 5–10× improvement on projection-dominated path. Actual speedup depe
 
 ---
 
-*Revised 2026-06-09 after profiling and bug fixes. Profile data in `findings/gemma4_prefill_profile_12b_q8.md`. Adversarial reviews in `findings/gemma4_prefill_wmma_plan_rev_glm5.md`, `findings/gemma4_prefill_wmma_plan_rev_gemini.md`, `findings/gemma4_prefill_wmma_plan_rev_claude.md`. Bug fixes in commit `d1b1a488`.*
+*Revised 2026-06-09 after profiling and bug fixes; **2026-06-10 handover update** appended below (see "Implementation Log & Current Status"). Profile data in `findings/gemma4_prefill_profile_12b_q8.md`. The standalone adversarial reviews (glm5, gemini, claude) have been folded into the "Implementation Log & Current Status" section and removed. Bug fixes in commit `d1b1a488`.*
 ## 8 · Measured perf results (2026-06-09)
 
 ### Short prompt (17 tokens, "What is France?")
@@ -237,3 +237,131 @@ The per-token attention loop issues ~700K HIP operations (1279 tokens × 48 laye
 Each approach needs ring-buffer cache_capacity support for q8 sliding KV.
 
 **Milestone 3:** 26B-A4B MoE batched prefill (currently gated out due to `apply_moe_branch_batched` token attractor).
+
+---
+
+# Implementation Log & Current Status (2026-06-09 → 2026-06-10)
+
+> This section folds in the former standalone reviews
+> `gemma4_prefill_wmma_plan_rev_claude.md` (Claude/Opus dev log) and
+> `gemma4_prefill_wmma_plan_rev_gemini.md` (Gemini). Those files have been
+> removed; this is the single authoritative record. All numbers gfx1151,
+> 12B-Q8, canonical committed prompt `benchmarks/prompts/gemma4_longcontext_1200.txt`
+> (1279 tok, md5 `6236cc470a2eefe9c1b34913f9fa9ea6`), warm-then-measure, fresh
+> process per measure.
+
+## ⚠ HANDOVER STATUS (2026-06-10): the batched-attention path is BROKEN
+
+**Two coupled defects in the opt-in batched prefill path. Both opt-in flags
+(`HIPFIRE_BATCHED_PREFILL`, `HIPFIRE_WMMA_PREFILL`) default OFF, so the default
+per-token prefill path is correct and unaffected — this is a broken
+experimental path, not a default-user regression.**
+
+1. **A.1 (`aa66352f`, PUSHED UPSTREAM) corrupts at multi-chunk.** Batched
+   full-layer (asym3) attention is wrong at `start_pos > 0`. It was validated
+   only at 160 tok = a single chunk (`start_pos = 0`), which masked the bug.
+   On any prompt > 128 tok under `HIPFIRE_BATCHED_PREFILL=1` it emits a
+   `(No)(No)(No)…` attractor. **→ Worth notifying the maintainer (Kaden).**
+2. **A.2 (`d5fc03d9`, WIP, known-broken) corrupts even single-chunk.** Batched
+   q8 *sliding* attention produces `<audio|>****…` on a 35-tok single chunk —
+   an additional defect on top of (1).
+
+**Three-way control (identical binary, identical 1279-tok prompt):**
+
+| Config | Prefill path | Result |
+|---|---|---|
+| default (no flags) | per-token `forward_scratch` | **COHERENT** ✓ |
+| `HIPFIRE_GEMMA4_NO_SLIDING_BATCH=1` (= `aa66352f`) | per-token sliding + batched full | **GARBAGE** ✗ `(No)(No)` |
+| `HIPFIRE_BATCHED_PREFILL=1` (A.2) | batched sliding + batched full | **GARBAGE** ✗ `<audio\|>` / `the the` |
+
+The default path being coherent on the identical prompt isolates the
+corruption to the **batched attention at `start_pos > 0`** (the only delta
+between rows 1 and 2 is that full-layer attention is batched).
+
+**Repro:** `HIPFIRE_BATCHED_PREFILL=1` + any prompt > 128 tok → attractor;
+same prompt, no flag → coherent.
+
+## Commits (on `feat/dispatch-unification-gemma4`, atop `d1b1a488`)
+
+| commit | what | status |
+|---|---|---|
+| `ed6e68c3` | window/cap threading completion — made the tree build (3 missed call sites) | ok |
+| `5e927530` | **chunking** — >128-tok prompts route through batched prefill in ≤128 windows | ok (per-token attn) |
+| `bf44af1f` | 4th threading call site (q8 microbench example) | ok |
+| `aa66352f` | **A.1** — batched full-layer (asym3) prefill attention, 1 launch/layer | **BROKEN @ multi-chunk** |
+| `d5fc03d9` | **A.2** — batched q8 sliding attention (kernel port + wiring) | **KNOWN-BROKEN, do not ship** |
+
+## Measured prefill (1279 tok)
+
+| path | prefill | speedup | note |
+|---|---|---|---|
+| per-token baseline (default) | 92.8s | 1.00× | coherent |
+| scalar-chunked (`HIPFIRE_BATCHED_PREFILL=1`, pre-A.1) | 69.3s | 1.34× | coherent — per-token attention, batched projections |
+| + A.1 batched full @ **single chunk** (160 tok) | 68.0s | — | coherent at 160 tok ONLY; multi-chunk now known broken |
+| + A.1 batched full @ **multi-chunk** (1279 tok) | 68.1s | — | ❌ `(No)(No)` attractor |
+| wmma + kv-scalar | 19.1s | 4.86× | ❌ block attractor @ ~tok 30 |
+| wmma full-F16 | 14.8s | 6.25× | ❌ attractor @ ~tok 12 |
+
+## Established findings (each falsified the prior cheaper hypothesis)
+
+1. **Sync-stall theory FALSIFIED.** Env-gated `active_stream` A/B gave **−7.5%**,
+   not the predicted ~3×. The long-prefill bottleneck is CPU op-**submission**
+   (~95 µs/op × ~700K ops ≈ 66.8s of the 66.8s idle), not synchronous-copy
+   stalls (corroborated by ~200% daemon CPU during prefill). Async copies don't
+   change the submit count → can't help. Reverted. The lever is **op-count
+   reduction** (chunking + graph capture), not de-syncing.
+2. **Chunking is the correct fix for submission cost** (`5e927530`) — collapses
+   ~588K per-token GEMV launches into a few thousand batched GEMMs. Proven
+   coherent across all 10 chunks of the 1279-tok prompt with **per-token**
+   attention.
+3. **WMMA F16 is not coherence-safe for long context** — corrupts every
+   prefilled KV entry AND accumulates in the residual stream (o_proj/down_proj
+   write F16 error into the residual every layer). K/V-scalar alone is
+   INSUFFICIENT (delays the attractor tok 12→30, still block-loops at length).
+   Coherent WMMA needs split-F16 (compensated activation staging) — deferred.
+   *Process note: a 24-tok eyeball passed; the 160-tok check caught the block
+   attractor. Always validate at length.*
+4. **Per-token attention (~15s) is the floor** bounding every config and the
+   real gap vs llama.cpp (~0.33s / 3925 tok/s). Batching it is the real lever
+   (Milestone 2) — but is exactly where the current corruption lives.
+
+## Ring-buffer hazard (constrains A.2 design — important)
+
+The sliding KV is a **q8 ring of exactly `sliding_window` (1024) physical
+slots** (`new_gpu_q8_capped`, `physical_cap = sliding_window`). Positions ≥1024
+MUST wrap. In a batched "write-all-then-attend-all", a later token at pos `p'`
+overwrites ring slot `p' % 1024`, which held position `p'−1024`. For
+**window == cap == 1024**, that old position is always inside an earlier
+token's window `[p−1023, p]` → corruption. So a batch is ring-safe **iff every
+position < cap** (`start_pos + n_batch ≤ sliding_window`). Past that boundary,
+window==cap forces size-1 safe batches (per-token). A.2 therefore batches only
+the no-wrap regime and falls back to per-token for the wrapped tail. This is a
+write/attend **ordering** constraint a masking change cannot fix. (NB: this
+hazard is independent of, and does not explain, the `start_pos>0` and
+single-chunk corruption above — those are real bugs in the batched path
+itself.)
+
+## Root-cause status (open) — for the next owner
+
+- The corruption is **`start_pos > 0`-specific** for the full (asym3) path, and
+  **even `start_pos == 0`** for the q8 sliding path → likely two distinct bugs,
+  possibly a shared positions/offset root.
+- **Reduce kernel ruled out** (`attention_flash_asym_reduce_batched.hip`): it
+  iterates per-query `n_tiles = ceil(seq_len/tile)` and guards stale tiles with
+  `tile_sum > 0`; the tile kernel writes every tile in `[0, n_tiles)` for full
+  layers (window=0). Not stale-partials.
+- `pb_positions` confirmed absolute (`start_pos + i`, `gemma4.rs:2692`).
+- **Next diagnostic:** dump-and-diff the batched full-layer attention output
+  vs. the per-token reference at layer 0 for `start_pos = 128` (chunk 1) — the
+  smallest multi-chunk case — to localize the `start_pos>0` divergence. Then
+  separately diff batched-q8-sliding vs per-token at `start_pos = 0`.
+- Validation MUST be length-gated (>1024-tok prompt) through
+  `coherence-gate.sh` + `coherence-gate-dflash.sh` before any A.x is called
+  coherent — the failure mode is a block attractor past the window edge that a
+  short smoke test misses.
+
+## Isolation toggle (committed, for debugging)
+
+`HIPFIRE_GEMMA4_NO_SLIDING_BATCH=1` forces the sliding layers back to per-token
+while keeping A.1's batched full layers — i.e. reproduces `aa66352f` exactly.
+Used for the three-way control above.
